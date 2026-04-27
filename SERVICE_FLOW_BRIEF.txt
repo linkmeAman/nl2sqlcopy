@@ -1,0 +1,70 @@
+NL2SQL Service Flow Brief
+=========================
+
+Overview
+--------
+This system is split across two machines connected via Tailscale:
+
+1) Local Machine (100.120.187.84)
+   - Embedding server: bge-large-en-v1.5 at :8000/embed
+   - PostgreSQL + pgvector at :5432/ragdb
+
+2) App Server (this repo)
+   - FastAPI service at :8080
+   - No local model loading and no local vector DB
+
+
+How POST /ingest works
+----------------------
+1) Request arrives at /ingest.
+2) chunker.py prepares chunks:
+   - type="text": token-aware split (512 size, 64 overlap)
+   - type="schema": one chunk per table using provided text verbatim
+3) embed.py calls remote embedding API over Tailscale:
+   - Request format: {"inputs": [...]} (TEI-compatible)
+   - Response format: list of vectors (also accepts {"embeddings": [...]})
+4) db.py inserts rows into nl2sql_embeddings with pgvector embedding.
+5) Inserts are idempotent with UNIQUE(source, chunk_index) + ON CONFLICT DO NOTHING.
+6) Response returns inserted count and source.
+
+Stored columns include:
+- content
+- embedding (vector(1024))
+- source
+- chunk_index
+- token_count
+- embedding_model
+- metadata (JSONB for extra fields)
+
+
+How POST /query works
+---------------------
+1) Query text is embedded via remote API (:8000/embed).
+2) retrieve.py performs cosine similarity search in PostgreSQL:
+   ORDER BY embedding <=> query_vector LIMIT top_k
+3) Service returns top matches with:
+   - content
+   - similarity (1 - cosine_distance)
+   - metadata
+
+
+Current operational status (last known)
+---------------------------------------
+- Embedding endpoint :8000 is reachable.
+- PostgreSQL :5432 has intermittent/blocked reachability from App Server in your logs.
+- If DB is unavailable at startup, service still starts and /ingest, /query return 503 until DB is reachable.
+
+
+Common errors seen and fixes already applied
+--------------------------------------------
+1) pydantic settings rejected extra .env keys
+   - Fixed by setting Settings model config extra="ignore".
+
+2) Embedding API returned 422 for missing 'inputs'
+   - Fixed embed payload from {"texts": [...]} to {"inputs": [...]}.
+
+3) query endpoint 500 on metadata parsing
+   - Fixed JSONB parsing in retrieve.py by handling string JSON via json.loads().
+
+4) unknown type public.vector during startup
+   - Fixed by creating extension on a raw DB connection before creating asyncpg pool.

@@ -1,0 +1,22 @@
+[Unit]
+Description=NL2SQL FastAPI service
+Documentation=file:/var/www/py-workspace/nl2sql/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=developer
+Group=developer
+WorkingDirectory=/var/www/py-workspace/nl2sql
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/var/www/py-workspace/nl2sql/.venv/bin/uvicorn nl2sql_service.main:app --host 0.0.0.0 --port 8080
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+{
+  "output_dir": "docs\\generated",
+  "table_count": 692,
+  "view_count": 373,
+  "relationship_count": 62,
+  "databases": {
+    "tables": {
+      "pf_TickleRight_9210": 528,
+      "pf_central": 131,
+      "pf_messenger": 33
+    },
+    "views": {
+      "pf_TickleRight_9210": 366,
+      "pf_central": 7
+    }
+  },
+  "files": {
+    "tables": "nl2sql_schema_tables.jsonl",
+    "views": "nl2sql_schema_views.jsonl",
+    "relationships": "nl2sql_relationships.jsonl",
+    "business_rules": "nl2sql_business_rules.jsonl"
+  }
+}
