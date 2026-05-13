@@ -1,23 +1,30 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
 import asyncpg
-import httpx
 import sqlparse
 from sqlparse import tokens as T
 from sqlparse.sql import Comment, Identifier, IdentifierList, Parenthesis, Statement, Token, TokenList
 
-from nl2sql_service import retrieve
-from nl2sql_service.config import Settings
+from nl2sql_service import query_rewriter, retrieve
+from nl2sql_service.cache import sql_cache
+from nl2sql_service.column_loader import load_columns_for_tables
+from nl2sql_service.config import Settings, settings as default_settings
+from nl2sql_service.model_client import get_model_client
 from nl2sql_service.models import (
+    GenerateSqlClarification,
     GenerateSqlRejected,
     GenerateSqlResponse,
     GenerateSqlSuccess,
     SqlWarning,
     WarningCode,
 )
+from nl2sql_service.rulebook import build_governance_block, get_config
+
+logger = logging.getLogger(__name__)
 
 _FENCED_SQL_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _RAW_SQL_START_RE = re.compile(
@@ -142,6 +149,18 @@ _INQUIRY_QUERY_TERMS = (
     "prospect",
     "prospects",
 )
+COLUMN_SELECTION_RULE = """COLUMN SELECTION RULE:
+ For listing queries (show, list, find, get, fetch):
+   SELECT: id, name/title/subject columns, status,
+           and the most relevant date column only.
+   Do NOT select: financial columns (amount, balance,
+   fee, cost), audit columns (created_by, updated_by,
+   allocation_date, last_updated), or internal columns
+   unless the user specifically asks for them.
+ For aggregation queries (total, count, sum, average):
+   SELECT only the columns needed for the calculation.
+ For detail queries (details, full, all columns, *):
+   SELECT * is acceptable."""
 
 
 def build_sql_prompt(
@@ -151,7 +170,9 @@ def build_sql_prompt(
     dialect: str,
     allowed_columns: dict[str, list[str]] | None = None,
     planner_instruction: str = "",
+    settings: Settings | None = None,
 ) -> str:
+    active_settings = settings or default_settings
     tables = ", ".join(tables_in_scope) if tables_in_scope else "(none)"
     lines = [
         f"Generate ONE {dialect} SELECT statement only.",
@@ -162,6 +183,7 @@ def build_sql_prompt(
             "Use SELECT * only when the user explicitly asks for full details, "
             "all columns, or raw rows."
         ),
+        COLUMN_SELECTION_RULE,
         "Honor explicit row counts with LIMIT.",
         "For latest/recent requests, order by the best available date or timestamp column.",
     ]
@@ -177,6 +199,13 @@ def build_sql_prompt(
                 ],
             ]
         )
+    if active_settings.governance_enabled and active_settings.governance_inject_sql:
+        governance = build_governance_block(
+            get_config(active_settings),
+            context="sql_gen",
+        )
+        if governance:
+            lines.extend(["", governance])
     lines.extend(
         [
             "",
@@ -203,7 +232,9 @@ def build_refinement_prompt(
     validation_errors: list[SqlWarning],
     attempt: int,
     planner_instruction: str = "",
+    settings: Settings | None = None,
 ) -> str:
+    active_settings = settings or default_settings
     tables = ", ".join(tables_in_scope) if tables_in_scope else "(none)"
     errors = "\n".join(
         f"- {warning.code.value}: {warning.message}" for warning in validation_errors
@@ -211,36 +242,46 @@ def build_refinement_prompt(
     if not errors:
         errors = "- UNKNOWN: Previous SQL did not pass validation."
 
-    return "\n".join(
+    lines = [
+        f"Your previous SQL attempt {attempt} failed.",
+        "Validation errors:",
+        errors,
+        *(
+            ["", f"Planner instruction: {planner_instruction}"]
+            if planner_instruction
+            else []
+        ),
+        "",
+        "Previous SQL:",
+        "```sql",
+        previous_sql,
+        "```",
+        "",
+        "Constraints:",
+        f"- Generate ONE {dialect} SELECT statement only.",
+        "- Use read-only SQL. Do not execute the SQL.",
+        f"- Only use these tables: {tables}",
+        (
+            "- For show/list queries, choose concise, semantically relevant columns. "
+            "Use SELECT * only when the user explicitly asks for full details, "
+            "all columns, or raw rows."
+        ),
+        COLUMN_SELECTION_RULE,
+        "- Honor explicit row counts with LIMIT.",
+        "- For latest/recent requests, order by the best available date or timestamp column.",
+        "- Correct every validation error listed above.",
+        "- Do not reuse disallowed tables or columns from previous SQL.",
+        "- If planner instruction conflicts with constraints, follow constraints.",
+    ]
+    if active_settings.governance_enabled and active_settings.governance_inject_sql:
+        governance = build_governance_block(
+            get_config(active_settings),
+            context="sql_gen",
+        )
+        if governance:
+            lines.extend(["", governance])
+    lines.extend(
         [
-            f"Your previous SQL attempt {attempt} failed.",
-            "Validation errors:",
-            errors,
-            *(
-                ["", f"Planner instruction: {planner_instruction}"]
-                if planner_instruction
-                else []
-            ),
-            "",
-            "Previous SQL:",
-            "```sql",
-            previous_sql,
-            "```",
-            "",
-            "Constraints:",
-            f"- Generate ONE {dialect} SELECT statement only.",
-            "- Use read-only SQL. Do not execute the SQL.",
-            f"- Only use these tables: {tables}",
-            (
-                "- For show/list queries, choose concise, semantically relevant columns. "
-                "Use SELECT * only when the user explicitly asks for full details, "
-                "all columns, or raw rows."
-            ),
-            "- Honor explicit row counts with LIMIT.",
-            "- For latest/recent requests, order by the best available date or timestamp column.",
-            "- Correct every validation error listed above.",
-            "- Do not reuse disallowed tables or columns from previous SQL.",
-            "- If planner instruction conflicts with constraints, follow constraints.",
             "",
             "User question:",
             query,
@@ -253,70 +294,40 @@ def build_refinement_prompt(
             "Return only the corrected SQL.",
         ]
     )
+    return "\n".join(lines)
 
 
 async def call_ollama(
     prompt: str,
     settings: Settings,
 ) -> tuple[str | None, list[SqlWarning]]:
-    url = f"{settings.llm_base_url.rstrip('/')}/api/generate"
-    payload = {
-        "model": settings.llm_model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.0,
-        },
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=settings.llm_timeout) as client:
-            response = await client.post(url, json=payload)
-    except httpx.TimeoutException:
+    client = get_model_client(
+        settings=settings,
+        model=settings.llm_model,
+        default_timeout=settings.llm_timeout,
+    )
+    response = await client.generate(
+        prompt=prompt,
+        temperature=0.0,
+        timeout=settings.llm_timeout,
+    )
+    if not response.text:
+        code = (
+            WarningCode.OLLAMA_TIMEOUT
+            if response.error_type == "timeout"
+            else WarningCode.OLLAMA_MALFORMED
+            if response.error_type in {"malformed", "empty"}
+            else WarningCode.OLLAMA_UPSTREAM
+        )
+        detail = response.error_message or f"{client.provider_name} model returned no text"
         return None, [
             SqlWarning(
-                code=WarningCode.OLLAMA_TIMEOUT,
-                message=f"Ollama request timed out after {settings.llm_timeout}s",
-            )
-        ]
-    except httpx.RequestError as exc:
-        return None, [
-            SqlWarning(
-                code=WarningCode.OLLAMA_UPSTREAM,
-                message=f"Ollama unreachable: {exc}",
-            )
-        ]
-
-    if not response.is_success:
-        return None, [
-            SqlWarning(
-                code=WarningCode.OLLAMA_UPSTREAM,
-                message=(
-                    f"Ollama unreachable: HTTP {response.status_code}: "
-                    f"{response.text[:200]}"
-                ),
+                code=code,
+                message=detail,
             )
         ]
 
-    try:
-        data = response.json()
-    except ValueError:
-        return None, [
-            SqlWarning(
-                code=WarningCode.OLLAMA_MALFORMED,
-                message="Ollama response missing 'response' field",
-            )
-        ]
-
-    if not isinstance(data, dict) or not isinstance(data.get("response"), str):
-        return None, [
-            SqlWarning(
-                code=WarningCode.OLLAMA_MALFORMED,
-                message="Ollama response missing 'response' field",
-            )
-        ]
-
-    return data["response"], []
+    return response.text, []
 
 
 def extract_sql(raw: str) -> str:
@@ -732,6 +743,150 @@ async def run_explain(sql: str, settings: Settings) -> list[SqlWarning]:
         connection.close()
 
 
+async def review_sql(
+    sql: str,
+    query: str,
+    tables_in_scope: list[str],
+    allowed_columns: dict[str, list[str]],
+    settings: Settings,
+) -> tuple[bool, list[str]]:
+    known_columns_formatted = (
+        "\n".join(
+            f"- {table}: {', '.join(columns)}"
+            for table, columns in allowed_columns.items()
+        )
+        if allowed_columns
+        else "(none)"
+    )
+    prompt = f"""
+You are a strict SQL reviewer for a MySQL database.
+Review the SQL below against these rules:
+
+1. Is it a single SELECT or WITH...SELECT? (no DML)
+2. Does it only use these tables: {tables_in_scope}?
+3. Does it actually answer: "{query}"?
+4. Are the WHERE conditions sensible for the question?
+5. Are all table.column references valid given the
+   known columns: {known_columns_formatted}?
+
+SQL to review:
+{sql}
+
+Output EXACTLY in this format — no other text:
+VERDICT: PASS or FAIL
+VIOLATIONS: <comma-separated list of rule numbers
+             that failed, or "none" if PASS>
+REASON: <one sentence explaining the verdict>
+""".strip()
+    client = get_model_client(
+        settings=settings,
+        model=settings.reasoning_model,
+        default_timeout=15,
+    )
+    response = await client.generate(
+        prompt=prompt,
+        max_tokens=150,
+        temperature=0.0,
+        enable_thinking=False,
+        timeout=15,
+    )
+    if not response.text:
+        return True, []
+
+    verdict = ""
+    violations_raw = ""
+    reason = ""
+    for raw_line in response.text.splitlines():
+        line = raw_line.strip()
+        if line.upper().startswith("VERDICT:"):
+            verdict = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("VIOLATIONS:"):
+            violations_raw = line.split(":", 1)[1].strip()
+        elif line.upper().startswith("REASON:"):
+            reason = line.split(":", 1)[1].strip()
+
+    if not verdict or not violations_raw or not reason:
+        return True, []
+
+    if "FAIL" in verdict.upper():
+        violations = [
+            item.strip()
+            for item in violations_raw.split(",")
+            if item.strip() and item.strip().lower() != "none"
+        ]
+        return False, violations
+
+    if "PASS" in verdict.upper():
+        return True, []
+
+    return True, []
+
+
+async def _apply_review_gate(
+    result: GenerateSqlSuccess,
+    query: str,
+    pool: asyncpg.Pool,
+    settings: Settings,
+    top_k: int,
+) -> GenerateSqlSuccess:
+    if not settings.governance_enabled:
+        return result
+
+    review_tables_in_scope = result.tables_used
+    allowed_columns: dict[str, list[str]] = {}
+    try:
+        search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+        retrieved = await retrieve.retrieve_groups(
+            query=query,
+            top_k=top_k,
+            pool=pool,
+            search_query=search_query,
+        )
+        review_tables_in_scope = _result_value(retrieved, "tables_in_scope")
+        allowed_columns = await load_columns_for_tables(
+            tables=review_tables_in_scope,
+            settings=settings,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.info(
+            "Review gate context refresh failed for query %r: %s",
+            query[:60],
+            exc,
+        )
+        try:
+            allowed_columns = await load_columns_for_tables(
+                tables=result.tables_used,
+                settings=settings,
+            )
+        except Exception:  # noqa: BLE001
+            allowed_columns = {}
+
+    passes, violations = await review_sql(
+        sql=result.sql,
+        query=query,
+        tables_in_scope=review_tables_in_scope,
+        allowed_columns=allowed_columns,
+        settings=settings,
+    )
+    if passes:
+        return result
+
+    logger.info(
+        "Review gate FAIL for query %r: violations=%s",
+        query[:60],
+        violations,
+    )
+    warning = SqlWarning(
+        code=WarningCode.REVIEW_FAILED,
+        message=(
+            "Review gate flagged issues with rules: "
+            f"{', '.join(violations) or 'unknown'}. "
+            "SQL may still be correct — verify manually."
+        ),
+    )
+    return result.model_copy(update={"warnings": [*result.warnings, warning]})
+
+
 async def generate_sql(
     query: str,
     pool: asyncpg.Pool,
@@ -740,12 +895,43 @@ async def generate_sql(
 ) -> GenerateSqlResponse:
     from nl2sql_service.react_agent import run as react_run
 
-    return await react_run(
+    effective_top_k = top_k or settings.top_k
+    if settings.sql_cache_enabled:
+        cached = sql_cache.get(query, effective_top_k)
+        if cached:
+            cached["cache_hit"] = True
+            return _generate_sql_response_from_dict(cached)
+
+    result = await react_run(
         query=query,
         pool=pool,
         settings=settings,
         top_k=top_k,
     )
+    if result.status == "ok" and settings.governance_enabled:
+        result = await _apply_review_gate(
+            result=result,
+            query=query,
+            pool=pool,
+            settings=settings,
+            top_k=effective_top_k,
+        )
+    if settings.sql_cache_enabled:
+        payload = result.model_dump(mode="json")
+        payload["cache_hit"] = False
+        sql_cache.set(query, effective_top_k, payload)
+    return result
+
+
+def _generate_sql_response_from_dict(payload: dict[str, Any]) -> GenerateSqlResponse:
+    status = payload.get("status")
+    if status == "ok":
+        return GenerateSqlSuccess(**payload)
+    if status == "rejected":
+        return GenerateSqlRejected(**payload)
+    if status == "clarification_needed":
+        return GenerateSqlClarification(**payload)
+    raise ValueError(f"Unknown SQL generation status in cache: {status}")
 
 
 def _result_value(result: Any, field: str) -> Any:

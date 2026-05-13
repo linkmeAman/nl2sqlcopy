@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any
 
 import asyncpg
-import httpx
 
+from nl2sql_service import query_rewriter
 from nl2sql_service.column_loader import load_columns_for_tables
-from nl2sql_service.config import Settings
+from nl2sql_service.config import Settings, settings as default_settings
+from nl2sql_service.instruction_store import record_instruction_outcome
+from nl2sql_service.model_client import get_model_client
 from nl2sql_service.models import (
+    GenerateSqlClarification,
     GenerateSqlRejected,
     GenerateSqlResponse,
     GenerateSqlSuccess,
@@ -18,6 +22,7 @@ from nl2sql_service.models import (
     SqlWarning,
     WarningCode,
 )
+from nl2sql_service.rulebook import build_governance_block, get_config
 from nl2sql_service.retrieve import retrieve_groups
 from nl2sql_service.sql_generator import (
     build_refinement_prompt,
@@ -53,88 +58,61 @@ def looks_like_action_payload(raw: str) -> bool:
     return any(action.value in normalized for action in ReActAction)
 
 
+def combine_search_queries(refined_query: str, base_search_query: str) -> str:
+    refined = " ".join(refined_query.split())
+    base = " ".join(base_search_query.split())
+    if not refined:
+        return base
+    if not base:
+        return refined
+
+    refined_lower = refined.lower()
+    base_lower = base.lower()
+    if refined_lower == base_lower or refined_lower in base_lower:
+        return base
+    if base_lower in refined_lower:
+        return refined
+    return f"{refined}\n{base}"
+
+
 async def call_reasoning_model(
     prompt: str,
     settings: Settings,
 ) -> tuple[str, str, list[SqlWarning]]:
-    url = f"{settings.llm_base_url.rstrip('/')}/api/generate"
-    payload = {
-        "model": settings.reasoning_model,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-        "think": True,
-        "options": {
-            "temperature": settings.reasoning_temperature,
-            "num_predict": 800,
-        },
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=settings.reasoning_timeout) as client:
-            response = await client.post(url, json=payload)
-    except httpx.TimeoutException:
+    client = get_model_client(
+        settings=settings,
+        model=settings.reasoning_model,
+        default_timeout=settings.reasoning_timeout,
+    )
+    response = await client.generate(
+        prompt=prompt,
+        max_tokens=800,
+        temperature=settings.reasoning_temperature,
+        enable_thinking=True,
+        timeout=settings.reasoning_timeout,
+        response_format="json",
+    )
+    thought = response.thought or ""
+    answer = response.text or ""
+    if not answer and looks_like_action_payload(thought):
+        answer = thought
+        thought = ""
+    if not answer:
+        code = (
+            WarningCode.OLLAMA_TIMEOUT
+            if response.error_type == "timeout"
+            else WarningCode.OLLAMA_MALFORMED
+            if response.error_type in {"malformed", "empty"}
+            else WarningCode.OLLAMA_UPSTREAM
+        )
+        detail = response.error_message or f"returned no text from {client.provider_name}"
         return "", "", [
             SqlWarning(
-                code=WarningCode.OLLAMA_TIMEOUT,
-                message=(
-                    "Reasoning model timed out after "
-                    f"{settings.reasoning_timeout}s"
-                ),
-            )
-        ]
-    except httpx.RequestError as exc:
-        return "", "", [
-            SqlWarning(
-                code=WarningCode.OLLAMA_UPSTREAM,
-                message=f"Reasoning model unreachable: {exc}",
-            )
-        ]
-    except Exception as exc:  # noqa: BLE001
-        return "", "", [
-            SqlWarning(
-                code=WarningCode.OLLAMA_UPSTREAM,
-                message=f"Reasoning model unreachable: {exc}",
+                code=code,
+                message=f"Reasoning model {detail}",
             )
         ]
 
-    if not response.is_success:
-        return "", "", [
-            SqlWarning(
-                code=WarningCode.OLLAMA_UPSTREAM,
-                message=(
-                    f"Reasoning model unreachable: HTTP {response.status_code}: "
-                    f"{response.text[:200]}"
-                ),
-            )
-        ]
-
-    try:
-        data = response.json()
-    except ValueError:
-        return "", "", [
-            SqlWarning(
-                code=WarningCode.OLLAMA_MALFORMED,
-                message="Reasoning model response missing 'response' field",
-            )
-        ]
-
-    if not isinstance(data, dict) or not isinstance(data.get("response"), str):
-        return "", "", [
-            SqlWarning(
-                code=WarningCode.OLLAMA_MALFORMED,
-                message="Reasoning model response missing 'response' field",
-            )
-        ]
-
-    thought, answer = extract_think_block(data["response"])
-    if isinstance(data.get("thinking"), str) and data["thinking"].strip():
-        thinking = data["thinking"].strip()
-        if not answer and looks_like_action_payload(thinking):
-            answer = thinking
-            thought = ""
-        else:
-            thought = thinking
     return thought, answer, []
 
 
@@ -163,6 +141,8 @@ def parse_action(answer: str) -> tuple[ReActAction, str]:
             "WRITE_SQL": ReActAction.GENERATE_SQL,
             "VALIDATE": ReActAction.VALIDATE_AND_RETURN,
             "RETURN_SQL": ReActAction.VALIDATE_AND_RETURN,
+            "ASK_CLARIFICATION": ReActAction.ASK_CLARIFICATION,
+            "CLARIFY": ReActAction.ASK_CLARIFICATION,
             "GIVEUP": ReActAction.GIVE_UP,
         }
         if normalized in aliases:
@@ -242,6 +222,10 @@ def parse_action(answer: str) -> tuple[ReActAction, str]:
                 r"\b(validate|check)\b.*\b(return|sql|query)\b",
             ),
             (
+                ReActAction.ASK_CLARIFICATION,
+                r"\b(ask|request)\b.*\b(clarification|rephrase)\b",
+            ),
+            (
                 ReActAction.GIVE_UP,
                 r"\b(give\s*up|cannot|can't|unable|insufficient)\b",
             ),
@@ -310,7 +294,9 @@ def build_react_prompt(
     history: list[ReActStep],
     current_error: str,
     dialect: str,
+    settings: Settings | None = None,
 ) -> str:
+    active_settings = settings or default_settings
     column_lines = [
         f"  {table}: {', '.join(columns)}"
         for table, columns in allowed_columns.items()
@@ -324,8 +310,14 @@ def build_react_prompt(
         for step in history
     ]
     rendered_history = "\n".join(history_lines) if history_lines else "(empty)"
+    governance = ""
+    if active_settings.governance_enabled and active_settings.governance_inject_react:
+        governance = build_governance_block(
+            get_config(active_settings),
+            context="react",
+        )
 
-    return f"""
+    prompt = f"""
 You are a SQL planning agent for a {dialect} database.
 Your job is to analyse the situation and decide the
 next action to take.
@@ -339,12 +331,20 @@ AVAILABLE ACTIONS:
   using deepseek-coder
 - VALIDATE_AND_RETURN: current SQL passed validation,
   return it as the answer
+- ASK_CLARIFICATION: use this when you have tried to
+  retrieve context and cannot find relevant tables at
+  all - the user needs to rephrase their question
 - GIVE_UP: cannot generate valid SQL, explain why
 
 USER QUESTION: {query}
 
 RETRIEVED SCHEMA CONTEXT:
 {context}
+
+IMPORTANT: If USER-PROVIDED RULES are present above,
+follow them strictly. They override your defaults.
+Do not ignore table relationships, term mappings,
+or filter rules listed there.
 
 TABLES IN SCOPE: {', '.join(tables_in_scope)}
 
@@ -369,12 +369,16 @@ STRICT RULES:
 - If columns are missing, use FETCH_SCHEMA
 - If everything looks good, use GENERATE_SQL
 - If SQL passed all checks, use VALIDATE_AND_RETURN
+- If retrieval cannot find relevant tables at all after trying, use ASK_CLARIFICATION
 - If error is unrecoverable, use GIVE_UP
 
 Think carefully about what went wrong and what to do.
 Then output EXACTLY:
-{{"action":"<one of the five actions above>","input":"<brief instruction for the action>"}}
+{{"action":"<one of the six actions above>","input":"<brief instruction for the action>"}}
 """.strip()
+    if governance:
+        return f"{governance}\n\n{prompt}"
+    return prompt
 
 
 async def execute_action(
@@ -387,10 +391,15 @@ async def execute_action(
 ) -> tuple[str, list[SqlWarning]]:
     if action == ReActAction.RETRIEVE_MORE_CONTEXT:
         refined_query = action_input if action_input else query
+        search_query = combine_search_queries(
+            refined_query,
+            str(state.get("search_query") or query),
+        )
         result = await retrieve_groups(
             query=refined_query,
             top_k=state["top_k"],
             pool=pool,
+            search_query=search_query,
         )
         state["context"] = _result_value(result, "context")
         state["tables_in_scope"] = _result_value(result, "tables_in_scope")
@@ -435,6 +444,7 @@ async def execute_action(
                 validation_errors=state["last_validation_errors"],
                 attempt=generation_count,
                 planner_instruction=action_input,
+                settings=settings,
             )
         else:
             prompt = build_sql_prompt(
@@ -444,6 +454,7 @@ async def execute_action(
                 allowed_columns=state["allowed_columns"],
                 dialect=settings.sql_dialect,
                 planner_instruction=action_input,
+                settings=settings,
             )
         raw, warnings = await call_ollama(
             prompt=prompt,
@@ -510,13 +521,78 @@ async def execute_action(
         observation = f"FAILED: {error_summary}"
         return observation, blocking_warnings
 
-    observation = f"Agent gave up: {action_input}"
-    return observation, [
-        SqlWarning(
-            code=WarningCode.MAX_RETRIES_EXCEEDED,
-            message=f"ReAct agent chose GIVE_UP: {action_input}",
-        )
+    if action == ReActAction.ASK_CLARIFICATION:
+        return "Agent requested clarification.", []
+
+    return f"Agent gave up: {action_input}", []
+
+
+async def build_clarification(
+    query: str,
+    failure_reason: str,
+    all_warnings: list[SqlWarning],
+    react_trace: ReactTrace,
+    settings: Settings,
+) -> GenerateSqlClarification:
+    del all_warnings
+    prompt = f"""
+A user asked a database question but SQL generation failed.
+
+User question: "{query}"
+Failure reason: "{failure_reason}"
+
+Your job: ask ONE clarifying question and provide
+2-3 refined query suggestions that would work better.
+
+Be specific. Use database terms where helpful.
+Example: instead of "employee named aman", suggest
+"find employee by contact name aman" or
+"search member with name containing aman".
+
+Output EXACTLY this format - no other text:
+QUESTION: <one clear clarifying question>
+SUGGESTION_1: <refined query>
+SUGGESTION_2: <refined query>
+SUGGESTION_3: <optional third suggestion>
+""".strip()
+    fallback_question = (
+        f"I couldn't generate valid SQL for '{query}'. "
+        "Could you rephrase or add more detail?"
+    )
+    fallback_suggestions = [
+        "Show recent records from the most relevant table",
+        "Search by a specific column value",
     ]
+
+    question = fallback_question
+    suggestions = fallback_suggestions
+    try:
+        client = get_model_client(
+            settings=settings,
+            model=settings.reasoning_model,
+            default_timeout=settings.reasoning_timeout,
+        )
+        response = await client.generate(
+            prompt=prompt,
+            max_tokens=300,
+            temperature=0.3,
+            enable_thinking=False,
+            timeout=settings.reasoning_timeout,
+        )
+        parsed_question, parsed_suggestions = _parse_clarification_response(response.text)
+        if parsed_question and len(parsed_suggestions) >= 2:
+            question = parsed_question
+            suggestions = parsed_suggestions[:3]
+    except Exception:  # noqa: BLE001
+        pass
+
+    return GenerateSqlClarification(
+        question=question,
+        suggestions=suggestions[:3],
+        original_query=query,
+        failure_reason=failure_reason,
+        react_trace=react_trace,
+    )
 
 
 async def run(
@@ -525,10 +601,12 @@ async def run(
     settings: Settings,
     top_k: int | None = None,
 ) -> GenerateSqlResponse:
+    search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
     result = await retrieve_groups(
         query=query,
         top_k=top_k or settings.top_k,
         pool=pool,
+        search_query=search_query,
     )
     tables_in_scope = _result_value(result, "tables_in_scope")
     initial_columns = await load_columns_for_tables(
@@ -546,6 +624,7 @@ async def run(
         "sql_generation_count": 0,
         "tables_used": [],
         "top_k": top_k or settings.top_k,
+        "search_query": search_query,
     }
 
     steps: list[ReActStep] = []
@@ -563,12 +642,22 @@ async def run(
             history=steps,
             current_error=current_error,
             dialect=settings.sql_dialect,
+            settings=settings,
         )
 
         thought, answer, reason_warnings = await call_reasoning_model(prompt, settings)
         if reason_warnings:
             all_warnings.extend(reason_warnings)
-            break
+            trace = ReactTrace(
+                steps=steps,
+                total_iterations=len(steps),
+                final_action=last_completed_action if steps else ReActAction.GIVE_UP,
+            )
+            return GenerateSqlRejected(
+                warnings=all_warnings,
+                attempt_count=len(steps),
+                react_trace=trace,
+            )
 
         action, action_input = parse_action(answer)
         if action == ReActAction.GIVE_UP and action_input == "Could not parse action":
@@ -616,6 +705,40 @@ async def run(
         )
         last_completed_action = completed_action
 
+        if _is_transport_failure(action_warnings):
+            all_warnings.extend(action_warnings)
+            trace = ReactTrace(
+                steps=steps,
+                total_iterations=iteration,
+                final_action=completed_action,
+            )
+            return GenerateSqlRejected(
+                warnings=all_warnings,
+                attempt_count=iteration,
+                react_trace=trace,
+            )
+
+        if action in {ReActAction.GIVE_UP, ReActAction.ASK_CLARIFICATION}:
+            trace = ReactTrace(
+                steps=steps,
+                total_iterations=iteration,
+                final_action=action,
+            )
+            asyncio.create_task(
+                record_instruction_outcome(
+                    tables_used=state.get("tables_in_scope", []),
+                    success=False,
+                    pool=pool,
+                )
+            )
+            return await build_clarification(
+                query=query,
+                failure_reason=action_input or "Could not generate valid SQL",
+                all_warnings=all_warnings,
+                react_trace=trace,
+                settings=settings,
+            )
+
         if blocking_action_warnings:
             current_error = "; ".join(
                 warning.message for warning in blocking_action_warnings
@@ -636,6 +759,13 @@ async def run(
                 total_iterations=iteration,
                 final_action=completed_action,
             )
+            asyncio.create_task(
+                record_instruction_outcome(
+                    tables_used=state["tables_used"],
+                    success=True,
+                    pool=pool,
+                )
+            )
             return GenerateSqlSuccess(
                 sql=state["current_sql"],
                 warnings=info_warnings,
@@ -645,11 +775,9 @@ async def run(
                 react_trace=trace,
             )
 
-        if action == ReActAction.GIVE_UP:
-            break
-
     if len(steps) >= max_iterations and (
-        not steps or steps[-1].action != ReActAction.GIVE_UP
+        not steps
+        or steps[-1].action not in {ReActAction.GIVE_UP, ReActAction.ASK_CLARIFICATION}
     ):
         all_warnings.append(
             SqlWarning(
@@ -665,10 +793,21 @@ async def run(
         total_iterations=len(steps),
         final_action=last_completed_action if steps else ReActAction.GIVE_UP,
     )
-    return GenerateSqlRejected(
-        warnings=all_warnings,
-        attempt_count=len(steps),
+    codes = [warning.code.value for warning in all_warnings]
+    failure_reason = "; ".join(codes) if codes else "Could not generate valid SQL"
+    asyncio.create_task(
+        record_instruction_outcome(
+            tables_used=state.get("tables_in_scope", []),
+            success=False,
+            pool=pool,
+        )
+    )
+    return await build_clarification(
+        query=query,
+        failure_reason=failure_reason,
+        all_warnings=all_warnings,
         react_trace=trace,
+        settings=settings,
     )
 
 
@@ -678,6 +817,38 @@ def _blocking_warnings(warnings: list[SqlWarning]) -> list[SqlWarning]:
         for warning in warnings
         if warning.code != WarningCode.MYSQL_EXPLAIN_UNAVAILABLE
     ]
+
+
+def _is_transport_failure(warnings: list[SqlWarning]) -> bool:
+    transport_codes = {
+        WarningCode.OLLAMA_TIMEOUT,
+        WarningCode.OLLAMA_UPSTREAM,
+        WarningCode.OLLAMA_MALFORMED,
+    }
+    return bool(warnings) and all(warning.code in transport_codes for warning in warnings)
+
+
+def _parse_clarification_response(text: str) -> tuple[str, list[str]]:
+    question = ""
+    suggestions: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        question_match = re.match(r"QUESTION\s*:\s*(.+)", stripped, flags=re.IGNORECASE)
+        if question_match:
+            question = question_match.group(1).strip()
+            continue
+        suggestion_match = re.match(
+            r"SUGGESTION_\d+\s*:\s*(.+)",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        if suggestion_match:
+            suggestion = suggestion_match.group(1).strip()
+            if suggestion:
+                suggestions.append(suggestion)
+    return question, suggestions
 
 
 def _result_value(result: Any, field: str) -> Any:

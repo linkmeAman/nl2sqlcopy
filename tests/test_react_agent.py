@@ -6,6 +6,7 @@ import pytest
 
 from nl2sql_service import react_agent
 from nl2sql_service.config import settings
+from nl2sql_service.model_client import ModelResponse
 from nl2sql_service.models import ReActAction, SqlWarning, WarningCode
 
 
@@ -218,8 +219,9 @@ async def test_final_iteration_generated_sql_is_auto_validated(
 async def test_reasoning_model_chooses_give_up(
     mock_call_reasoning_model,
     mock_react_retrieve,
+    mock_build_clarification,
 ):
-    del mock_react_retrieve
+    del mock_react_retrieve, mock_build_clarification
     mock_call_reasoning_model.return_value = (
         "The schema context is insufficient to continue",
         "ACTION: GIVE_UP\nINPUT: Cannot determine correct table structure",
@@ -232,14 +234,8 @@ async def test_reasoning_model_chooses_give_up(
         settings=settings,
     )
 
-    assert response.status == "rejected"
-    terminal_warnings = [
-        warning for warning in response.warnings if warning.code == WarningCode.MAX_RETRIES_EXCEEDED
-    ]
-    assert len(terminal_warnings) == 1
-    assert terminal_warnings[0].message == (
-        "ReAct agent chose GIVE_UP: Cannot determine correct table structure"
-    )
+    assert response.status == "clarification_needed"
+    assert response.failure_reason == "Cannot determine correct table structure"
     assert response.react_trace is not None
     assert response.react_trace.final_action == ReActAction.GIVE_UP
 
@@ -268,11 +264,12 @@ async def test_unparseable_empty_planner_response_recovers_to_generate_then_vali
 
 
 @pytest.mark.asyncio
-async def test_explicit_unknown_action_still_rejects(
+async def test_explicit_unknown_action_returns_clarification(
     mock_call_reasoning_model,
     mock_react_retrieve,
+    mock_build_clarification,
 ):
-    del mock_react_retrieve
+    del mock_react_retrieve, mock_build_clarification
     mock_call_reasoning_model.return_value = (
         "",
         "ACTION: NOT_REAL\nINPUT: bad input",
@@ -285,7 +282,7 @@ async def test_explicit_unknown_action_still_rejects(
         settings=settings,
     )
 
-    assert response.status == "rejected"
+    assert response.status == "clarification_needed"
     assert response.react_trace is not None
     assert response.react_trace.final_action == ReActAction.GIVE_UP
 
@@ -296,8 +293,9 @@ async def test_max_iterations_exhausted(
     mock_call_reasoning_model,
     mock_react_retrieve,
     mock_react_call_ollama,
+    mock_build_clarification,
 ):
-    del mock_react_retrieve
+    del mock_react_retrieve, mock_build_clarification
     monkeypatch.setattr(settings, "react_max_iterations", 3)
     mock_call_reasoning_model.return_value = (
         "I will keep generating SQL",
@@ -312,12 +310,12 @@ async def test_max_iterations_exhausted(
         settings=settings,
     )
 
-    assert response.status == "rejected"
+    assert response.status == "clarification_needed"
     assert response.react_trace is not None
     assert response.react_trace.total_iterations == 3
     assert response.react_trace.steps[-1].action == ReActAction.GENERATE_SQL
     assert response.react_trace.final_action == ReActAction.VALIDATE_AND_RETURN
-    assert any(warning.code == WarningCode.MAX_RETRIES_EXCEEDED for warning in response.warnings)
+    assert WarningCode.MAX_RETRIES_EXCEEDED.value in response.failure_reason
 
 
 @pytest.mark.asyncio
@@ -404,12 +402,13 @@ async def test_retry_generation_uses_refinement_prompt_and_planner_input(
 
 
 @pytest.mark.asyncio
-async def test_react_trace_in_rejected_response(
+async def test_react_trace_in_clarification_response(
     client,
     mock_call_reasoning_model,
     mock_react_retrieve,
+    mock_build_clarification,
 ):
-    del mock_react_retrieve
+    del mock_react_retrieve, mock_build_clarification
     mock_call_reasoning_model.return_value = (
         "There is not enough information to continue",
         "ACTION: GIVE_UP\nINPUT: Cannot determine correct table structure",
@@ -423,7 +422,7 @@ async def test_react_trace_in_rejected_response(
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "rejected"
+    assert body["status"] == "clarification_needed"
     assert "react_trace" in body
     assert isinstance(body["react_trace"]["steps"], list)
     assert body["react_trace"]["total_iterations"] >= 1
@@ -497,33 +496,19 @@ def test_extract_think_block_parsing():
 async def test_call_reasoning_model_uses_thinking_action_when_response_empty(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    class FakeResponse:
-        is_success = True
-
-        def json(self) -> dict:
-            return {
-                "response": "",
-                "thinking": '{"action":"GENERATE_SQL","input":"show payments"}',
-            }
-
     class FakeClient:
-        def __init__(self, timeout: int) -> None:
-            self.timeout = timeout
+        provider_name = "fake"
 
-        async def __aenter__(self):
-            return self
+        async def generate(self, **kwargs):
+            assert kwargs["enable_thinking"] is True
+            assert kwargs["max_tokens"] == 800
+            assert kwargs["response_format"] == "json"
+            return ModelResponse(
+                text="",
+                thought='{"action":"GENERATE_SQL","input":"show payments"}',
+            )
 
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def post(self, url: str, json: dict) -> FakeResponse:
-            del url
-            assert json["format"] == "json"
-            assert json["think"] is True
-            assert "thinking" not in json["options"]
-            return FakeResponse()
-
-    monkeypatch.setattr(react_agent.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(react_agent, "get_model_client", lambda **kwargs: FakeClient())
 
     thought, answer, warnings = await react_agent.call_reasoning_model(
         "prompt",

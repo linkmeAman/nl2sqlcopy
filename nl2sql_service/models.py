@@ -72,11 +72,32 @@ class IngestGroupsRequest(BaseModel):
     group_names: list[str] | None = None
 
 
+class GroupEmbeddingStatusItem(BaseModel):
+    group_name: str
+    entity_id: str
+    file_hash: str
+    stored_version: str | None
+    is_current: bool
+    last_embedded_at: str | None
+
+
+class GroupEmbeddingStatusResponse(BaseModel):
+    groups: list[GroupEmbeddingStatusItem]
+    current_count: int
+    stale_count: int
+    never_embedded_count: int
+
+
 class EnrichmentSummary(BaseModel):
     groups_with_columns: int
     groups_without_columns: int
     groups_with_aliases: int
     groups_with_examples: int
+
+
+class GroupIngestFailure(BaseModel):
+    group_name: str
+    reason: str
 
 
 class IngestKnowledgeRequest(BaseModel):
@@ -115,6 +136,7 @@ class GroupQueryResponse(BaseModel):
 class GenerateSqlRequest(BaseModel):
     query: str
     top_k: int | None = None
+    request_id: str | None = None
 
 
 class WarningCode(str, Enum):
@@ -133,6 +155,8 @@ class WarningCode(str, Enum):
     ANSWER_TIMEOUT = "ANSWER_TIMEOUT"
     ANSWER_UPSTREAM = "ANSWER_UPSTREAM"
     ANSWER_MALFORMED = "ANSWER_MALFORMED"
+    ANSWER_HALLUCINATION = "ANSWER_HALLUCINATION"
+    REVIEW_FAILED = "REVIEW_FAILED"
     MAX_RETRIES_EXCEEDED = "MAX_RETRIES_EXCEEDED"
 
 
@@ -146,6 +170,7 @@ class ReActAction(str, Enum):
     FETCH_SCHEMA = "FETCH_SCHEMA"
     GENERATE_SQL = "GENERATE_SQL"
     VALIDATE_AND_RETURN = "VALIDATE_AND_RETURN"
+    ASK_CLARIFICATION = "ASK_CLARIFICATION"
     GIVE_UP = "GIVE_UP"
 
 
@@ -170,6 +195,7 @@ class GenerateSqlSuccess(BaseModel):
     tables_used: list[str]
     matched_groups: list[str]
     attempt_count: int
+    cache_hit: bool = False
     react_trace: ReactTrace | None = None
 
 
@@ -178,11 +204,22 @@ class GenerateSqlRejected(BaseModel):
     sql: None = None
     warnings: list[SqlWarning]
     attempt_count: int
+    cache_hit: bool = False
+    react_trace: ReactTrace | None = None
+
+
+class GenerateSqlClarification(BaseModel):
+    status: Literal["clarification_needed"] = "clarification_needed"
+    question: str
+    suggestions: list[str]
+    original_query: str
+    failure_reason: str
+    cache_hit: bool = False
     react_trace: ReactTrace | None = None
 
 
 GenerateSqlResponse = Annotated[
-    GenerateSqlSuccess | GenerateSqlRejected,
+    GenerateSqlSuccess | GenerateSqlRejected | GenerateSqlClarification,
     Field(discriminator="status"),
 ]
 
@@ -190,6 +227,7 @@ GenerateSqlResponse = Annotated[
 class AskRequest(BaseModel):
     query: str
     top_k: int | None = None
+    request_id: str | None = None
 
 
 class AskSuccess(BaseModel):
@@ -215,9 +253,68 @@ class AskRejected(BaseModel):
 
 
 AskResponse = Annotated[
-    AskSuccess | AskRejected,
+    AskSuccess | AskRejected | GenerateSqlClarification,
     Field(discriminator="status"),
 ]
+
+
+class PatternFeedbackRequest(BaseModel):
+    pattern_id: int
+    helpful: bool
+
+
+# ---------------------------------------------------------------------------
+# Interactive learning models
+# ---------------------------------------------------------------------------
+
+
+class InstructionType(str, Enum):
+    TABLE_RELATIONSHIP = "table_relationship"
+    BUSINESS_RULE = "business_rule"
+    QUERY_METHODOLOGY = "query_methodology"
+    TERM_MAPPING = "term_mapping"
+    FILTER_RULE = "filter_rule"
+    CORRECTION = "correction"
+
+
+class TeachRequest(BaseModel):
+    instruction_type: InstructionType
+    content: str
+    tables_affected: list[str] = Field(default_factory=list)
+    source_query: str | None = None
+
+
+class LearningStatus(str, Enum):
+    SAVED_NEW = "saved_new"
+    UPDATED_EXISTING = "updated_existing"
+    CONFLICT_DETECTED = "conflict_detected"
+    PENDING_CONFIRMATION = "pending_confirmation"
+    SIMILAR_FOUND = "similar_found"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+
+
+class SimilarInstruction(BaseModel):
+    id: int
+    instruction_type: str
+    content: str
+    confidence_score: float
+    is_verified: bool
+    use_count: int
+
+
+class TeachResponse(BaseModel):
+    learning_status: LearningStatus
+    message: str
+    instruction_id: int | None = None
+    similar_instructions: list[SimilarInstruction] = Field(default_factory=list)
+    requires_confirmation: bool = False
+    confirmation_token: str | None = None
+
+
+class ConfirmRequest(BaseModel):
+    confirmation_token: str
+    action: Literal["confirm", "reject", "replace"]
 
 
 # ---------------------------------------------------------------------------
@@ -233,3 +330,26 @@ class IngestResponse(BaseModel):
 
 class IngestGroupsResponse(IngestResponse):
     enrichment_summary: EnrichmentSummary | None = None
+    failed_groups: list[GroupIngestFailure] = Field(default_factory=list)
+    failure_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Evaluation / telemetry models
+# ---------------------------------------------------------------------------
+
+
+class BenchmarkCaseCreateRequest(BaseModel):
+    query: str
+    gold_sql: str | None = None
+    expected_status: Literal["ok", "clarification_needed", "rejected"] = "ok"
+    slices: list[str] = Field(default_factory=list)
+    error_label: str | None = None
+    source: str = "manual"
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class BenchmarkCaseCreateResponse(BaseModel):
+    id: int
+    query: str
+    expected_status: str

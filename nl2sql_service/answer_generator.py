@@ -1,12 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
-import httpx
-
-from nl2sql_service.config import Settings
+from nl2sql_service.config import Settings, settings as default_settings
+from nl2sql_service.model_client import get_model_client
 from nl2sql_service.models import SqlWarning, WarningCode
-from nl2sql_service.react_agent import extract_think_block
+from nl2sql_service.rulebook import build_governance_block, get_config
 from nl2sql_service.sql_generator import select_relevant_column_indexes
 
 
@@ -48,8 +48,107 @@ def _format_result_table(
     return "\n".join(rendered_rows)
 
 
+def _format_template_rows(
+    columns: list[str],
+    rows: list[tuple[Any, ...]],
+    max_rows: int = 10,
+) -> str:
+    if not rows:
+        return "(no rows)"
+
+    rendered_rows: list[str] = []
+    for row_index, row in enumerate(rows[:max_rows], start=1):
+        values = []
+        for col_index, column in enumerate(columns):
+            value = None if col_index >= len(row) else row[col_index]
+            rendered = "NULL" if value is None else str(value)
+            values.append(f"{column}={rendered}")
+        rendered_rows.append(f"Row {row_index}: {', '.join(values)}")
+    return "\n".join(rendered_rows)
+
+
+def _rows_to_dicts(columns: list[str], rows: list[tuple[Any, ...]]) -> list[dict[str, Any]]:
+    return [
+        {
+            column: None if index >= len(row) else row[index]
+            for index, column in enumerate(columns)
+        }
+        for row in rows
+    ]
+
+
+def _parse_answer_template(text: str) -> dict[str, str] | None:
+    sections: dict[str, str] = {}
+    current: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(
+            r"^(ANSWER|KEY\s+FIGURES|DETAILS)\s*:\s*(.*)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            current = re.sub(r"\s+", " ", match.group(1).upper())
+            sections[current] = match.group(2).strip()
+            continue
+        if current:
+            sections[current] = f"{sections[current]} {line}".strip()
+
+    required = {"ANSWER", "KEY FIGURES", "DETAILS"}
+    if not required.issubset(sections):
+        return None
+    return sections
+
+
+def _combine_answer_sections(sections: dict[str, str]) -> str:
+    parts: list[str] = []
+    answer = sections.get("ANSWER", "").strip()
+    key_figures = sections.get("KEY FIGURES", "").strip()
+    details = sections.get("DETAILS", "").strip()
+
+    if answer and answer.lower() != "none":
+        parts.append(answer.rstrip("."))
+    if key_figures and key_figures.lower() != "none":
+        parts.append(f"Key figures: {key_figures.rstrip('.')}")
+    if details and details.lower() != "none":
+        parts.append(f"Details: {details.rstrip('.')}")
+
+    if not parts:
+        return ""
+    return ". ".join(parts).strip() + "."
+
+
 def _fallback_column_indexes(query: str, columns: list[str], max_columns: int = 8) -> list[int]:
     return select_relevant_column_indexes(query, columns, max_columns)
+
+
+def _truncate_to_max_words(text: str, max_words: int) -> str:
+    if max_words <= 0:
+        return text.strip()
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    return " ".join(words[:max_words]).strip()
+
+
+def _enforce_answer_style(text: str, settings: Settings) -> str:
+    cleaned = text.strip()
+    if settings.answer_strict_concise:
+        prefixes = (
+            "okay, let's tackle this.",
+            "let's tackle this.",
+            "here's the answer:",
+            "based on the result",
+        )
+        lowered = cleaned.lower()
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                cleaned = cleaned[len(prefix):].lstrip(" :\n")
+                lowered = cleaned.lower()
+
+    return _truncate_to_max_words(cleaned, settings.answer_max_words)
 
 
 def build_fallback_answer(
@@ -89,117 +188,86 @@ def build_answer_prompt(
     rows: list[tuple[Any, ...]],
     row_count: int,
     warnings: list[SqlWarning],
+    settings: Settings,
 ) -> str:
-    display_indexes = _fallback_column_indexes(query, columns)
-    display_columns = [columns[index] for index in display_indexes]
-    return "\n".join(
-        [
-            "You are an assistant that summarizes SQL query results for business users.",
-            "Answer in at most 80 words.",
-            "For show/list queries, use compact numbered lines.",
-            "Do not output SQL unless the user explicitly asked for SQL.",
-            "If no rows are returned, say that clearly.",
-            "Use only the displayed result rows and columns.",
-            "",
-            "User question:",
-            query,
-            "",
-            "Executed SQL:",
-            sql,
-            "",
-            f"Row count: {row_count}",
-            "Displayed columns:",
-            ", ".join(display_columns) if display_columns else "(none)",
-            "",
-            "Result rows (first 10 rows, selected columns):",
-            "```text",
-            _format_result_table(columns, rows, display_indexes, max_rows=10),
-            "```",
-            "",
-            "Warnings:",
-            _format_warning_lines(warnings),
-            "",
-            "Return only the final answer text.",
-        ]
-    )
+    del sql, warnings
+    active_settings = settings or default_settings
+    rows_formatted = _format_template_rows(columns, rows, max_rows=10)
+    prompt = f"""
+You are a concise data analyst. Answer using ONLY the
+data provided. Do not add information not in the data.
+
+QUESTION: {query}
+
+DATA ({row_count} rows):
+Columns: {", ".join(columns) if columns else "(none)"}
+{rows_formatted}
+
+Fill this template exactly. Do not write anything else:
+
+ANSWER: <one sentence directly answering the question>
+KEY FIGURES: <any counts, totals, amounts from the data,
+              or "none" if not applicable>
+DETAILS: <up to 2 specific facts from the data,
+          or "none" if not useful>
+""".strip()
+    if active_settings.governance_enabled and active_settings.governance_inject_answer:
+        governance = build_governance_block(
+            get_config(active_settings),
+            context="answer",
+        )
+        if governance:
+            return f"{prompt}\n\n{governance}"
+    return prompt
+
+
+def validate_answer_numbers(
+    answer: str,
+    rows: list[dict],
+) -> list[str]:
+    numbers = re.findall(r"\b\d+(?:\.\d+)?\b", answer)
+    violations: list[str] = []
+    cell_values = [str(value) for row in rows for value in row.values()]
+    for number in numbers:
+        if not any(number in value for value in cell_values):
+            violations.append(f"Number '{number}' in answer not found in data")
+    return violations
 
 
 async def call_answer_model(
     prompt: str,
     settings: Settings,
 ) -> tuple[str | None, list[SqlWarning]]:
-    url = f"{settings.llm_base_url.rstrip('/')}/api/generate"
     model_name = settings.answer_model or settings.reasoning_model
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "stream": False,
-        "think": False,
-        "options": {
-            "temperature": settings.answer_temperature,
-            "num_predict": 300,
-        },
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=settings.answer_timeout) as client:
-            response = await client.post(url, json=payload)
-    except httpx.TimeoutException:
+    client = get_model_client(
+        settings=settings,
+        model=model_name,
+        default_timeout=settings.answer_timeout,
+    )
+    response = await client.generate(
+        prompt=prompt,
+        max_tokens=settings.answer_max_tokens,
+        temperature=settings.answer_temperature,
+        enable_thinking=settings.answer_allow_reasoning,
+        timeout=settings.answer_timeout,
+    )
+    if not response.text:
+        code = (
+            WarningCode.ANSWER_TIMEOUT
+            if response.error_type == "timeout"
+            else WarningCode.ANSWER_MALFORMED
+            if response.error_type in {"malformed", "empty"}
+            else WarningCode.ANSWER_UPSTREAM
+        )
+        detail = response.error_message or f"Answer model returned no text from {client.provider_name}"
         return None, [
             SqlWarning(
-                code=WarningCode.ANSWER_TIMEOUT,
-                message=f"Answer model timed out after {settings.answer_timeout}s",
-            )
-        ]
-    except httpx.RequestError as exc:
-        return None, [
-            SqlWarning(
-                code=WarningCode.ANSWER_UPSTREAM,
-                message=f"Answer model unreachable: {exc}",
-            )
-        ]
-
-    if not response.is_success:
-        return None, [
-            SqlWarning(
-                code=WarningCode.ANSWER_UPSTREAM,
-                message=(
-                    f"Answer model unreachable: HTTP {response.status_code}: "
-                    f"{response.text[:200]}"
-                ),
+                code=code,
+                message=detail,
             )
         ]
 
-    try:
-        data = response.json()
-    except ValueError:
-        return None, [
-            SqlWarning(
-                code=WarningCode.ANSWER_MALFORMED,
-                message="Answer model response missing 'response' field",
-            )
-        ]
-
-    raw_response = data.get("response") if isinstance(data, dict) else None
-    if not isinstance(raw_response, str):
-        return None, [
-            SqlWarning(
-                code=WarningCode.ANSWER_MALFORMED,
-                message="Answer model response missing 'response' field",
-            )
-        ]
-
-    _, answer = extract_think_block(raw_response)
-    answer_text = answer.strip()
-    if not answer_text:
-        return None, [
-            SqlWarning(
-                code=WarningCode.ANSWER_MALFORMED,
-                message="Answer model returned empty answer",
-            )
-        ]
-
-    return answer_text, []
+    return response.text.strip(), []
 
 
 async def generate_answer(
@@ -218,9 +286,27 @@ async def generate_answer(
         rows=rows,
         row_count=row_count,
         warnings=sql_warnings,
+        settings=settings,
     )
     answer_text, warnings = await call_answer_model(prompt=prompt, settings=settings)
     if answer_text is not None:
-        return answer_text, warnings
+        sections = _parse_answer_template(answer_text)
+        if sections is not None:
+            rendered = _combine_answer_sections(sections)
+            if rendered:
+                answer = _enforce_answer_style(rendered, settings)
+                violations = validate_answer_numbers(answer, _rows_to_dicts(columns, rows))
+                if violations:
+                    warnings = [
+                        *warnings,
+                        SqlWarning(
+                            code=WarningCode.ANSWER_HALLUCINATION,
+                            message=(
+                                "Answer may contain invented numbers: "
+                                f"{violations}"
+                            ),
+                        ),
+                    ]
+                return answer, warnings
 
     return build_fallback_answer(query, columns, rows, row_count), warnings

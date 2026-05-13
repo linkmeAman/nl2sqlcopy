@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from nl2sql_service import sql_generator
@@ -23,6 +25,7 @@ async def test_valid_select_status_ok(client, mock_ollama, mock_retrieve_groups)
     assert body["status"] == "ok"
     assert body["sql"] is not None
     assert body["attempt_count"] == 1
+    assert body["cache_hit"] is False
     assert body["react_trace"]["total_iterations"] == 1
     assert body["react_trace"]["final_action"] == "VALIDATE_AND_RETURN"
     assert "invoice" in body["tables_used"]
@@ -58,8 +61,25 @@ def test_sql_prompts_use_concise_column_selection_rule():
     )
 
     assert "choose concise, semantically relevant columns" in prompt
+    assert "COLUMN SELECTION RULE:" in prompt
+    assert "Do NOT select: financial columns" in prompt
     assert "Use SELECT * only when the user explicitly asks" in prompt
     assert "Do not use SELECT *" not in prompt
+
+
+def test_refinement_prompt_uses_column_selection_rule():
+    prompt = sql_generator.build_refinement_prompt(
+        query="show recent inquiries",
+        context="Group: inquiry_lifecycle",
+        tables_in_scope=["inquiry"],
+        dialect="mysql",
+        previous_sql="SELECT * FROM inquiry",
+        validation_errors=[],
+        attempt=1,
+    )
+
+    assert "COLUMN SELECTION RULE:" in prompt
+    assert "SELECT only the columns needed for the calculation" in prompt
 
 
 def test_inquiry_select_star_is_narrowed_without_low_signal_columns():
@@ -123,7 +143,13 @@ async def test_leading_comment_valid_select(client, mock_ollama, mock_retrieve_g
 
 
 @pytest.mark.asyncio
-async def test_destructive_sql_status_rejected(client, mock_ollama, mock_retrieve_groups):
+async def test_destructive_sql_returns_clarification(
+    client,
+    mock_ollama,
+    mock_retrieve_groups,
+    mock_build_clarification,
+):
+    del mock_build_clarification
     mock_ollama.return_value = ("DROP TABLE invoice", [])
 
     response = await client.post(
@@ -133,17 +159,20 @@ async def test_destructive_sql_status_rejected(client, mock_ollama, mock_retriev
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "rejected"
-    assert any(
-        warning["code"] == WarningCode.SQL_DESTRUCTIVE.value
-        for warning in body["warnings"]
-    )
-    assert body["sql"] is None
+    assert body["status"] == "clarification_needed"
+    assert WarningCode.SQL_DESTRUCTIVE.value in body["failure_reason"]
+    assert "sql" not in body
     assert "tables_used" not in body
 
 
 @pytest.mark.asyncio
-async def test_multi_statement_status_rejected(client, mock_ollama, mock_retrieve_groups):
+async def test_multi_statement_returns_clarification(
+    client,
+    mock_ollama,
+    mock_retrieve_groups,
+    mock_build_clarification,
+):
+    del mock_build_clarification
     mock_ollama.return_value = ("SELECT * FROM invoice; DROP TABLE invoice", [])
 
     response = await client.post(
@@ -153,11 +182,8 @@ async def test_multi_statement_status_rejected(client, mock_ollama, mock_retriev
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "rejected"
-    assert any(
-        warning["code"] == WarningCode.SQL_MULTI_STATEMENT.value
-        for warning in body["warnings"]
-    )
+    assert body["status"] == "clarification_needed"
+    assert WarningCode.SQL_MULTI_STATEMENT.value in body["failure_reason"]
 
 
 @pytest.mark.asyncio
@@ -180,11 +206,13 @@ async def test_unknown_table_self_corrects(client, mock_ollama, mock_retrieve_gr
 
 
 @pytest.mark.asyncio
-async def test_all_attempts_fail_max_retries_exceeded(
+async def test_all_attempts_fail_returns_clarification(
     client,
     mock_ollama,
     mock_retrieve_groups,
+    mock_build_clarification,
 ):
+    del mock_build_clarification
     mock_ollama.return_value = ("SELECT * FROM forbidden_table", [])
 
     response = await client.post(
@@ -194,27 +222,21 @@ async def test_all_attempts_fail_max_retries_exceeded(
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "rejected"
-    assert body["attempt_count"] == 4
-    assert any(
-        warning["code"] == WarningCode.MAX_RETRIES_EXCEEDED.value
-        for warning in body["warnings"]
-    )
-    table_warnings = [
-        warning
-        for warning in body["warnings"]
-        if warning["code"] == WarningCode.TABLE_OUT_OF_SCOPE.value
-    ]
-    assert len(table_warnings) == 4
+    assert body["status"] == "clarification_needed"
+    assert WarningCode.MAX_RETRIES_EXCEEDED.value in body["failure_reason"]
+    assert WarningCode.TABLE_OUT_OF_SCOPE.value in body["failure_reason"]
+    assert body["react_trace"]["total_iterations"] == 4
 
 
 @pytest.mark.asyncio
-async def test_rejected_trace_after_validation_driven_retry(
+async def test_clarification_trace_after_validation_driven_retry(
     monkeypatch: pytest.MonkeyPatch,
     client,
     mock_ollama,
     mock_retrieve_groups,
+    mock_build_clarification,
 ):
+    del mock_build_clarification
     from nl2sql_service.config import settings
 
     monkeypatch.setattr(settings, "react_max_iterations", 2)
@@ -230,9 +252,8 @@ async def test_rejected_trace_after_validation_driven_retry(
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "rejected"
-    assert body["sql"] is None
-    assert body["attempt_count"] == 2
+    assert body["status"] == "clarification_needed"
+    assert "sql" not in body
 
     trace = body["react_trace"]
     assert trace["total_iterations"] == 2
@@ -246,16 +267,8 @@ async def test_rejected_trace_after_validation_driven_retry(
     assert "Auto-validation: FAILED:" in trace["steps"][0]["observation"]
     assert "Auto-validation: FAILED:" in trace["steps"][1]["observation"]
 
-    table_warnings = [
-        warning
-        for warning in body["warnings"]
-        if warning["code"] == WarningCode.TABLE_OUT_OF_SCOPE.value
-    ]
-    assert len(table_warnings) == 2
-    assert any(
-        warning["code"] == WarningCode.MAX_RETRIES_EXCEEDED.value
-        for warning in body["warnings"]
-    )
+    assert WarningCode.TABLE_OUT_OF_SCOPE.value in body["failure_reason"]
+    assert WarningCode.MAX_RETRIES_EXCEEDED.value in body["failure_reason"]
 
 
 @pytest.mark.asyncio
@@ -289,7 +302,13 @@ async def test_ollama_timeout_status_rejected_http_200(
 
 
 @pytest.mark.asyncio
-async def test_rejected_payload_shape(client, mock_ollama, mock_retrieve_groups):
+async def test_clarification_payload_shape(
+    client,
+    mock_ollama,
+    mock_retrieve_groups,
+    mock_build_clarification,
+):
+    del mock_build_clarification
     mock_ollama.return_value = ("DROP TABLE invoice", [])
 
     response = await client.post(
@@ -301,18 +320,37 @@ async def test_rejected_payload_shape(client, mock_ollama, mock_retrieve_groups)
     assert response.status_code == 200
     assert set(body.keys()) == {
         "status",
-        "sql",
-        "warnings",
-        "attempt_count",
+        "question",
+        "suggestions",
+        "original_query",
+        "failure_reason",
+        "cache_hit",
         "react_trace",
     }
+    assert body["status"] == "clarification_needed"
+    assert "sql" not in body
     assert "tables_used" not in body
     assert "matched_groups" not in body
 
 
 @pytest.mark.asyncio
-async def test_db_unavailable_returns_503(app, client, mock_ollama, mock_retrieve_groups):
+async def test_db_unavailable_returns_503(
+    app,
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_ollama,
+    mock_retrieve_groups,
+):
+    from nl2sql_service import main
+
     app.state.pool = None
+    app.state.pool_last_reconnect_attempt = 0.0
+    monkeypatch.setattr(main.settings, "db_reconnect_min_interval", 0.0)
+    monkeypatch.setattr(
+        main.db,
+        "create_pool",
+        AsyncMock(side_effect=TimeoutError("DB unavailable")),
+    )
 
     response = await client.post(
         "/generate-sql",

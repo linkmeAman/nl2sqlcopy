@@ -11,7 +11,37 @@ import pytest_asyncio
 
 from nl2sql_service import embed
 from nl2sql_service.config import settings
-from nl2sql_service.models import SqlWarning
+from nl2sql_service.models import (
+    GenerateSqlClarification,
+    LearningStatus,
+    SqlWarning,
+    TeachResponse,
+)
+
+
+@pytest.fixture(autouse=True)
+def disable_query_rewrite_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "query_rewrite_enabled", False)
+
+
+@pytest.fixture(autouse=True)
+def disable_governance_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    from nl2sql_service import rulebook
+
+    monkeypatch.setattr(settings, "governance_enabled", False)
+    monkeypatch.setattr(settings, "governance_enabled_rules", "all")
+    monkeypatch.setattr(settings, "governance_inject_react", True)
+    monkeypatch.setattr(settings, "governance_inject_sql", True)
+    monkeypatch.setattr(settings, "governance_inject_answer", True)
+    monkeypatch.setattr(rulebook, "_config", None)
+
+
+@pytest.fixture(autouse=True)
+def clear_in_memory_caches() -> None:
+    from nl2sql_service.cache import embed_cache, sql_cache
+
+    embed_cache.clear()
+    sql_cache.invalidate_all()
 
 
 @pytest.fixture
@@ -107,6 +137,181 @@ def mock_retrieve_groups(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     )
     monkeypatch.setattr(retrieve, "retrieve_groups", async_mock)
     monkeypatch.setattr(react_agent, "retrieve_groups", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_pattern_store_empty(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import pattern_store
+
+    async_mock: AsyncMock = AsyncMock(return_value=[])
+    monkeypatch.setattr(pattern_store, "get_relevant_patterns", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_pattern_store_with_join_pattern(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import pattern_store
+
+    async_mock: AsyncMock = AsyncMock(
+        return_value=[
+            {
+                "id": 1,
+                "query_text": "fetch employee named aman",
+                "sql_used": (
+                    "SELECT e.* FROM employee e JOIN contact c "
+                    "ON c.id = e.contact_id WHERE c.name LIKE '%aman%'"
+                ),
+                "tables_used": ["employee", "contact"],
+                "join_conditions": [
+                    {
+                        "left_table": "employee",
+                        "left_column": "contact_id",
+                        "right_table": "contact",
+                        "right_column": "id",
+                        "join_type": "INNER",
+                    }
+                ],
+                "matched_groups": ["inquiry_lifecycle"],
+                "use_count": 5,
+                "last_used_at": "2026-04-27T10:00:00",
+            }
+        ]
+    )
+    monkeypatch.setattr(pattern_store, "get_relevant_patterns", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_instruction_store_empty(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import instruction_store
+    from nl2sql_service import retrieve
+
+    async_mock: AsyncMock = AsyncMock(return_value=[])
+    monkeypatch.setattr(instruction_store, "get_relevant_instructions", async_mock)
+    monkeypatch.setattr(retrieve.instruction_store, "get_relevant_instructions", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_instruction_store_with_rules(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import instruction_store
+    from nl2sql_service import retrieve
+
+    async_mock: AsyncMock = AsyncMock(
+        return_value=[
+            {
+                "id": 1,
+                "instruction_type": "table_relationship",
+                "content": "employee.contact_id = contact.id",
+                "embedding_source": (
+                    "Table relationship: employee.contact_id = contact.id\n"
+                    "Tables: employee, contact"
+                ),
+                "tables_affected": ["employee", "contact"],
+                "confidence_score": 1.0,
+                "is_verified": True,
+                "is_active": True,
+                "use_count": 8,
+                "success_count": 7,
+                "failure_count": 1,
+                "last_used_at": "2026-04-28T10:00:00",
+            },
+            {
+                "id": 2,
+                "instruction_type": "term_mapping",
+                "content": "counselor means employee table",
+                "embedding_source": (
+                    "Term mapping: counselor means employee table\n"
+                    "Related tables: employee"
+                ),
+                "tables_affected": ["employee"],
+                "confidence_score": 0.9,
+                "is_verified": True,
+                "is_active": True,
+                "use_count": 5,
+                "success_count": 5,
+                "failure_count": 0,
+                "last_used_at": "2026-04-28T09:00:00",
+            },
+        ]
+    )
+    monkeypatch.setattr(instruction_store, "get_relevant_instructions", async_mock)
+    monkeypatch.setattr(retrieve.instruction_store, "get_relevant_instructions", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_process_teach_request(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import instruction_store
+    from nl2sql_service import main
+
+    async_mock: AsyncMock = AsyncMock(
+        return_value=TeachResponse(
+            learning_status=LearningStatus.SAVED_NEW,
+            message="This instruction is new. I've saved it.",
+            instruction_id=42,
+        )
+    )
+    monkeypatch.setattr(instruction_store, "process_teach_request", async_mock)
+    monkeypatch.setattr(main, "process_teach_request", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_detect_conflict_none(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import instruction_store
+
+    async_mock: AsyncMock = AsyncMock(return_value=None)
+    monkeypatch.setattr(instruction_store, "detect_conflict", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_detect_conflict_found(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import instruction_store
+
+    async_mock: AsyncMock = AsyncMock(
+        return_value={
+            "id": 10,
+            "instruction_type": "table_relationship",
+            "content": "employee links to contact via employee_id",
+            "confidence_score": 0.7,
+            "is_verified": False,
+            "use_count": 2,
+        }
+    )
+    monkeypatch.setattr(instruction_store, "detect_conflict", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_save_pattern(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import pattern_store
+
+    async_mock: AsyncMock = AsyncMock(return_value=None)
+    monkeypatch.setattr(pattern_store, "save_pattern", async_mock)
+    return async_mock
+
+
+@pytest.fixture
+def mock_build_clarification(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    from nl2sql_service import react_agent
+
+    async def build_mock(**kwargs):
+        return GenerateSqlClarification(
+            question="Are you searching for an employee or a contact?",
+            suggestions=[
+                "find employee with contact name aman",
+                "search contact by name aman",
+            ],
+            original_query=kwargs["query"],
+            failure_reason=kwargs["failure_reason"],
+            react_trace=kwargs.get("react_trace"),
+        )
+
+    async_mock: AsyncMock = AsyncMock(side_effect=build_mock)
+    monkeypatch.setattr(react_agent, "build_clarification", async_mock)
     return async_mock
 
 

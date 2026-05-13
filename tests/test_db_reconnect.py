@@ -118,7 +118,8 @@ async def test_health_attempts_reconnect_when_pool_missing(
     app.state.pool_last_reconnect_attempt = 0.0
     settings.db_reconnect_min_interval = 0.0
 
-    restored_pool = object()
+    restored_pool = AsyncMock()
+    restored_pool.execute = AsyncMock(return_value="SELECT 1")
     monkeypatch.setattr(main.db, "create_pool", AsyncMock(return_value=restored_pool))
     monkeypatch.setattr(main.db, "bootstrap", AsyncMock(return_value=None))
     monkeypatch.setattr(main.ingest, "ensure_hnsw_index", AsyncMock(return_value=None))

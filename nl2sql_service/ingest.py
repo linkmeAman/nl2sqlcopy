@@ -165,17 +165,27 @@ async def ingest_schema_groups(
         log.info("Ingesting all %d groups from rag_schema/entities/", len(names))
 
     chunks: list[dict[str, Any]] = []
+    failed_groups: list[dict[str, str]] = []
     groups_with_columns = 0
     groups_without_columns = 0
     groups_with_aliases = 0
     groups_with_examples = 0
 
     for name in names:
-        chunk = await chunker.chunk_schema_group(
-            group_name=name,
-            settings=chunker.settings,
-            allowed_columns=None,
-        )
+        try:
+            chunk = await chunker.chunk_schema_group(
+                group_name=name,
+                settings=chunker.settings,
+                allowed_columns=None,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "Exceeds 400 limit" not in message:
+                raise
+            failed_groups.append({"group_name": name, "reason": message})
+            log.warning("Skipping group '%s' during ingest: %s", name, message)
+            continue
+
         has_columns = bool(chunk.get("has_columns"))
         has_aliases = bool(chunk.get("has_aliases"))
         has_examples = bool(chunk.get("has_examples"))
@@ -204,6 +214,7 @@ async def ingest_schema_groups(
         return {
             "inserted_count": 0,
             "updated_count": 0,
+            "failed_groups": failed_groups,
             "enrichment_summary": {
                 "groups_with_columns": groups_with_columns,
                 "groups_without_columns": groups_without_columns,
@@ -245,6 +256,7 @@ async def ingest_schema_groups(
     return {
         "inserted_count": inserted_count,
         "updated_count": updated_count,
+        "failed_groups": failed_groups,
         "enrichment_summary": {
             "groups_with_columns": groups_with_columns,
             "groups_without_columns": groups_without_columns,

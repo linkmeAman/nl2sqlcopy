@@ -4,6 +4,10 @@ import json
 import asyncpg
 
 from nl2sql_service import embed
+from nl2sql_service.cache import embed_cache
+from nl2sql_service import instruction_store
+from nl2sql_service import pattern_store
+from nl2sql_service.config import settings
 from nl2sql_service.models import GroupQueryResponse, QueryResult
 
 _QUERY_SQL = """
@@ -21,15 +25,32 @@ LIMIT $2
 """
 
 
-async def retrieve(query: str, top_k: int, pool: asyncpg.Pool) -> list[QueryResult]:
+async def _embed_for_retrieval(text: str) -> list[float]:
+    if settings.embed_cache_enabled:
+        cached = embed_cache.get(text)
+        if cached:
+            return cached
+
+    vectors = await embed.embed_texts([text])
+    vector = vectors[0]
+    if settings.embed_cache_enabled:
+        embed_cache.set(text, vector)
+    return vector
+
+
+async def retrieve(
+    query: str,
+    top_k: int,
+    pool: asyncpg.Pool,
+    search_query: str | None = None,
+) -> list[QueryResult]:
     """
-    Embed *query* and return the *top_k* most similar chunks from pgvector.
+    Embed *search_query* or *query* and return similar chunks from pgvector.
 
     Similarity is cosine similarity expressed as ``1 - cosine_distance``,
     so 1.0 is an exact match and −1.0 is the opposite direction.
     """
-    vectors = await embed.embed_texts([query])
-    query_vec = vectors[0]
+    query_vec = await _embed_for_retrieval(search_query or query)
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(_QUERY_SQL, query_vec, top_k)
@@ -82,9 +103,10 @@ async def retrieve_groups(
     query: str,
     top_k: int,
     pool: asyncpg.Pool,
+    search_query: str | None = None,
 ) -> GroupQueryResponse:
     """
-    Embed *query* and return the *top_k* closest schema-group chunks.
+    Embed *search_query* or *query* and return closest schema-group chunks.
 
     Builds three output artefacts:
 
@@ -93,8 +115,7 @@ async def retrieve_groups(
       from all matched groups, preserving insertion order.
     * ``context`` – formatted multi-block string ready to paste into an LLM prompt.
     """
-    vectors = await embed.embed_texts([query])
-    query_vec = vectors[0]
+    query_vec = await _embed_for_retrieval(search_query or query)
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(_GROUP_QUERY_SQL, query_vec, top_k)
@@ -151,9 +172,33 @@ async def retrieve_groups(
         block_lines.append(row["content"])
         context_blocks.append("\n".join(block_lines))
 
+    schema_context = "\n\n---\n\n".join(context_blocks)
+    context = schema_context
+    patterns = await pattern_store.get_relevant_patterns(
+        query=query,
+        tables_in_scope=list(seen_tables),
+        pool=pool,
+        min_use_count=settings.min_pattern_use_count,
+    )
+    if patterns:
+        pattern_text = pattern_store.format_patterns_for_prompt(patterns)
+        if pattern_text:
+            context = "PREVIOUSLY LEARNED PATTERNS:\n" + pattern_text + "\n\n" + context
+
+    instructions = await instruction_store.get_relevant_instructions(
+        query=query,
+        tables_in_scope=list(seen_tables),
+        pool=pool,
+        min_confidence=settings.min_instruction_confidence,
+    )
+    if instructions:
+        instruction_text = instruction_store.format_instructions_for_prompt(instructions)
+        if instruction_text:
+            context = instruction_text + "\n\n" + context
+
     return GroupQueryResponse(
         matched_groups=matched_groups,
         tables_in_scope=list(seen_tables),
-        context="\n\n---\n\n".join(context_blocks),
+        context=context,
         results=results,
     )
