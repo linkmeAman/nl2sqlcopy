@@ -79,6 +79,22 @@ async def call_reasoning_model(
     prompt: str,
     settings: Settings,
 ) -> tuple[str, str, list[SqlWarning]]:
+    def _warnings_for_response(error_type: str | None, error_message: str | None) -> list[SqlWarning]:
+        code = (
+            WarningCode.OLLAMA_TIMEOUT
+            if error_type == "timeout"
+            else WarningCode.OLLAMA_MALFORMED
+            if error_type in {"malformed", "empty"}
+            else WarningCode.OLLAMA_UPSTREAM
+        )
+        detail = error_message or f"returned no text from {client.provider_name}"
+        return [
+            SqlWarning(
+                code=code,
+                message=f"Reasoning model {detail}",
+            )
+        ]
+
     client = get_model_client(
         settings=settings,
         model=settings.reasoning_model,
@@ -97,23 +113,33 @@ async def call_reasoning_model(
     if not answer and looks_like_action_payload(thought):
         answer = thought
         thought = ""
-    if not answer:
-        code = (
-            WarningCode.OLLAMA_TIMEOUT
-            if response.error_type == "timeout"
-            else WarningCode.OLLAMA_MALFORMED
-            if response.error_type in {"malformed", "empty"}
-            else WarningCode.OLLAMA_UPSTREAM
-        )
-        detail = response.error_message or f"returned no text from {client.provider_name}"
-        return "", "", [
-            SqlWarning(
-                code=code,
-                message=f"Reasoning model {detail}",
-            )
-        ]
+    if answer:
+        return thought, answer, []
 
-    return thought, answer, []
+    # Timeout fallback: retry once in compact non-thinking mode to reduce latency.
+    if response.error_type == "timeout":
+        fallback_timeout = min(max(10, settings.reasoning_timeout // 2), settings.reasoning_timeout)
+        fallback_response = await client.generate(
+            prompt=prompt,
+            max_tokens=220,
+            temperature=0.0,
+            enable_thinking=False,
+            timeout=fallback_timeout,
+            response_format=None,
+        )
+        fallback_answer = fallback_response.text or ""
+        fallback_thought = fallback_response.thought or ""
+        if not fallback_answer and looks_like_action_payload(fallback_thought):
+            fallback_answer = fallback_thought
+            fallback_thought = ""
+        if fallback_answer:
+            return fallback_thought, fallback_answer, []
+        return "", "", _warnings_for_response(
+            fallback_response.error_type,
+            fallback_response.error_message,
+        )
+
+    return "", "", _warnings_for_response(response.error_type, response.error_message)
 
 
 def parse_action(answer: str) -> tuple[ReActAction, str]:
