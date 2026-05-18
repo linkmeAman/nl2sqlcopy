@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -96,6 +97,35 @@ async def test_ask_rejected_sql_generation_skips_execution(
     assert body["attempt_count"] == 4
     assert mock_execute_sql.await_count == 0
     assert mock_generate_answer.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_ask_service_budget_timeout_returns_controlled_rejection(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service import main
+
+    async def slow_generate_sql(*args, **kwargs):
+        del args, kwargs
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(main.settings, "ask_timeout", 0.01)
+    monkeypatch.setattr(main, "generate_sql", slow_generate_sql)
+
+    response = await client.post(
+        "/ask",
+        json={"query": "newest payment", "top_k": 5},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "rejected"
+    assert body["sql"] is None
+    assert any(
+        warning["code"] == WarningCode.REQUEST_TIMEOUT.value
+        for warning in body["warnings"]
+    )
 
 
 @pytest.mark.asyncio

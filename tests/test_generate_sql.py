@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -297,6 +298,35 @@ async def test_ollama_timeout_status_rejected_http_200(
     assert body["status"] == "rejected"
     assert any(
         warning["code"] == WarningCode.OLLAMA_TIMEOUT.value
+        for warning in body["warnings"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_sql_service_budget_timeout_returns_rejected(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service import react_agent
+    from nl2sql_service.config import settings
+
+    async def slow_react_run(**kwargs):
+        del kwargs
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(settings, "sql_generation_timeout", 0.01)
+    monkeypatch.setattr(react_agent, "run", slow_react_run)
+
+    response = await client.post(
+        "/generate-sql",
+        json={"query": "show unpaid invoices"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "rejected"
+    assert any(
+        warning["code"] == WarningCode.REQUEST_TIMEOUT.value
         for warning in body["warnings"]
     )
 

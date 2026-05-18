@@ -51,6 +51,8 @@ def app():
     fastapi_app.state.pool = object()
     settings.llm_max_retries = 2
     settings.react_max_iterations = 4
+    settings.sql_generation_timeout = 90
+    settings.ask_timeout = 105
     settings.top_k = 5
     return fastapi_app
 

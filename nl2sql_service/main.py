@@ -90,6 +90,8 @@ def _derive_error_source(warnings: list[SqlWarning]) -> str | None:
     if not warnings:
         return None
     for warning in warnings:
+        if warning.code == WarningCode.REQUEST_TIMEOUT:
+            return "service_timeout"
         if warning.code in {WarningCode.OLLAMA_TIMEOUT, WarningCode.OLLAMA_UPSTREAM, WarningCode.OLLAMA_MALFORMED}:
             return "generation_transport"
         if warning.code in {
@@ -935,6 +937,58 @@ async def ask_endpoint(
     request_id = _resolve_request_id(request.request_id)
     set_request_id(request_id)
     started = time.monotonic()
+    try:
+        return await asyncio.wait_for(
+            _run_ask_workflow(
+                request=request,
+                pool=pool,
+                top_k=top_k,
+                request_id=request_id,
+                started=started,
+            ),
+            timeout=settings.ask_timeout,
+        )
+    except asyncio.TimeoutError:
+        response = AskRejected(
+            sql=None,
+            warnings=[
+                SqlWarning(
+                    code=WarningCode.REQUEST_TIMEOUT,
+                    message=(
+                        "Ask workflow exceeded the service time budget "
+                        f"of {settings.ask_timeout}s."
+                    ),
+                )
+            ],
+            attempt_count=0,
+            react_trace=None,
+        )
+        asyncio.create_task(
+            _log_request_event(
+                pool,
+                request_id=request_id,
+                endpoint="/ask",
+                query_text=request.query,
+                top_k=top_k,
+                status=response.status,
+                attempt_count=response.attempt_count,
+                latency_ms=_elapsed_ms(started),
+                stage_latencies_ms={},
+                warning_codes=[warning.code.value for warning in response.warnings],
+                error_source=_derive_error_source(response.warnings),
+                metadata={"sql_present": False},
+            )
+        )
+        return response
+
+
+async def _run_ask_workflow(
+    request: AskRequest,
+    pool: asyncpg.Pool,
+    top_k: int,
+    request_id: str,
+    started: float,
+) -> AskResponse:
     stage_latencies_ms: dict[str, int] = {}
 
     sql_started = time.monotonic()

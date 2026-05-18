@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     reasoning_temperature: float = 0.6
     reasoning_timeout: int = 45
     react_max_iterations: int = 4
+    sql_generation_timeout: int = 90
     sql_dialect: str = "mysql"
 
     # HTTP client behaviour
@@ -70,6 +71,7 @@ class Settings(BaseSettings):
     answer_max_words: int = 80
     answer_allow_reasoning: bool = False
     answer_strict_concise: bool = True
+    ask_timeout: int = 105
 
     # Governance / rulebook system
     governance_enabled: bool = True

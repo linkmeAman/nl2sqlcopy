@@ -369,6 +369,8 @@ REASONING_MODEL=qwen3:4b
 REASONING_TEMPERATURE=0.6
 REASONING_TIMEOUT=45
 REACT_MAX_ITERATIONS=4
+SQL_GENERATION_TIMEOUT=90
+ASK_TIMEOUT=105
 ANSWER_MODEL=qwen3:4b
 ANSWER_TIMEOUT=45
 ANSWER_TEMPERATURE=0.2
@@ -421,6 +423,7 @@ NL2SQL_DOCS_DIR=/var/www/py-workspace/nl2sql/ignore_docs_now/docs
 > `LLM_MODEL` is used by `deepseek-coder` for SQL generation only. `REASONING_MODEL` is used by `qwen3:4b` for ReAct Thought/Action steps.
 > `qwen3:4b` is called with top-level `think=true`, `num_predict=800`, and `REASONING_TEMPERATURE=0.6`.
 > `REACT_MAX_ITERATIONS` controls the ReAct loop cycles. `LLM_MAX_RETRIES` is retained for legacy compatibility and is not the ReAct loop limit.
+> `SQL_GENERATION_TIMEOUT` caps the full ReAct SQL-generation workflow. `ASK_TIMEOUT` caps the end-to-end `/ask` workflow so callers receive a controlled JSON response before upstream gateway timeouts.
 > `ANSWER_MODEL` is used by `/ask` answer generation and defaults to `REASONING_MODEL` when not set.
 > `ANSWER_TIMEOUT` and `ANSWER_TEMPERATURE` control answer generation only.
 > `/ask` uses a structured answer template and parses `ANSWER`, `KEY FIGURES`, and `DETAILS`; `ANSWER_STRICT_CONCISE=true` still enforces the final word cap after parsing.

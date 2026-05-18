@@ -1150,6 +1150,7 @@ Notes:
 - `LLM_BASE_URL` is independent from `EMBEDDING_API_URL`.
 - `REACT_MAX_ITERATIONS` controls the maximum Thought/Action/Observation cycles.
 - `LLM_MAX_RETRIES` is retained as a legacy setting and is not the ReAct loop limit.
+- `SQL_GENERATION_TIMEOUT` caps the full ReAct SQL-generation workflow and returns a controlled `status="rejected"` response with `REQUEST_TIMEOUT` if exceeded.
 - `qwen3:4b` is called with top-level `think=true`, `num_predict=800`, and `REASONING_TEMPERATURE`.
 - `deepseek-coder:6.7b` is called with `stream=false` and temperature `0.0`.
 - Governance review uses the reasoning model with `think=false`, temperature `0.0`, `max_tokens=150`, and timeout `15s`.
@@ -1297,6 +1298,7 @@ Example rejected response:
 ```
 
 Warning codes:
+- REQUEST_TIMEOUT
 - OLLAMA_TIMEOUT
 - OLLAMA_UPSTREAM
 - OLLAMA_MALFORMED
@@ -1474,6 +1476,7 @@ What this route does:
 - Falls back to a compact deterministic row summary if the answer model times out, returns malformed output, or does not follow the template after SQL execution succeeds.
 - Adds a non-blocking `ANSWER_HALLUCINATION` warning when the final model answer contains numbers not present in returned row values.
 - May also surface non-blocking `REVIEW_FAILED` warnings inherited from the successful `/generate-sql` path.
+- Returns a controlled `status: "rejected"` response with `REQUEST_TIMEOUT` if the end-to-end `/ask` workflow exceeds `ASK_TIMEOUT`.
 - Returns answer text plus SQL metadata.
 - Saves a learned pattern in the background when the final response is `status: "ok"` and `row_count > 0`.
 - The underlying ReAct generation path records user-instruction success/failure counters in the background.
@@ -1491,6 +1494,7 @@ Notes:
 - Raw rows are not returned by default.
 - `ANSWER_MODEL` defaults to `REASONING_MODEL` when unset.
 - `ANSWER_STRICT_CONCISE=true` still enforces the configured word cap after template parsing.
+- `ASK_TIMEOUT` should be lower than any upstream gateway/client timeout so callers receive this JSON response instead of a transport timeout.
 - SQL generation clarification returns `status: "clarification_needed"` and does not execute SQL.
 - SQL generation transport rejection returns `status: "rejected"` and does not execute SQL.
 - Pattern saving uses `asyncio.create_task()` and is not awaited by the request path.
@@ -1562,6 +1566,7 @@ Example success:
 ```
 
 Warning codes commonly seen in `/ask`:
+- REQUEST_TIMEOUT
 - OLLAMA_TIMEOUT
 - OLLAMA_UPSTREAM
 - OLLAMA_MALFORMED

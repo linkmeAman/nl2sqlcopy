@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -902,12 +903,30 @@ async def generate_sql(
             cached["cache_hit"] = True
             return _generate_sql_response_from_dict(cached)
 
-    result = await react_run(
-        query=query,
-        pool=pool,
-        settings=settings,
-        top_k=top_k,
-    )
+    try:
+        result = await asyncio.wait_for(
+            react_run(
+                query=query,
+                pool=pool,
+                settings=settings,
+                top_k=top_k,
+            ),
+            timeout=settings.sql_generation_timeout,
+        )
+    except asyncio.TimeoutError:
+        result = GenerateSqlRejected(
+            warnings=[
+                SqlWarning(
+                    code=WarningCode.REQUEST_TIMEOUT,
+                    message=(
+                        "SQL generation exceeded the service time budget "
+                        f"of {settings.sql_generation_timeout}s."
+                    ),
+                )
+            ],
+            attempt_count=0,
+            react_trace=None,
+        )
     if result.status == "ok" and settings.governance_enabled:
         result = await _apply_review_gate(
             result=result,
@@ -916,7 +935,7 @@ async def generate_sql(
             settings=settings,
             top_k=effective_top_k,
         )
-    if settings.sql_cache_enabled:
+    if settings.sql_cache_enabled and result.status == "ok":
         payload = result.model_dump(mode="json")
         payload["cache_hit"] = False
         sql_cache.set(query, effective_top_k, payload)

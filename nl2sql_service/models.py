@@ -140,6 +140,7 @@ class GenerateSqlRequest(BaseModel):
 
 
 class WarningCode(str, Enum):
+    REQUEST_TIMEOUT = "REQUEST_TIMEOUT"
     OLLAMA_TIMEOUT = "OLLAMA_TIMEOUT"
     OLLAMA_UPSTREAM = "OLLAMA_UPSTREAM"
     OLLAMA_MALFORMED = "OLLAMA_MALFORMED"
