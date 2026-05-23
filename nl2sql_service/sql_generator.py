@@ -117,6 +117,8 @@ _COLUMN_NAME_SKIP_KEYWORDS = {
     "YEAR",
 }
 _RECENT_QUERY_TERMS = ("recent", "latest", "newest", "last")
+_PAYMENT_QUERY_RE = re.compile(r"\bpayments?\b", re.IGNORECASE)
+_COUNT_RE = re.compile(r"\b(\d{1,3})\b")
 _FINANCIAL_QUERY_TERMS = (
     "amount",
     "balance",
@@ -162,6 +164,114 @@ COLUMN_SELECTION_RULE = """COLUMN SELECTION RULE:
    SELECT only the columns needed for the calculation.
  For detail queries (details, full, all columns, *):
    SELECT * is acceptable."""
+
+
+def _quote_identifier(identifier: str) -> str:
+    if _SQL_NAME_RE.match(identifier):
+        return identifier
+    return f"`{identifier.replace('`', '``')}`"
+
+
+def _query_requests_recent_payment(query: str) -> bool:
+    query_lower = query.lower()
+    return bool(_PAYMENT_QUERY_RE.search(query_lower)) and any(
+        term in query_lower for term in _RECENT_QUERY_TERMS
+    )
+
+
+def _deterministic_limit(query: str, top_k: int) -> int:
+    match = _COUNT_RE.search(query)
+    if match:
+        return max(1, min(int(match.group(1)), 50))
+    if re.search(r"\bpayment\b", query, flags=re.IGNORECASE) and not re.search(
+        r"\bpayments\b",
+        query,
+        flags=re.IGNORECASE,
+    ):
+        return 1
+    return max(1, min(top_k, 50))
+
+
+def _best_recent_order_columns(columns: list[str]) -> list[str]:
+    lookup = {column.lower(): column for column in columns}
+    ordered: list[str] = []
+    for preferred in (
+        "date",
+        "created_at",
+        "modified_at",
+        "id",
+    ):
+        column = lookup.get(preferred)
+        if column:
+            ordered.append(column)
+    return ordered
+
+
+def _select_payment_columns(query: str, columns: list[str], max_columns: int = 8) -> list[str]:
+    del query
+    lookup = {column.lower(): column for column in columns}
+    selected: list[str] = []
+    for preferred in (
+        "id",
+        "invoice_id",
+        "date",
+        "amount",
+        "actual_amount",
+        "calculated_amount",
+        "receipt",
+        "pay_mode_text",
+        "payment_mode",
+        "pay_mode",
+        "txn_number",
+        "tracking_id",
+        "bank_ref_no",
+        "created_at",
+    ):
+        column = lookup.get(preferred)
+        if column and column not in selected:
+            selected.append(column)
+        if len(selected) >= max_columns:
+            break
+    return selected or columns[:max_columns]
+
+
+def _has_blocking_warnings(warnings: list[SqlWarning]) -> bool:
+    return any(warning.code != WarningCode.MYSQL_EXPLAIN_UNAVAILABLE for warning in warnings)
+
+
+def build_deterministic_sql(
+    query: str,
+    allowed_columns: dict[str, list[str]],
+    top_k: int,
+) -> tuple[str, list[str]] | None:
+    """Return validated-template SQL for high-confidence simple intents."""
+    if not _query_requests_recent_payment(query):
+        return None
+
+    payment_columns = allowed_columns.get("payment") or allowed_columns.get("Payment")
+    if not payment_columns:
+        return None
+
+    order_columns = _best_recent_order_columns(payment_columns)
+    if not order_columns:
+        return None
+
+    selected_columns = _select_payment_columns(
+        query=query,
+        columns=payment_columns,
+        max_columns=8,
+    )
+    for required in order_columns:
+        if required not in selected_columns and len(selected_columns) < 8:
+            selected_columns.append(required)
+    if not selected_columns:
+        return None
+
+    limit = _deterministic_limit(query, top_k)
+    select_list = ", ".join(_quote_identifier(column) for column in selected_columns)
+    order_by = ", ".join(f"{_quote_identifier(column)} DESC" for column in order_columns)
+    sql = f"SELECT {select_list} FROM payment ORDER BY {order_by} LIMIT {limit}"
+    return sql, ["payment"]
 
 
 def build_sql_prompt(
@@ -903,6 +1013,18 @@ async def generate_sql(
             cached["cache_hit"] = True
             return _generate_sql_response_from_dict(cached)
 
+    deterministic_result = await _try_deterministic_generation(
+        query=query,
+        settings=settings,
+        top_k=effective_top_k,
+    )
+    if deterministic_result is not None:
+        if settings.sql_cache_enabled and deterministic_result.status == "ok":
+            payload = deterministic_result.model_dump(mode="json")
+            payload["cache_hit"] = False
+            sql_cache.set(query, effective_top_k, payload)
+        return deterministic_result
+
     try:
         result = await asyncio.wait_for(
             react_run(
@@ -940,6 +1062,62 @@ async def generate_sql(
         payload["cache_hit"] = False
         sql_cache.set(query, effective_top_k, payload)
     return result
+
+
+async def _try_deterministic_generation(
+    query: str,
+    settings: Settings,
+    top_k: int,
+) -> GenerateSqlSuccess | None:
+    allowed_columns = await load_columns_for_tables(
+        tables=["payment"],
+        settings=settings,
+    )
+    built = build_deterministic_sql(
+        query=query,
+        allowed_columns=allowed_columns,
+        top_k=top_k,
+    )
+    if built is None:
+        return None
+
+    sql, tables_used = built
+    warnings = validate_sql_safety(sql, settings.sql_dialect)
+    if warnings:
+        return None
+
+    validated_tables, table_warnings = validate_tables_used(sql, tables_used)
+    warnings.extend(table_warnings)
+    warnings.extend(validate_columns_used(sql, allowed_columns))
+    if _has_blocking_warnings(warnings):
+        logger.info(
+            "Deterministic NL2SQL candidate failed validation for query %r: %s",
+            query[:80],
+            [warning.message for warning in warnings],
+        )
+        return None
+
+    explain_warnings = await run_explain(sql, settings)
+    if _has_blocking_warnings(explain_warnings):
+        logger.info(
+            "Deterministic NL2SQL candidate failed EXPLAIN for query %r: %s",
+            query[:80],
+            [warning.message for warning in explain_warnings],
+        )
+        return None
+
+    return GenerateSqlSuccess(
+        sql=sql,
+        warnings=[
+            warning
+            for warning in explain_warnings
+            if warning.code == WarningCode.MYSQL_EXPLAIN_UNAVAILABLE
+        ],
+        tables_used=validated_tables,
+        matched_groups=["deterministic_payment"],
+        attempt_count=0,
+        react_trace=None,
+    )
 
 
 def _generate_sql_response_from_dict(payload: dict[str, Any]) -> GenerateSqlResponse:

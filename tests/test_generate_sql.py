@@ -114,6 +114,64 @@ def test_inquiry_select_star_is_narrowed_without_low_signal_columns():
     assert "last_updated" not in sql
 
 
+def test_deterministic_recent_payment_sql_uses_live_columns():
+    built = sql_generator.build_deterministic_sql(
+        query="newest payment",
+        allowed_columns={
+            "payment": [
+                "id",
+                "invoice_id",
+                "date",
+                "amount",
+                "receipt",
+                "pay_mode_text",
+                "created_at",
+            ]
+        },
+        top_k=5,
+    )
+
+    assert built is not None
+    sql, tables_used = built
+    assert tables_used == ["payment"]
+    assert sql == (
+        "SELECT id, invoice_id, date, amount, receipt, pay_mode_text, created_at "
+        "FROM payment ORDER BY date DESC, created_at DESC, id DESC LIMIT 1"
+    )
+
+
+def test_deterministic_recent_payments_honors_explicit_limit():
+    built = sql_generator.build_deterministic_sql(
+        query="show me the 5 most recent payments",
+        allowed_columns={
+            "payment": [
+                "id",
+                "invoice_id",
+                "date",
+                "amount",
+                "receipt",
+                "pay_mode_text",
+                "created_at",
+            ]
+        },
+        top_k=3,
+    )
+
+    assert built is not None
+    sql, _ = built
+    assert sql.endswith("LIMIT 5")
+
+
+def test_deterministic_payment_sql_ignores_non_recent_payment_query():
+    built = sql_generator.build_deterministic_sql(
+        query="payments by branch",
+        allowed_columns={"payment": ["id", "date", "amount"]},
+        top_k=5,
+    )
+
+    assert built is None
+
+
 def test_select_star_is_preserved_when_user_asks_for_full_details():
     sql = sql_generator.narrow_select_star(
         "SELECT * FROM inquiry ORDER BY created_at DESC LIMIT 5;",

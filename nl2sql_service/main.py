@@ -1081,15 +1081,24 @@ async def _run_ask_workflow(
         return response
 
     answer_started = time.monotonic()
-    answer_text, answer_warnings = await answer_generator.generate_answer(
-        query=request.query,
-        sql=capped_sql,
-        columns=columns,
-        rows=rows,
-        row_count=len(rows),
-        sql_warnings=[*sql_result.warnings, *execution_warnings],
-        settings=settings,
-    )
+    if "deterministic_payment" in sql_result.matched_groups:
+        answer_text = answer_generator.build_fallback_answer(
+            query=request.query,
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+        )
+        answer_warnings = []
+    else:
+        answer_text, answer_warnings = await answer_generator.generate_answer(
+            query=request.query,
+            sql=capped_sql,
+            columns=columns,
+            rows=rows,
+            row_count=len(rows),
+            sql_warnings=[*sql_result.warnings, *execution_warnings],
+            settings=settings,
+        )
     stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
     if answer_text is None:
         enriched_answer_warnings: list[SqlWarning] = [
