@@ -189,6 +189,7 @@ class ReActStep(BaseModel):
     action: ReActAction
     action_input: str
     observation: str
+    duration_ms: int | None = None
 
 
 class ReactTrace(BaseModel):
@@ -207,6 +208,7 @@ class GenerateSqlSuccess(BaseModel):
     cache_hit: bool = False
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
+    stage_latencies_ms: dict[str, int] | None = None
 
 
 class GenerateSqlRejected(BaseModel):
@@ -217,6 +219,7 @@ class GenerateSqlRejected(BaseModel):
     cache_hit: bool = False
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
+    stage_latencies_ms: dict[str, int] | None = None
 
 
 class GenerateSqlClarification(BaseModel):
@@ -228,6 +231,7 @@ class GenerateSqlClarification(BaseModel):
     cache_hit: bool = False
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
+    stage_latencies_ms: dict[str, int] | None = None
 
 
 GenerateSqlResponse = Annotated[
@@ -255,6 +259,7 @@ class AskSuccess(BaseModel):
     cache_hit: bool = False
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
+    stage_latencies_ms: dict[str, int] | None = None
 
 
 class AskRejected(BaseModel):
@@ -266,12 +271,27 @@ class AskRejected(BaseModel):
     cache_hit: bool = False
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
+    stage_latencies_ms: dict[str, int] | None = None
 
 
 AskResponse = Annotated[
     AskSuccess | AskRejected | GenerateSqlClarification,
     Field(discriminator="status"),
 ]
+
+
+class TraceEvent(BaseModel):
+    request_id: str
+    seq: int
+    layer: str
+    stage: str
+    status: str
+    message: str
+    duration_ms: int | None = None
+    warning_codes: list[str] = Field(default_factory=list)
+    error_source: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
 
 
 class PatternFeedbackRequest(BaseModel):

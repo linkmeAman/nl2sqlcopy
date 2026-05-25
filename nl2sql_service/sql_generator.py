@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import asyncpg
 import sqlparse
@@ -29,6 +29,32 @@ from nl2sql_service.models import (
 from nl2sql_service.rulebook import build_governance_block, get_config
 
 logger = logging.getLogger(__name__)
+
+TraceCallback = Callable[..., Awaitable[None]]
+
+
+async def _emit_trace(
+    trace_callback: TraceCallback | None,
+    *,
+    stage: str,
+    status: str,
+    message: str,
+    duration_ms: int | None = None,
+    warning_codes: list[str] | None = None,
+    error_source: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if trace_callback is None:
+        return
+    await trace_callback(
+        stage=stage,
+        status=status,
+        message=message,
+        duration_ms=duration_ms,
+        warning_codes=warning_codes,
+        error_source=error_source,
+        details=details or {},
+    )
 
 _FENCED_SQL_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
 _RAW_SQL_START_RE = re.compile(
@@ -1031,15 +1057,30 @@ async def generate_sql(
     pool: asyncpg.Pool,
     settings: Settings,
     top_k: int | None = None,
+    trace_callback: TraceCallback | None = None,
 ) -> GenerateSqlResponse:
     from nl2sql_service.react_agent import run as react_run
 
     effective_top_k = top_k or settings.top_k
     cache_epoch: int | None = None
     query_embedding: list[float] | None = None
+    await _emit_trace(
+        trace_callback,
+        stage="cache_lookup",
+        status="started",
+        message="Checking SQL cache before running the agent.",
+        details={"endpoint": "generate-sql", "top_k": effective_top_k},
+    )
     if settings.sql_cache_enabled:
         cached = sql_cache.get(query, effective_top_k)
         if cached:
+            await _emit_trace(
+                trace_callback,
+                stage="cache_lookup",
+                status="completed",
+                message="SQL cache hit in memory.",
+                details={"cache_source": CacheSource.MEMORY_EXACT.value},
+            )
             return _generate_sql_response_from_dict(
                 _with_cache_metadata(cached, CacheSource.MEMORY_EXACT)
             )
@@ -1056,6 +1097,13 @@ async def generate_sql(
                 threshold=settings.sql_cache_semantic_threshold,
             )
             if sem_cached:
+                await _emit_trace(
+                    trace_callback,
+                    stage="cache_lookup",
+                    status="completed",
+                    message="Semantic SQL cache hit in memory.",
+                    details={"cache_source": CacheSource.MEMORY_SEMANTIC.value},
+                )
                 return _generate_sql_response_from_dict(
                     _with_cache_metadata(sem_cached, CacheSource.MEMORY_SEMANTIC)
                 )
@@ -1063,23 +1111,30 @@ async def generate_sql(
             pass  # semantic lookup is best-effort; never block on failure
 
     if settings.sql_cache_enabled:
-        cache_epoch = await db.get_query_cache_epoch(pool)
-        db_exact = await db.get_query_cache_exact(
-            pool,
-            endpoint="generate-sql",
-            query_text=query,
-            top_k=effective_top_k,
-            cache_epoch=cache_epoch,
-        )
-        if db_exact:
-            warmed = _with_cache_metadata(db_exact, CacheSource.DB_EXACT)
-            sql_cache.set(query, effective_top_k, db_exact)
-            if query_embedding is not None:
-                semantic_sql_cache.set(query, effective_top_k, db_exact, embedding=query_embedding)
-            return _generate_sql_response_from_dict(warmed)
+        try:
+            cache_epoch = await db.get_query_cache_epoch(pool)
+            db_exact = await db.get_query_cache_exact(
+                pool,
+                endpoint="generate-sql",
+                query_text=query,
+                top_k=effective_top_k,
+                cache_epoch=cache_epoch,
+            )
+            if db_exact:
+                warmed = _with_cache_metadata(db_exact, CacheSource.DB_EXACT)
+                sql_cache.set(query, effective_top_k, db_exact)
+                await _emit_trace(
+                    trace_callback,
+                    stage="cache_lookup",
+                    status="completed",
+                    message="SQL cache hit in PostgreSQL.",
+                    details={"cache_source": CacheSource.DB_EXACT.value},
+                )
+                if query_embedding is not None:
+                    semantic_sql_cache.set(query, effective_top_k, db_exact, embedding=query_embedding)
+                return _generate_sql_response_from_dict(warmed)
 
-        if query_embedding is not None:
-            try:
+            if query_embedding is not None:
                 db_semantic = await db.get_query_cache_semantic(
                     pool,
                     endpoint="generate-sql",
@@ -1096,11 +1151,26 @@ async def generate_sql(
                         db_semantic,
                         embedding=query_embedding,
                     )
+                    await _emit_trace(
+                        trace_callback,
+                        stage="cache_lookup",
+                        status="completed",
+                        message="Semantic SQL cache hit in PostgreSQL.",
+                        details={"cache_source": CacheSource.DB_SEMANTIC.value},
+                    )
                     return _generate_sql_response_from_dict(
                         _with_cache_metadata(db_semantic, CacheSource.DB_SEMANTIC)
                     )
-            except Exception:
-                pass
+        except Exception:
+            logger.exception("Failed DB SQL cache lookup")
+
+    await _emit_trace(
+        trace_callback,
+        stage="cache_lookup",
+        status="completed",
+        message="No reusable SQL cache entry found.",
+        details={"cache_source": CacheSource.NONE.value},
+    )
 
     deterministic_result = await _try_deterministic_generation(
         query=query,
@@ -1108,6 +1178,17 @@ async def generate_sql(
         top_k=effective_top_k,
     )
     if deterministic_result is not None:
+        await _emit_trace(
+            trace_callback,
+            stage="sql_generation",
+            status="completed",
+            message="Deterministic SQL rule generated a validated query.",
+            details={
+                "matched_groups": deterministic_result.matched_groups,
+                "tables_used": deterministic_result.tables_used,
+                "sql_preview": deterministic_result.sql[:500],
+            },
+        )
         if settings.sql_cache_enabled and deterministic_result.status == "ok":
             payload = deterministic_result.model_dump(mode="json")
             payload["cache_hit"] = False
@@ -1141,10 +1222,22 @@ async def generate_sql(
                 pool=pool,
                 settings=settings,
                 top_k=top_k,
+                trace_callback=trace_callback,
             ),
             timeout=settings.sql_generation_timeout,
         )
     except asyncio.TimeoutError:
+        await _emit_trace(
+            trace_callback,
+            stage="sql_generation",
+            status="failed",
+            message=(
+                "SQL generation exceeded the service time budget "
+                f"of {settings.sql_generation_timeout}s."
+            ),
+            warning_codes=[WarningCode.REQUEST_TIMEOUT.value],
+            error_source="service_timeout",
+        )
         result = GenerateSqlRejected(
             warnings=[
                 SqlWarning(
@@ -1159,12 +1252,26 @@ async def generate_sql(
             react_trace=None,
         )
     if result.status == "ok" and settings.governance_enabled:
+        await _emit_trace(
+            trace_callback,
+            stage="review_gate",
+            status="started",
+            message="Running governance review for generated SQL.",
+            details={"tables_used": result.tables_used},
+        )
         result = await _apply_review_gate(
             result=result,
             query=query,
             pool=pool,
             settings=settings,
             top_k=effective_top_k,
+        )
+        await _emit_trace(
+            trace_callback,
+            stage="review_gate",
+            status="completed" if not any(w.code == WarningCode.REVIEW_FAILED for w in result.warnings) else "warning",
+            message="Governance review completed.",
+            warning_codes=[warning.code.value for warning in result.warnings],
         )
     if settings.sql_cache_enabled and result.status == "ok":
         payload = result.model_dump(mode="json")
@@ -1188,8 +1295,22 @@ async def generate_sql(
                 query_embedding=query_embedding,
                 cache_epoch=cache_epoch or await db.get_query_cache_epoch(pool),
             )
+            await _emit_trace(
+                trace_callback,
+                stage="cache_write",
+                status="completed",
+                message="Stored successful SQL generation in cache.",
+                details={"endpoint": "generate-sql"},
+            )
         except Exception:
             logger.exception("Failed to persist generate-sql cache entry")
+            await _emit_trace(
+                trace_callback,
+                stage="cache_write",
+                status="warning",
+                message="Failed to persist SQL generation cache entry.",
+                error_source="cache_write",
+            )
     return result
 
 

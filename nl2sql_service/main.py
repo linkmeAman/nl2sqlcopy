@@ -6,7 +6,8 @@ import json
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
 from typing import Annotated, AsyncIterator, Union
 
 import asyncpg
@@ -203,8 +204,20 @@ async def _log_failure_event(
     sql_preview: str | None,
     tables_attempted: list[str],
     latency_ms: int,
+    trace_emit=None,
 ) -> None:
     """Write to the dedicated failure log and attach a teach suggestion."""
+    if trace_emit is not None:
+        await trace_emit(
+            stage="failure_log_write",
+            status="started",
+            message="Writing NL2SQL failure context.",
+            details={
+                "endpoint": endpoint,
+                "warning_codes": warning_codes,
+                "error_source": error_source,
+            },
+        )
     try:
         suggestion = build_failure_teach_suggestion(
             query=query_text,
@@ -224,8 +237,23 @@ async def _log_failure_event(
             latency_ms=latency_ms,
             suggest_teach=suggestion,
         )
+        if trace_emit is not None:
+            await trace_emit(
+                stage="failure_log_write",
+                status="completed",
+                message="NL2SQL failure context written.",
+                details={"endpoint": endpoint},
+            )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to write failure log entry")
+        if trace_emit is not None:
+            await trace_emit(
+                stage="failure_log_write",
+                status="warning",
+                message="Failed to write NL2SQL failure context.",
+                error_source="failure_log_write",
+                details={"endpoint": endpoint},
+            )
 
 
 def _ensure_governance_enabled() -> None:
@@ -244,6 +272,88 @@ def _generation_metadata(result: GenerateSqlResponse) -> dict[str, object]:
         base["failure_reason"] = result.failure_reason
         base["suggestion_count"] = len(result.suggestions)
     return base
+
+
+class TraceRecorder:
+    """Per-request sanitized trace logger and optional stream queue."""
+
+    def __init__(
+        self,
+        *,
+        pool: asyncpg.Pool,
+        request_id: str,
+        layer: str = "nl2sql-service",
+        stream_queue: asyncio.Queue[dict[str, object]] | None = None,
+    ) -> None:
+        self.pool = pool
+        self.request_id = request_id
+        self.layer = layer
+        self.stream_queue = stream_queue
+        self.seq = 0
+
+    async def emit(
+        self,
+        *,
+        stage: str,
+        status: str,
+        message: str,
+        duration_ms: int | None = None,
+        warning_codes: list[str] | None = None,
+        error_source: str | None = None,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        self.seq += 1
+        event = {
+            "request_id": self.request_id,
+            "seq": self.seq,
+            "layer": self.layer,
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "duration_ms": duration_ms,
+            "warning_codes": warning_codes or [],
+            "error_source": error_source,
+            "details": details or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info("NL2SQL TRACE | %s", json.dumps(event, default=str, separators=(",", ":")))
+        await _persist_trace_event(self.pool, event)
+        if self.stream_queue is not None:
+            await self.stream_queue.put(event)
+
+
+async def _persist_trace_event(pool: asyncpg.Pool, event: dict[str, object]) -> None:
+    if not hasattr(pool, "acquire"):
+        return
+    try:
+        await db.insert_trace_event(
+            pool,
+            request_id=str(event["request_id"]),
+            seq=int(event["seq"]),
+            layer=str(event["layer"]),
+            stage=str(event["stage"]),
+            status=str(event["status"]),
+            message=str(event["message"]),
+            duration_ms=event.get("duration_ms") if isinstance(event.get("duration_ms"), int) else None,
+            warning_codes=[
+                str(code)
+                for code in (event.get("warning_codes") or [])
+                if code
+            ],
+            error_source=event.get("error_source") if isinstance(event.get("error_source"), str) else None,
+            details=event.get("details") if isinstance(event.get("details"), dict) else {},
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to write trace event")
+
+
+async def _drain_trace_queue(queue: asyncio.Queue[dict[str, object]]) -> list[dict[str, object]]:
+    events: list[dict[str, object]] = []
+    while True:
+        try:
+            events.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            return events
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +660,18 @@ async def telemetry_summary_endpoint(
     summary["endpoint"] = endpoint
     summary["since_minutes"] = since_minutes
     return summary
+
+
+@app.get("/telemetry/trace/{request_id}", tags=["ops"])
+async def telemetry_trace_endpoint(
+    request: Request,
+    request_id: str,
+    limit: int = 500,
+) -> dict[str, object]:
+    """Return ordered per-stage trace events for one request id."""
+    pool = await _require_pool(request)
+    results = await db.list_trace_events(pool, request_id=request_id, limit=limit)
+    return {"request_id": request_id, "results": results, "total": len(results)}
 
 
 @app.get("/failures", tags=["ops"])
@@ -1060,7 +1182,29 @@ async def generate_sql_endpoint(
     request_id = _resolve_request_id(request.request_id)
     set_request_id(request_id)
     started = time.monotonic()
-    result = await generate_sql(request.query, pool, settings, top_k)
+    trace_recorder = TraceRecorder(pool=pool, request_id=request_id)
+    await trace_recorder.emit(
+        stage="request_received",
+        status="started",
+        message="Received SQL preview request.",
+        details={"endpoint": "/generate-sql", "top_k": top_k},
+    )
+    result = await generate_sql(
+        request.query,
+        pool,
+        settings,
+        top_k,
+        trace_callback=trace_recorder.emit,
+    )
+    await trace_recorder.emit(
+        stage="complete",
+        status=result.status,
+        message="SQL preview request completed.",
+        duration_ms=_elapsed_ms(started),
+        warning_codes=[warning.code.value for warning in getattr(result, "warnings", [])],
+        error_source=_derive_error_source(getattr(result, "warnings", [])),
+        details=_generation_metadata(result),
+    )
     asyncio.create_task(
         _log_request_event(
             pool,
@@ -1090,6 +1234,13 @@ async def ask_endpoint(
     request_id = _resolve_request_id(request.request_id)
     set_request_id(request_id)
     started = time.monotonic()
+    trace_recorder = TraceRecorder(pool=pool, request_id=request_id)
+    await trace_recorder.emit(
+        stage="request_received",
+        status="started",
+        message="Received ask request.",
+        details={"endpoint": "/ask", "top_k": top_k},
+    )
     cache_epoch: int | None = None
     query_embedding: list[float] | None = None
 
@@ -1100,7 +1251,20 @@ async def ask_endpoint(
             cached_ask.pop("_top_k", None)
             cached_ask["cache_hit"] = True
             cached_ask["cache_source"] = CacheSource.MEMORY_EXACT.value
-            return _ask_success_from_cache(cached_ask)
+            response = _ask_success_from_cache(cached_ask)
+            await trace_recorder.emit(
+                stage="cache_lookup",
+                status="completed",
+                message="Ask cache hit in memory.",
+                details={"cache_source": CacheSource.MEMORY_EXACT.value},
+            )
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Ask request completed from cache.",
+                duration_ms=_elapsed_ms(started),
+            )
+            return response
 
     # --- Ask cache: semantic match -----------------------------------------------
     if settings.ask_cache_enabled:
@@ -1117,27 +1281,53 @@ async def ask_endpoint(
                 sem_ask.pop("_top_k", None)
                 sem_ask["cache_hit"] = True
                 sem_ask["cache_source"] = CacheSource.MEMORY_SEMANTIC.value
-                return _ask_success_from_cache(sem_ask)
+                response = _ask_success_from_cache(sem_ask)
+                await trace_recorder.emit(
+                    stage="cache_lookup",
+                    status="completed",
+                    message="Semantic ask cache hit in memory.",
+                    details={"cache_source": CacheSource.MEMORY_SEMANTIC.value},
+                )
+                await trace_recorder.emit(
+                    stage="complete",
+                    status=response.status,
+                    message="Ask request completed from cache.",
+                    duration_ms=_elapsed_ms(started),
+                )
+                return response
         except Exception:
             pass  # semantic lookup is best-effort
 
     if settings.ask_cache_enabled:
-        cache_epoch = await db.get_query_cache_epoch(pool)
-        cached_ask = await db.get_query_cache_exact(
-            pool,
-            endpoint="ask",
-            query_text=request.query,
-            top_k=top_k,
-            cache_epoch=cache_epoch,
-        )
-        if cached_ask:
-            ask_cache.set(request.query, top_k, cached_ask, embedding=query_embedding)
-            cached_ask["cache_hit"] = True
-            cached_ask["cache_source"] = CacheSource.DB_EXACT.value
-            return _ask_success_from_cache(cached_ask)
+        try:
+            cache_epoch = await db.get_query_cache_epoch(pool)
+            cached_ask = await db.get_query_cache_exact(
+                pool,
+                endpoint="ask",
+                query_text=request.query,
+                top_k=top_k,
+                cache_epoch=cache_epoch,
+            )
+            if cached_ask:
+                ask_cache.set(request.query, top_k, cached_ask, embedding=query_embedding)
+                cached_ask["cache_hit"] = True
+                cached_ask["cache_source"] = CacheSource.DB_EXACT.value
+                response = _ask_success_from_cache(cached_ask)
+                await trace_recorder.emit(
+                    stage="cache_lookup",
+                    status="completed",
+                    message="Ask cache hit in PostgreSQL.",
+                    details={"cache_source": CacheSource.DB_EXACT.value},
+                )
+                await trace_recorder.emit(
+                    stage="complete",
+                    status=response.status,
+                    message="Ask request completed from cache.",
+                    duration_ms=_elapsed_ms(started),
+                )
+                return response
 
-        if query_embedding is not None:
-            try:
+            if query_embedding is not None:
                 sem_ask = await db.get_query_cache_semantic(
                     pool,
                     endpoint="ask",
@@ -1150,9 +1340,22 @@ async def ask_endpoint(
                     ask_cache.set(request.query, top_k, sem_ask, embedding=query_embedding)
                     sem_ask["cache_hit"] = True
                     sem_ask["cache_source"] = CacheSource.DB_SEMANTIC.value
-                    return _ask_success_from_cache(sem_ask)
-            except Exception:
-                logger.exception("Failed semantic DB ask cache lookup")
+                    response = _ask_success_from_cache(sem_ask)
+                    await trace_recorder.emit(
+                        stage="cache_lookup",
+                        status="completed",
+                        message="Semantic ask cache hit in PostgreSQL.",
+                        details={"cache_source": CacheSource.DB_SEMANTIC.value},
+                    )
+                    await trace_recorder.emit(
+                        stage="complete",
+                        status=response.status,
+                        message="Ask request completed from cache.",
+                        duration_ms=_elapsed_ms(started),
+                    )
+                    return response
+        except Exception:
+            logger.exception("Failed DB ask cache lookup")
 
     try:
         return await asyncio.wait_for(
@@ -1164,6 +1367,7 @@ async def ask_endpoint(
                 started=started,
                 cache_epoch=cache_epoch,
                 query_embedding=query_embedding,
+                trace_recorder=trace_recorder,
             ),
             timeout=settings.ask_timeout,
         )
@@ -1212,7 +1416,16 @@ async def ask_endpoint(
                 sql_preview=None,
                 tables_attempted=[],
                 latency_ms=elapsed,
+                trace_emit=trace_recorder.emit,
             )
+        )
+        await trace_recorder.emit(
+            stage="complete",
+            status=response.status,
+            message=response.warnings[0].message,
+            duration_ms=elapsed,
+            warning_codes=warning_codes_list,
+            error_source=error_src,
         )
         return response
 
@@ -1225,12 +1438,26 @@ async def _run_ask_workflow(
     started: float,
     cache_epoch: int | None = None,
     query_embedding: list[float] | None = None,
+    trace_recorder: TraceRecorder | None = None,
 ) -> AskResponse:
     stage_latencies_ms: dict[str, int] = {}
 
     sql_started = time.monotonic()
-    sql_result = await generate_sql(request.query, pool, settings, top_k)
+    if trace_recorder is not None:
+        await trace_recorder.emit(
+            stage="sql_generation",
+            status="started",
+            message="Generating SQL for ask workflow.",
+        )
+    sql_result = await generate_sql(
+        request.query,
+        pool,
+        settings,
+        top_k,
+        trace_callback=trace_recorder.emit if trace_recorder is not None else None,
+    )
     stage_latencies_ms["sql_generation"] = _elapsed_ms(sql_started)
+    _merged_sql_latencies = {**(sql_result.stage_latencies_ms or {}), **stage_latencies_ms}
     if sql_result.status == "clarification_needed":
         asyncio.create_task(
             _log_request_event(
@@ -1251,7 +1478,20 @@ async def _run_ask_workflow(
                 },
             )
         )
-        return sql_result
+        response = sql_result.model_copy(update={"stage_latencies_ms": _merged_sql_latencies})
+        if trace_recorder is not None:
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message=response.failure_reason,
+                duration_ms=_elapsed_ms(started),
+                error_source="clarification",
+                details={
+                    "suggestion_count": len(response.suggestions),
+                    "stage_latencies_ms": _merged_sql_latencies,
+                },
+            )
+        return response
     if sql_result.status == "rejected":
         response = AskRejected(
             sql=None,
@@ -1260,6 +1500,7 @@ async def _run_ask_workflow(
             cache_hit=False,
             cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
+            stage_latencies_ms=_merged_sql_latencies,
         )
         elapsed = _elapsed_ms(started)
         warning_codes_list = [warning.code.value for warning in response.warnings]
@@ -1295,17 +1536,56 @@ async def _run_ask_workflow(
                 sql_preview=None,
                 tables_attempted=[],
                 latency_ms=elapsed,
+                trace_emit=trace_recorder.emit if trace_recorder is not None else None,
             )
         )
+        if trace_recorder is not None:
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Ask request stopped during SQL generation.",
+                duration_ms=elapsed,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                details={"stage_latencies_ms": _merged_sql_latencies},
+            )
         return response
 
     capped_sql = mysql_executor.apply_row_cap(sql_result.sql, cap=50)
     execution_started = time.monotonic()
+    if trace_recorder is not None:
+        await trace_recorder.emit(
+            stage="execution",
+            status="started",
+            message="Executing bounded SQL on MySQL.",
+            details={
+                "tables_used": sql_result.tables_used,
+                "sql_preview": capped_sql[:500],
+            },
+        )
     columns, rows, execution_warnings = await mysql_executor.execute_sql(
         sql=capped_sql,
         settings=settings,
     )
     stage_latencies_ms["execution"] = _elapsed_ms(execution_started)
+    if trace_recorder is not None:
+        await trace_recorder.emit(
+            stage="execution",
+            status="completed" if not execution_warnings else "failed",
+            message=(
+                "SQL execution completed."
+                if not execution_warnings
+                else "SQL execution failed."
+            ),
+            duration_ms=stage_latencies_ms["execution"],
+            warning_codes=[warning.code.value for warning in execution_warnings],
+            error_source="execution" if execution_warnings else None,
+            details={
+                "row_count": len(rows),
+                "columns": columns,
+                "sql_preview": capped_sql[:500],
+            },
+        )
     if execution_warnings:
         response = AskRejected(
             sql=capped_sql,
@@ -1314,6 +1594,7 @@ async def _run_ask_workflow(
             cache_hit=False,
             cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
+            stage_latencies_ms={**_merged_sql_latencies, **stage_latencies_ms},
         )
         elapsed = _elapsed_ms(started)
         warning_codes_list = [warning.code.value for warning in response.warnings]
@@ -1349,11 +1630,29 @@ async def _run_ask_workflow(
                 sql_preview=capped_sql,
                 tables_attempted=sql_result.tables_used,
                 latency_ms=elapsed,
+                trace_emit=trace_recorder.emit if trace_recorder is not None else None,
             )
         )
+        if trace_recorder is not None:
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Ask request stopped during SQL execution.",
+                duration_ms=elapsed,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                details={"stage_latencies_ms": response.stage_latencies_ms or {}},
+            )
         return response
 
     answer_started = time.monotonic()
+    if trace_recorder is not None:
+        await trace_recorder.emit(
+            stage="answer_generation",
+            status="started",
+            message="Generating final answer from result rows.",
+            details={"row_count": len(rows), "columns": columns},
+        )
     if "deterministic_payment" in sql_result.matched_groups:
         answer_text = answer_generator.build_fallback_answer(
             query=request.query,
@@ -1373,6 +1672,19 @@ async def _run_ask_workflow(
             settings=settings,
         )
     stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
+    if trace_recorder is not None:
+        await trace_recorder.emit(
+            stage="answer_generation",
+            status="completed" if answer_text is not None else "failed",
+            message=(
+                "Answer generation completed."
+                if answer_text is not None
+                else "Answer generation failed."
+            ),
+            duration_ms=stage_latencies_ms["answer_generation"],
+            warning_codes=[warning.code.value for warning in answer_warnings],
+            error_source="answer_generation" if answer_text is None else None,
+        )
     if answer_text is None:
         enriched_answer_warnings: list[SqlWarning] = [
             SqlWarning(
@@ -1401,6 +1713,7 @@ async def _run_ask_workflow(
             cache_hit=False,
             cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
+            stage_latencies_ms={**_merged_sql_latencies, **stage_latencies_ms},
         )
         elapsed = _elapsed_ms(started)
         warning_codes_list = [warning.code.value for warning in response.warnings]
@@ -1437,8 +1750,19 @@ async def _run_ask_workflow(
                 sql_preview=capped_sql,
                 tables_attempted=sql_result.tables_used,
                 latency_ms=elapsed,
+                trace_emit=trace_recorder.emit if trace_recorder is not None else None,
             )
         )
+        if trace_recorder is not None:
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Ask request stopped during answer generation.",
+                duration_ms=elapsed,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                details={"stage_latencies_ms": response.stage_latencies_ms or {}},
+            )
         return response
 
     if rows:
@@ -1464,6 +1788,7 @@ async def _run_ask_workflow(
         cache_hit=False,
         cache_source=CacheSource.NONE,
         react_trace=sql_result.react_trace,
+        stage_latencies_ms={**_merged_sql_latencies, **stage_latencies_ms},
     )
     asyncio.create_task(
         _log_request_event(
@@ -1505,8 +1830,37 @@ async def _run_ask_workflow(
                 query_embedding=query_embedding,
                 cache_epoch=cache_epoch or await db.get_query_cache_epoch(pool),
             )
+            if trace_recorder is not None:
+                await trace_recorder.emit(
+                    stage="cache_write",
+                    status="completed",
+                    message="Stored successful ask response in cache.",
+                    details={"endpoint": "ask"},
+                )
         except Exception:  # noqa: BLE001
             logger.exception("Failed to persist ask cache entry")
+            if trace_recorder is not None:
+                await trace_recorder.emit(
+                    stage="cache_write",
+                    status="warning",
+                    message="Failed to persist ask cache entry.",
+                    error_source="cache_write",
+                )
+    if trace_recorder is not None:
+        await trace_recorder.emit(
+            stage="complete",
+            status=response.status,
+            message="Ask request completed.",
+            duration_ms=_elapsed_ms(started),
+            warning_codes=[warning.code.value for warning in response.warnings],
+            error_source=_derive_error_source(response.warnings),
+            details={
+                "stage_latencies_ms": response.stage_latencies_ms or {},
+                "row_count": response.row_count,
+                "tables_used": response.tables_used,
+                "matched_groups": response.matched_groups,
+            },
+        )
     return response
 
 
@@ -1520,6 +1874,20 @@ def _json_event(event: str, **payload: object) -> str:
 
 def _warning_payload(warnings: list[SqlWarning]) -> list[dict]:
     return [warning.model_dump(mode="json") for warning in warnings]
+
+
+def _remaining_timeout_seconds(started: float, timeout_seconds: float) -> float:
+    return max(0.001, timeout_seconds - (time.monotonic() - started))
+
+
+def _ask_stream_timeout_warning(stage: str, timeout_seconds: float) -> SqlWarning:
+    return SqlWarning(
+        code=WarningCode.REQUEST_TIMEOUT,
+        message=(
+            "Streaming ask exceeded the service time budget "
+            f"of {timeout_seconds}s during {stage}."
+        ),
+    )
 
 
 def _response_payload(response: AskResponse) -> dict:
@@ -1536,9 +1904,21 @@ async def ask_stream_endpoint(
     request_id = _resolve_request_id(request.request_id)
     set_request_id(request_id)
     started = time.monotonic()
+    trace_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+    trace_recorder = TraceRecorder(
+        pool=pool,
+        request_id=request_id,
+        stream_queue=trace_queue,
+    )
 
     async def event_stream() -> AsyncIterator[str]:
         stage_latencies_ms: dict[str, int] = {}
+        await trace_recorder.emit(
+            stage="request_received",
+            status="started",
+            message="Received streaming ask request.",
+            details={"endpoint": "/ask/stream", "top_k": top_k},
+        )
         yield _json_event(
             "started",
             message="Received question.",
@@ -1546,23 +1926,116 @@ async def ask_stream_endpoint(
             top_k=top_k,
             request_id=request_id,
         )
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
 
         yield _json_event(
             "sql_generation_started",
             message="Retrieving schema context and generating guarded SQL.",
         )
         sql_started = time.monotonic()
-        sql_task = asyncio.create_task(generate_sql(request.query, pool, settings, top_k))
+        sql_task = asyncio.create_task(
+            generate_sql(
+                request.query,
+                pool,
+                settings,
+                top_k,
+                trace_callback=trace_recorder.emit,
+            )
+        )
+        last_running_notice = time.monotonic()
         while True:
-            done, _ = await asyncio.wait({sql_task}, timeout=10)
+            done, _ = await asyncio.wait(
+                {sql_task},
+                timeout=min(1, _remaining_timeout_seconds(started, settings.ask_timeout)),
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
             if done:
                 break
-            yield _json_event(
-                "sql_generation_running",
-                message="Still generating and validating SQL.",
-            )
+            if time.monotonic() - started >= settings.ask_timeout:
+                sql_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sql_task
+                timeout_warning = _ask_stream_timeout_warning(
+                    "SQL generation",
+                    settings.ask_timeout,
+                )
+                response = AskRejected(
+                    sql=None,
+                    warnings=[timeout_warning],
+                    attempt_count=0,
+                    react_trace=None,
+                    stage_latencies_ms=stage_latencies_ms,
+                )
+                elapsed = _elapsed_ms(started)
+                asyncio.create_task(
+                    _log_request_event(
+                        pool,
+                        request_id=request_id,
+                        endpoint="/ask/stream",
+                        query_text=request.query,
+                        top_k=top_k,
+                        status=response.status,
+                        attempt_count=None,
+                        latency_ms=elapsed,
+                        stage_latencies_ms=stage_latencies_ms,
+                        warning_codes=[timeout_warning.code.value],
+                        error_source="service_timeout",
+                        metadata={"failed_stage": "sql_generation"},
+                    )
+                )
+                asyncio.create_task(
+                    _log_failure_event(
+                        pool,
+                        request_id=request_id,
+                        endpoint="/ask/stream",
+                        query_text=request.query,
+                        warning_codes=[timeout_warning.code.value],
+                        error_source="service_timeout",
+                        sql_preview=None,
+                        tables_attempted=[],
+                        latency_ms=elapsed,
+                        trace_emit=trace_recorder.emit,
+                    )
+                )
+                yield _json_event(
+                    "timeout",
+                    message=timeout_warning.message,
+                    warnings=_warning_payload(response.warnings),
+                )
+                await trace_recorder.emit(
+                    stage="complete",
+                    status=response.status,
+                    message=timeout_warning.message,
+                    duration_ms=elapsed,
+                    warning_codes=[timeout_warning.code.value],
+                    error_source="service_timeout",
+                    details={
+                        "failed_stage": "sql_generation",
+                        "stage_latencies_ms": stage_latencies_ms,
+                    },
+                )
+                for event in await _drain_trace_queue(trace_queue):
+                    yield _json_event("trace", **event)
+                yield _json_event("final", response=_response_payload(response))
+                return
+            if time.monotonic() - last_running_notice >= 10:
+                yield _json_event(
+                    "sql_generation_running",
+                    message="Still generating and validating SQL.",
+                )
+                last_running_notice = time.monotonic()
         sql_result = await sql_task
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
         stage_latencies_ms["sql_generation"] = _elapsed_ms(sql_started)
+        merged_sql_latencies = {
+            **(getattr(sql_result, "stage_latencies_ms", None) or {}),
+            **stage_latencies_ms,
+        }
+        if getattr(sql_result, "stage_latencies_ms", None) != merged_sql_latencies:
+            sql_result = sql_result.model_copy(update={"stage_latencies_ms": merged_sql_latencies})
         if sql_result.status == "clarification_needed":
             asyncio.create_task(
                 _log_request_event(
@@ -1589,6 +2062,19 @@ async def ask_stream_endpoint(
                 question=sql_result.question,
                 suggestions=sql_result.suggestions,
             )
+            await trace_recorder.emit(
+                stage="complete",
+                status=sql_result.status,
+                message=sql_result.failure_reason,
+                duration_ms=_elapsed_ms(started),
+                error_source="clarification",
+                details={
+                    "suggestion_count": len(sql_result.suggestions),
+                    "stage_latencies_ms": stage_latencies_ms,
+                },
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
             yield _json_event("final", response=_response_payload(sql_result))
             return
         if sql_result.status == "rejected":
@@ -1597,6 +2083,10 @@ async def ask_stream_endpoint(
                 warnings=sql_result.warnings,
                 attempt_count=sql_result.attempt_count,
                 react_trace=sql_result.react_trace,
+                stage_latencies_ms={
+                    **(sql_result.stage_latencies_ms or {}),
+                    **stage_latencies_ms,
+                },
             )
             asyncio.create_task(
                 _log_request_event(
@@ -1624,6 +2114,17 @@ async def ask_stream_endpoint(
                 warnings=_warning_payload(sql_result.warnings),
                 attempt_count=sql_result.attempt_count,
             )
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Streaming ask stopped during SQL generation.",
+                duration_ms=_elapsed_ms(started),
+                warning_codes=[warning.code.value for warning in response.warnings],
+                error_source=_derive_error_source(response.warnings),
+                details={"stage_latencies_ms": stage_latencies_ms},
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
             yield _json_event("final", response=_response_payload(response))
             return
 
@@ -1649,18 +2150,138 @@ async def ask_stream_endpoint(
             "execution_started",
             message="Executing bounded SQL on the app MySQL database.",
         )
-        execution_started = time.monotonic()
-        columns, rows, execution_warnings = await mysql_executor.execute_sql(
-            sql=capped_sql,
-            settings=settings,
+        await trace_recorder.emit(
+            stage="execution",
+            status="started",
+            message="Executing bounded SQL on MySQL.",
+            details={
+                "tables_used": sql_result.tables_used,
+                "sql_preview": capped_sql[:500],
+            },
         )
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
+        execution_started = time.monotonic()
+        try:
+            columns, rows, execution_warnings = await asyncio.wait_for(
+                mysql_executor.execute_sql(
+                    sql=capped_sql,
+                    settings=settings,
+                ),
+                timeout=_remaining_timeout_seconds(started, settings.ask_timeout),
+            )
+        except asyncio.TimeoutError:
+            stage_latencies_ms["execution"] = _elapsed_ms(execution_started)
+            timeout_warning = _ask_stream_timeout_warning(
+                "MySQL execution",
+                settings.ask_timeout,
+            )
+            response = AskRejected(
+                sql=capped_sql,
+                warnings=[*sql_result.warnings, timeout_warning],
+                attempt_count=sql_result.attempt_count,
+                react_trace=sql_result.react_trace,
+                stage_latencies_ms={
+                    **(sql_result.stage_latencies_ms or {}),
+                    **stage_latencies_ms,
+                },
+            )
+            elapsed = _elapsed_ms(started)
+            asyncio.create_task(
+                _log_request_event(
+                    pool,
+                    request_id=request_id,
+                    endpoint="/ask/stream",
+                    query_text=request.query,
+                    top_k=top_k,
+                    status=response.status,
+                    attempt_count=response.attempt_count,
+                    latency_ms=elapsed,
+                    stage_latencies_ms=stage_latencies_ms,
+                    warning_codes=[warning.code.value for warning in response.warnings],
+                    error_source="service_timeout",
+                    metadata={
+                        "failed_stage": "execution",
+                        "sql_present": response.sql is not None,
+                        "tables_used": sql_result.tables_used,
+                        "matched_groups": sql_result.matched_groups,
+                    },
+                )
+            )
+            asyncio.create_task(
+                _log_failure_event(
+                    pool,
+                    request_id=request_id,
+                    endpoint="/ask/stream",
+                    query_text=request.query,
+                    warning_codes=[warning.code.value for warning in response.warnings],
+                    error_source="service_timeout",
+                    sql_preview=capped_sql,
+                    tables_attempted=sql_result.tables_used,
+                    latency_ms=elapsed,
+                    trace_emit=trace_recorder.emit,
+                )
+            )
+            yield _json_event(
+                "timeout",
+                message=timeout_warning.message,
+                warnings=_warning_payload([timeout_warning]),
+            )
+            await trace_recorder.emit(
+                stage="execution",
+                status="failed",
+                message=timeout_warning.message,
+                duration_ms=stage_latencies_ms["execution"],
+                warning_codes=[timeout_warning.code.value],
+                error_source="service_timeout",
+                details={"sql_preview": capped_sql[:500]},
+            )
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message=timeout_warning.message,
+                duration_ms=elapsed,
+                warning_codes=[warning.code.value for warning in response.warnings],
+                error_source="service_timeout",
+                details={
+                    "failed_stage": "execution",
+                    "stage_latencies_ms": response.stage_latencies_ms or {},
+                },
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
+            yield _json_event("final", response=_response_payload(response))
+            return
         stage_latencies_ms["execution"] = _elapsed_ms(execution_started)
+        await trace_recorder.emit(
+            stage="execution",
+            status="completed" if not execution_warnings else "failed",
+            message=(
+                "SQL execution completed."
+                if not execution_warnings
+                else "SQL execution failed."
+            ),
+            duration_ms=stage_latencies_ms["execution"],
+            warning_codes=[warning.code.value for warning in execution_warnings],
+            error_source="execution" if execution_warnings else None,
+            details={
+                "row_count": len(rows),
+                "columns": columns,
+                "sql_preview": capped_sql[:500],
+            },
+        )
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
         if execution_warnings:
             response = AskRejected(
                 sql=capped_sql,
                 warnings=[*sql_result.warnings, *execution_warnings],
                 attempt_count=sql_result.attempt_count,
                 react_trace=sql_result.react_trace,
+                stage_latencies_ms={
+                    **(sql_result.stage_latencies_ms or {}),
+                    **stage_latencies_ms,
+                },
             )
             asyncio.create_task(
                 _log_request_event(
@@ -1687,6 +2308,17 @@ async def ask_stream_endpoint(
                 message="MySQL execution failed.",
                 warnings=_warning_payload(execution_warnings),
             )
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Streaming ask stopped during SQL execution.",
+                duration_ms=_elapsed_ms(started),
+                warning_codes=[warning.code.value for warning in response.warnings],
+                error_source=_derive_error_source(response.warnings),
+                details={"stage_latencies_ms": response.stage_latencies_ms or {}},
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
             yield _json_event("final", response=_response_payload(response))
             return
 
@@ -1701,6 +2333,14 @@ async def ask_stream_endpoint(
             "answer_generation_started",
             message="Generating final answer from bounded result rows.",
         )
+        await trace_recorder.emit(
+            stage="answer_generation",
+            status="started",
+            message="Generating final answer from result rows.",
+            details={"row_count": len(rows), "columns": columns},
+        )
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
         answer_started = time.monotonic()
         answer_task = asyncio.create_task(
             answer_generator.generate_answer(
@@ -1713,16 +2353,123 @@ async def ask_stream_endpoint(
                 settings=settings,
             )
         )
+        last_answer_notice = time.monotonic()
         while True:
-            done, _ = await asyncio.wait({answer_task}, timeout=10)
+            done, _ = await asyncio.wait(
+                {answer_task},
+                timeout=min(1, _remaining_timeout_seconds(started, settings.ask_timeout)),
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
             if done:
                 break
-            yield _json_event(
-                "answer_generation_running",
-                message="Still generating final answer.",
-            )
+            if time.monotonic() - started >= settings.ask_timeout:
+                answer_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await answer_task
+                stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
+                timeout_warning = _ask_stream_timeout_warning(
+                    "answer generation",
+                    settings.ask_timeout,
+                )
+                response = AskRejected(
+                    sql=capped_sql,
+                    warnings=[*sql_result.warnings, timeout_warning],
+                    attempt_count=sql_result.attempt_count,
+                    react_trace=sql_result.react_trace,
+                    stage_latencies_ms={
+                        **(sql_result.stage_latencies_ms or {}),
+                        **stage_latencies_ms,
+                    },
+                )
+                elapsed = _elapsed_ms(started)
+                asyncio.create_task(
+                    _log_request_event(
+                        pool,
+                        request_id=request_id,
+                        endpoint="/ask/stream",
+                        query_text=request.query,
+                        top_k=top_k,
+                        status=response.status,
+                        attempt_count=response.attempt_count,
+                        latency_ms=elapsed,
+                        stage_latencies_ms=stage_latencies_ms,
+                        warning_codes=[warning.code.value for warning in response.warnings],
+                        error_source="service_timeout",
+                        metadata={
+                            "failed_stage": "answer_generation",
+                            "sql_present": response.sql is not None,
+                            "row_count": len(rows),
+                            "tables_used": sql_result.tables_used,
+                            "matched_groups": sql_result.matched_groups,
+                        },
+                    )
+                )
+                asyncio.create_task(
+                    _log_failure_event(
+                        pool,
+                        request_id=request_id,
+                        endpoint="/ask/stream",
+                        query_text=request.query,
+                        warning_codes=[warning.code.value for warning in response.warnings],
+                        error_source="service_timeout",
+                        sql_preview=capped_sql,
+                        tables_attempted=sql_result.tables_used,
+                        latency_ms=elapsed,
+                        trace_emit=trace_recorder.emit,
+                    )
+                )
+                yield _json_event(
+                    "timeout",
+                    message=timeout_warning.message,
+                    warnings=_warning_payload([timeout_warning]),
+                )
+                await trace_recorder.emit(
+                    stage="answer_generation",
+                    status="failed",
+                    message=timeout_warning.message,
+                    duration_ms=stage_latencies_ms["answer_generation"],
+                    warning_codes=[timeout_warning.code.value],
+                    error_source="service_timeout",
+                )
+                await trace_recorder.emit(
+                    stage="complete",
+                    status=response.status,
+                    message=timeout_warning.message,
+                    duration_ms=elapsed,
+                    warning_codes=[warning.code.value for warning in response.warnings],
+                    error_source="service_timeout",
+                    details={
+                        "failed_stage": "answer_generation",
+                        "stage_latencies_ms": response.stage_latencies_ms or {},
+                    },
+                )
+                for event in await _drain_trace_queue(trace_queue):
+                    yield _json_event("trace", **event)
+                yield _json_event("final", response=_response_payload(response))
+                return
+            if time.monotonic() - last_answer_notice >= 10:
+                yield _json_event(
+                    "answer_generation_running",
+                    message="Still generating final answer.",
+                )
+                last_answer_notice = time.monotonic()
         answer_text, answer_warnings = await answer_task
         stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
+        await trace_recorder.emit(
+            stage="answer_generation",
+            status="completed" if answer_text is not None else "failed",
+            message=(
+                "Answer generation completed."
+                if answer_text is not None
+                else "Answer generation failed."
+            ),
+            duration_ms=stage_latencies_ms["answer_generation"],
+            warning_codes=[warning.code.value for warning in answer_warnings],
+            error_source="answer_generation" if answer_text is None else None,
+        )
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
         if answer_text is None:
             enriched_answer_warnings: list[SqlWarning] = [
                 SqlWarning(
@@ -1749,6 +2496,10 @@ async def ask_stream_endpoint(
                 warnings=[*sql_result.warnings, *enriched_answer_warnings],
                 attempt_count=sql_result.attempt_count,
                 react_trace=sql_result.react_trace,
+                stage_latencies_ms={
+                    **(sql_result.stage_latencies_ms or {}),
+                    **stage_latencies_ms,
+                },
             )
             asyncio.create_task(
                 _log_request_event(
@@ -1776,6 +2527,17 @@ async def ask_stream_endpoint(
                 message="Answer generation failed.",
                 warnings=_warning_payload(enriched_answer_warnings),
             )
+            await trace_recorder.emit(
+                stage="complete",
+                status=response.status,
+                message="Streaming ask stopped during answer generation.",
+                duration_ms=_elapsed_ms(started),
+                warning_codes=[warning.code.value for warning in response.warnings],
+                error_source=_derive_error_source(response.warnings),
+                details={"stage_latencies_ms": response.stage_latencies_ms or {}},
+            )
+            for event in await _drain_trace_queue(trace_queue):
+                yield _json_event("trace", **event)
             yield _json_event("final", response=_response_payload(response))
             return
 
@@ -1804,6 +2566,10 @@ async def ask_stream_endpoint(
             matched_groups=sql_result.matched_groups,
             attempt_count=sql_result.attempt_count,
             react_trace=sql_result.react_trace,
+            stage_latencies_ms={
+                **(sql_result.stage_latencies_ms or {}),
+                **stage_latencies_ms,
+            },
         )
         asyncio.create_task(
             _log_request_event(
@@ -1825,6 +2591,22 @@ async def ask_stream_endpoint(
                 },
             )
         )
+        await trace_recorder.emit(
+            stage="complete",
+            status=response.status,
+            message="Streaming ask request completed.",
+            duration_ms=_elapsed_ms(started),
+            warning_codes=[warning.code.value for warning in response.warnings],
+            error_source=_derive_error_source(response.warnings),
+            details={
+                "stage_latencies_ms": response.stage_latencies_ms or {},
+                "row_count": response.row_count,
+                "tables_used": response.tables_used,
+                "matched_groups": response.matched_groups,
+            },
+        )
+        for event in await _drain_trace_queue(trace_queue):
+            yield _json_event("trace", **event)
         yield _json_event("final", response=_response_payload(response))
 
     return StreamingResponse(

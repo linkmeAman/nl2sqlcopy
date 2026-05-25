@@ -12,11 +12,21 @@ from nl2sql_service.config import Settings
 
 Chunk = dict[str, Any]
 
-_encoding = tiktoken.get_encoding("cl100k_base")
+_ENCODING_UNAVAILABLE = object()
+_encoding = None
 
 
 def count_tokens(text: str) -> int:
     """Return the number of cl100k_base tokens in *text*."""
+    global _encoding
+    if _encoding is _ENCODING_UNAVAILABLE:
+        return max(1, len(text.split()))
+    if _encoding is None:
+        try:
+            _encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _encoding = _ENCODING_UNAVAILABLE
+            return max(1, len(text.split()))
     return len(_encoding.encode(text))
 
 

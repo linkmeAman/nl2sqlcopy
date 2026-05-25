@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+import time
+from typing import Any, Awaitable, Callable
 
 import asyncpg
 
@@ -35,6 +36,32 @@ from nl2sql_service.sql_generator import (
     validate_sql_safety,
     validate_tables_used,
 )
+
+TraceCallback = Callable[..., Awaitable[None]]
+
+
+async def _emit_trace(
+    trace: TraceCallback | None,
+    *,
+    stage: str,
+    status: str,
+    message: str,
+    duration_ms: int | None = None,
+    warning_codes: list[str] | None = None,
+    error_source: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    if trace is None:
+        return
+    await trace(
+        stage=stage,
+        status=status,
+        message=message,
+        duration_ms=duration_ms,
+        warning_codes=warning_codes,
+        error_source=error_source,
+        details=details or {},
+    )
 
 
 def extract_think_block(raw: str) -> tuple[str, str]:
@@ -559,6 +586,7 @@ async def build_clarification(
     all_warnings: list[SqlWarning],
     react_trace: ReactTrace,
     settings: Settings,
+    stage_latencies_ms: dict[str, int] | None = None,
 ) -> GenerateSqlClarification:
     del all_warnings
     prompt = f"""
@@ -618,6 +646,7 @@ SUGGESTION_3: <optional third suggestion>
         original_query=query,
         failure_reason=failure_reason,
         react_trace=react_trace,
+        stage_latencies_ms=stage_latencies_ms,
     )
 
 
@@ -626,18 +655,62 @@ async def run(
     pool: asyncpg.Pool,
     settings: Settings,
     top_k: int | None = None,
+    trace_callback: TraceCallback | None = None,
 ) -> GenerateSqlResponse:
+    stage_latencies_ms: dict[str, int] = {}
+
+    rewrite_started = time.monotonic()
+    await _emit_trace(
+        trace_callback,
+        stage="query_rewrite",
+        status="started",
+        message="Rewriting the prompt for schema retrieval.",
+    )
     search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+    await _emit_trace(
+        trace_callback,
+        stage="query_rewrite",
+        status="completed",
+        message="Prompt rewrite completed.",
+        duration_ms=int((time.monotonic() - rewrite_started) * 1000),
+        details={
+            "used_rewrite": search_query != query,
+            "search_query": search_query,
+        },
+    )
+
+    retrieval_started = time.monotonic()
+    await _emit_trace(
+        trace_callback,
+        stage="schema_retrieval",
+        status="started",
+        message="Retrieving schema groups and live columns.",
+        details={"top_k": top_k or settings.top_k},
+    )
     result = await retrieve_groups(
         query=query,
         top_k=top_k or settings.top_k,
         pool=pool,
         search_query=search_query,
     )
+
     tables_in_scope = _result_value(result, "tables_in_scope")
     initial_columns = await load_columns_for_tables(
         tables=tables_in_scope,
         settings=settings,
+    )
+    stage_latencies_ms["initial_retrieval"] = int((time.monotonic() - retrieval_started) * 1000)
+    await _emit_trace(
+        trace_callback,
+        stage="schema_retrieval",
+        status="completed",
+        message=f"Retrieved {len(tables_in_scope)} table(s) for SQL planning.",
+        duration_ms=stage_latencies_ms["initial_retrieval"],
+        details={
+            "tables_in_scope": tables_in_scope,
+            "matched_groups": _result_value(result, "matched_groups"),
+            "column_tables": sorted(initial_columns.keys()),
+        },
     )
 
     state: dict[str, Any] = {
@@ -671,9 +744,28 @@ async def run(
             settings=settings,
         )
 
+        step_started = time.monotonic()
+        await _emit_trace(
+            trace_callback,
+            stage="react_iteration",
+            status="started",
+            message=f"Planning iteration {iteration} started.",
+            details={"iteration": iteration},
+        )
         thought, answer, reason_warnings = await call_reasoning_model(prompt, settings)
         if reason_warnings:
             all_warnings.extend(reason_warnings)
+            duration = int((time.monotonic() - step_started) * 1000)
+            await _emit_trace(
+                trace_callback,
+                stage="react_iteration",
+                status="failed",
+                message=f"Planning iteration {iteration} failed during model reasoning.",
+                duration_ms=duration,
+                warning_codes=[warning.code.value for warning in reason_warnings],
+                error_source="generation_transport",
+                details={"iteration": iteration},
+            )
             trace = ReactTrace(
                 steps=steps,
                 total_iterations=len(steps),
@@ -683,6 +775,7 @@ async def run(
                 warnings=all_warnings,
                 attempt_count=len(steps),
                 react_trace=trace,
+                stage_latencies_ms=stage_latencies_ms,
             )
 
         action, action_input = parse_action(answer)
@@ -720,6 +813,26 @@ async def run(
             blocking_action_warnings = _blocking_warnings(action_warnings)
             completed_action = ReActAction.VALIDATE_AND_RETURN
 
+        step_duration_ms = int((time.monotonic() - step_started) * 1000)
+        warning_codes = [warning.code.value for warning in action_warnings]
+        await _emit_trace(
+            trace_callback,
+            stage="react_iteration",
+            status="completed" if not warning_codes else "warning",
+            message=f"Planning iteration {iteration} selected {action.value}.",
+            duration_ms=step_duration_ms,
+            warning_codes=warning_codes,
+            details={
+                "iteration": iteration,
+                "action": action.value,
+                "action_input": action_input,
+                "observation": observation[:1000],
+                "completed_action": completed_action.value,
+                "sql_preview": (state.get("current_sql") or "")[:500],
+                "tables_in_scope": state.get("tables_in_scope", []),
+                "tables_used": state.get("tables_used", []),
+            },
+        )
         steps.append(
             ReActStep(
                 iteration=iteration,
@@ -727,12 +840,21 @@ async def run(
                 action=action,
                 action_input=action_input,
                 observation=observation,
+                duration_ms=step_duration_ms,
             )
         )
         last_completed_action = completed_action
 
         if _is_transport_failure(action_warnings):
             all_warnings.extend(action_warnings)
+            await _emit_trace(
+                trace_callback,
+                stage="sql_generation",
+                status="failed",
+                message="SQL planning stopped because the generation transport failed.",
+                warning_codes=[warning.code.value for warning in all_warnings],
+                error_source="generation_transport",
+            )
             trace = ReactTrace(
                 steps=steps,
                 total_iterations=iteration,
@@ -742,6 +864,7 @@ async def run(
                 warnings=all_warnings,
                 attempt_count=iteration,
                 react_trace=trace,
+                stage_latencies_ms=stage_latencies_ms,
             )
 
         if action in {ReActAction.GIVE_UP, ReActAction.ASK_CLARIFICATION}:
@@ -757,12 +880,24 @@ async def run(
                     pool=pool,
                 )
             )
+            await _emit_trace(
+                trace_callback,
+                stage="sql_generation",
+                status="needs_context" if action == ReActAction.ASK_CLARIFICATION else "failed",
+                message=action_input or "Could not generate valid SQL.",
+                details={
+                    "action": action.value,
+                    "tables_in_scope": state.get("tables_in_scope", []),
+                    "matched_groups": state.get("matched_groups", []),
+                },
+            )
             return await build_clarification(
                 query=query,
                 failure_reason=action_input or "Could not generate valid SQL",
                 all_warnings=all_warnings,
                 react_trace=trace,
                 settings=settings,
+                stage_latencies_ms=stage_latencies_ms,
             )
 
         if blocking_action_warnings:
@@ -792,6 +927,18 @@ async def run(
                     pool=pool,
                 )
             )
+            await _emit_trace(
+                trace_callback,
+                stage="sql_generation",
+                status="completed",
+                message="SQL generated and validated.",
+                details={
+                    "tables_used": state["tables_used"],
+                    "matched_groups": state["matched_groups"],
+                    "sql_preview": (state.get("current_sql") or "")[:500],
+                    "attempt_count": iteration,
+                },
+            )
             return GenerateSqlSuccess(
                 sql=state["current_sql"],
                 warnings=info_warnings,
@@ -799,6 +946,7 @@ async def run(
                 matched_groups=state["matched_groups"],
                 attempt_count=iteration,
                 react_trace=trace,
+                stage_latencies_ms=stage_latencies_ms,
             )
 
     if len(steps) >= max_iterations and (
@@ -828,12 +976,26 @@ async def run(
             pool=pool,
         )
     )
+    await _emit_trace(
+        trace_callback,
+        stage="sql_generation",
+        status="failed",
+        message=failure_reason,
+        warning_codes=codes,
+        error_source="sql_generation",
+        details={
+            "attempt_count": len(steps),
+            "tables_in_scope": state.get("tables_in_scope", []),
+            "matched_groups": state.get("matched_groups", []),
+        },
+    )
     return await build_clarification(
         query=query,
         failure_reason=failure_reason,
         all_warnings=all_warnings,
         react_trace=trace,
         settings=settings,
+        stage_latencies_ms=stage_latencies_ms,
     )
 
 

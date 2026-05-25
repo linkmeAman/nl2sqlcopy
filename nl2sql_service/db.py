@@ -211,6 +211,28 @@ CREATE INDEX IF NOT EXISTS nl2sql_failure_log_created_idx
 
 CREATE INDEX IF NOT EXISTS nl2sql_failure_log_endpoint_idx
     ON nl2sql_failure_log (endpoint, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS nl2sql_trace_events (
+    id              BIGSERIAL PRIMARY KEY,
+    request_id      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    layer           TEXT NOT NULL,
+    stage           TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    duration_ms     INTEGER,
+    warning_codes   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    error_source    TEXT,
+    details         JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (request_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS nl2sql_trace_events_request_idx
+    ON nl2sql_trace_events (request_id, seq);
+
+CREATE INDEX IF NOT EXISTS nl2sql_trace_events_created_idx
+    ON nl2sql_trace_events (created_at DESC);
 """
 
 
@@ -382,6 +404,52 @@ async def insert_failure_log(
         logger.warning("Failed to write failure log entry: %s", exc)
 
 
+async def insert_trace_event(
+    pool: asyncpg.Pool,
+    *,
+    request_id: str,
+    seq: int,
+    layer: str,
+    stage: str,
+    status: str,
+    message: str,
+    duration_ms: int | None = None,
+    warning_codes: list[str] | None = None,
+    error_source: str | None = None,
+    details: dict | None = None,
+) -> None:
+    """Persist one sanitized per-stage trace event for request debugging."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO nl2sql_trace_events (
+                request_id,
+                seq,
+                layer,
+                stage,
+                status,
+                message,
+                duration_ms,
+                warning_codes,
+                error_source,
+                details
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb)
+            ON CONFLICT (request_id, seq) DO NOTHING
+            """,
+            request_id,
+            seq,
+            layer,
+            stage,
+            status,
+            message,
+            duration_ms,
+            json.dumps(warning_codes or []),
+            error_source,
+            json.dumps(details or {}),
+        )
+
+
 async def list_failure_logs(
     pool: asyncpg.Pool,
     *,
@@ -435,6 +503,40 @@ async def list_failure_logs(
                 """,
                 safe_limit,
             )
+    return [dict(row) for row in rows]
+
+
+async def list_trace_events(
+    pool: asyncpg.Pool,
+    *,
+    request_id: str,
+    limit: int = 500,
+) -> list[dict]:
+    """Return ordered trace events for a single request id."""
+    safe_limit = max(1, min(limit, 1000))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                request_id,
+                seq,
+                layer,
+                stage,
+                status,
+                message,
+                duration_ms,
+                warning_codes,
+                error_source,
+                details,
+                created_at
+            FROM nl2sql_trace_events
+            WHERE request_id = $1
+            ORDER BY seq ASC
+            LIMIT $2
+            """,
+            request_id,
+            safe_limit,
+        )
     return [dict(row) for row in rows]
 
 
