@@ -5,6 +5,7 @@ This document is a route-by-route reference for the FastAPI service in this repo
 ## Change Log
 
 - 2026-05-11: Added governance rulebook injection, advisory SQL review gate, `GET /governance/rules`, `POST /governance/validate`, `REVIEW_FAILED` warnings, and telemetry summary visibility for review-gate hits.
+- 2026-05-25: Added full-response `AskCache` and semantic cosine-similarity `SemanticSqlCache`. Repeated `/ask` queries return in <5 ms (exact cache hit) or <50 ms (semantic hit at cosine ≥ 0.97). New env knobs: `ASK_CACHE_ENABLED`, `ASK_CACHE_TTL_SECONDS`, `ASK_CACHE_SEMANTIC_THRESHOLD`, `SQL_CACHE_SEMANTIC_THRESHOLD`. Default TTLs increased (`SQL_CACHE_TTL_SECONDS` 300 → 3600, `EMBED_CACHE_TTL_SECONDS` 1800 → 3600). `/cache/stats` and `/cache/clear` now cover all four cache layers.
 - 2026-05-09: Added in-memory embed/SQL caches, `GET /cache/stats`, `POST /cache/clear`, `cache_hit` SQL generation fields, structured answer generation, and `ANSWER_HALLUCINATION` warnings.
 - 2026-05-06: Added public browser route help at `/help`, `/help/{module}`, and `/help/{module}/{route_slug}`.
 - 2026-05-06: Added terminal route help browser via `python -m nl2sql_service.help_tui`; it reuses the same OpenAPI-backed help registry as `/help`.
@@ -357,22 +358,28 @@ curl -s -X POST http://localhost:8080/governance/validate \
 ## GET /cache/stats
 
 What this route does:
-- Returns current in-memory cache sizes and TTL settings.
+- Returns current in-memory cache sizes and TTL settings for all four cache layers.
 - Does not require PostgreSQL, MySQL, embedding service, or Ollama.
 
 Response fields:
 - `embed_cache_size`: number of cached retrieval embeddings
-- `sql_cache_size`: number of cached successful SQL generation responses
+- `sql_cache_size`: number of cached successful SQL generation responses (exact-match)
+- `semantic_sql_cache_size`: number of cached SQL generation responses indexed by query embedding (semantic-match)
+- `ask_cache_size`: number of cached full `/ask` responses (answer text + rows + SQL)
 - `embed_cache_ttl_seconds`: current embed cache TTL
-- `sql_cache_ttl_seconds`: current SQL cache TTL
+- `sql_cache_ttl_seconds`: current SQL / semantic SQL cache TTL
+- `ask_cache_ttl_seconds`: current ask cache TTL
 
 Example response:
 ```json
 {
   "embed_cache_size": 12,
   "sql_cache_size": 4,
-  "embed_cache_ttl_seconds": 1800,
-  "sql_cache_ttl_seconds": 300
+  "semantic_sql_cache_size": 4,
+  "ask_cache_size": 7,
+  "embed_cache_ttl_seconds": 3600,
+  "sql_cache_ttl_seconds": 3600,
+  "ask_cache_ttl_seconds": 300
 }
 ```
 
@@ -386,19 +393,23 @@ curl -s http://localhost:8080/cache/stats | python3 -m json.tool
 ## POST /cache/clear
 
 What this route does:
-- Clears both in-memory caches.
-- Intended for ops use after schema changes, re-ingest, or troubleshooting stale SQL generation.
+- Clears all four in-memory caches: embed, SQL (exact), semantic SQL, and ask.
+- Intended for ops use after schema changes, re-ingest, or troubleshooting stale SQL or answer generation.
 - Does not require PostgreSQL, MySQL, embedding service, or Ollama.
 
 Response fields:
 - `embed_cleared`: number of embedding cache entries removed
-- `sql_cleared`: number of SQL cache entries removed
+- `sql_cleared`: number of exact SQL cache entries removed
+- `semantic_sql_cleared`: number of semantic SQL cache entries removed
+- `ask_cleared`: number of full ask-response cache entries removed
 
 Example response:
 ```json
 {
   "embed_cleared": 12,
-  "sql_cleared": 4
+  "sql_cleared": 4,
+  "semantic_sql_cleared": 4,
+  "ask_cleared": 7
 }
 ```
 

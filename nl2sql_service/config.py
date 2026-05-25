@@ -42,10 +42,14 @@ class Settings(BaseSettings):
 
     # Retrieval
     top_k: int = 5
-    embed_cache_ttl_seconds: int = 1800
-    sql_cache_ttl_seconds: int = 300
+    embed_cache_ttl_seconds: int = 3600
+    sql_cache_ttl_seconds: int = 3600
     sql_cache_enabled: bool = True
     embed_cache_enabled: bool = True
+    ask_cache_ttl_seconds: int = 300
+    ask_cache_enabled: bool = True
+    ask_cache_semantic_threshold: float = 0.97
+    sql_cache_semantic_threshold: float = 0.96
     min_pattern_use_count: int = 2
     min_instruction_confidence: float = 0.5
     query_rewrite_enabled: bool = True

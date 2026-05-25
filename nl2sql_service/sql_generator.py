@@ -12,6 +12,7 @@ from sqlparse.sql import Comment, Identifier, IdentifierList, Parenthesis, State
 
 from nl2sql_service import query_rewriter, retrieve
 from nl2sql_service.cache import sql_cache
+from nl2sql_service.cache import semantic_sql_cache
 from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.config import Settings, settings as default_settings
 from nl2sql_service.model_client import get_model_client
@@ -1013,6 +1014,26 @@ async def generate_sql(
             cached["cache_hit"] = True
             return _generate_sql_response_from_dict(cached)
 
+    # Semantic SQL cache: embed the query and look for a near-duplicate hit.
+    if settings.sql_cache_enabled:
+        try:
+            from nl2sql_service.cache import embed_cache
+            from nl2sql_service import embed as _embed_mod
+            q_vec: list[float] | None = embed_cache.get(query)
+            if q_vec is None:
+                vecs = await _embed_mod.embed_texts([query])
+                q_vec = vecs[0]
+                embed_cache.set(query, q_vec)
+            sem_cached = semantic_sql_cache.get_semantic(
+                q_vec, effective_top_k, threshold=settings.sql_cache_semantic_threshold
+            )
+            if sem_cached:
+                sem_cached["cache_hit"] = True
+                sem_cached["semantic_cache_hit"] = True
+                return _generate_sql_response_from_dict(sem_cached)
+        except Exception:
+            pass  # semantic lookup is best-effort; never block on failure
+
     deterministic_result = await _try_deterministic_generation(
         query=query,
         settings=settings,
@@ -1023,6 +1044,17 @@ async def generate_sql(
             payload = deterministic_result.model_dump(mode="json")
             payload["cache_hit"] = False
             sql_cache.set(query, effective_top_k, payload)
+            try:
+                from nl2sql_service.cache import embed_cache
+                from nl2sql_service import embed as _embed_mod
+                q_vec = embed_cache.get(query)
+                if q_vec is None:
+                    vecs = await _embed_mod.embed_texts([query])
+                    q_vec = vecs[0]
+                    embed_cache.set(query, q_vec)
+                semantic_sql_cache.set(query, effective_top_k, payload, embedding=q_vec)
+            except Exception:
+                pass
         return deterministic_result
 
     try:
@@ -1061,6 +1093,17 @@ async def generate_sql(
         payload = result.model_dump(mode="json")
         payload["cache_hit"] = False
         sql_cache.set(query, effective_top_k, payload)
+        try:
+            from nl2sql_service.cache import embed_cache
+            from nl2sql_service import embed as _embed_mod
+            q_vec = embed_cache.get(query)
+            if q_vec is None:
+                vecs = await _embed_mod.embed_texts([query])
+                q_vec = vecs[0]
+                embed_cache.set(query, q_vec)
+            semantic_sql_cache.set(query, effective_top_k, payload, embedding=q_vec)
+        except Exception:
+            pass
     return result
 
 

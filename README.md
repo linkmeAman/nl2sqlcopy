@@ -6,6 +6,7 @@ It also contains older Qdrant/FastEmbed scripts that are still useful for offlin
 
 ## 0) Change Log
 
+- 2026-05-25: Added full-response `/ask` cache (`AskCache`) and semantic cosine-similarity SQL cache (`SemanticSqlCache`) to eliminate Ollama + MySQL round-trips on repeated or near-duplicate queries. Exact repeated queries now return in <5 ms; semantically similar queries (cosine ≥ 0.97) bypass the full pipeline entirely. New config knobs: `ASK_CACHE_ENABLED`, `ASK_CACHE_TTL_SECONDS`, `ASK_CACHE_SEMANTIC_THRESHOLD`, `SQL_CACHE_SEMANTIC_THRESHOLD`. Default TTLs increased: `SQL_CACHE_TTL_SECONDS` 300 → 3600, `EMBED_CACHE_TTL_SECONDS` 1800 → 3600. `/cache/stats` and `/cache/clear` now cover all four cache layers.
 - 2026-05-11: Added model-independent governance rulebook injection (`nl2sql_service/rulebook.py`), advisory post-validation SQL review, public governance inspection/validation endpoints, and telemetry visibility for `REVIEW_FAILED`.
 - 2026-05-09: Added in-memory retrieval/SQL caches, public cache ops endpoints, structured `/ask` answer prompting with `ANSWER_HALLUCINATION` warnings, short-query rewrite skipping, and the `ModelClient` abstraction for Ollama calls.
 - 2026-05-06: Added public browser documentation routes (`/help`, `/help/{module}`, `/help/{module}/{route_slug}`) backed by FastAPI OpenAPI metadata plus curated route docs.

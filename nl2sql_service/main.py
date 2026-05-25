@@ -27,7 +27,7 @@ from nl2sql_service import (
     retrieve,
     schema_loader,
 )
-from nl2sql_service.column_loader import load_columns_for_tables
+from nl2sql_service.cache import ask_cache
 from nl2sql_service.config import settings
 from nl2sql_service.embed import (
     EmbeddingClientError,
@@ -123,6 +123,31 @@ def _derive_error_source(warnings: list[SqlWarning]) -> str | None:
     return "unknown"
 
 
+def _ask_success_from_cache(payload: dict) -> AskSuccess:
+    """Reconstruct an AskSuccess from a cached serialised payload."""
+    SKIP = {"cache_hit", "ask_cache_hit", "semantic_cache_hit", "_top_k", "status"}
+    warnings_raw = payload.get("warnings") or []
+    warnings = [
+        SqlWarning(code=WarningCode(w["code"]), message=w.get("message", ""))
+        for w in warnings_raw
+        if isinstance(w, dict) and "code" in w
+    ]
+    react_trace_raw = payload.get("react_trace")
+    from nl2sql_service.models import ReactTrace
+    react_trace = ReactTrace(**react_trace_raw) if isinstance(react_trace_raw, dict) else react_trace_raw
+    return AskSuccess(
+        answer=payload.get("answer", ""),
+        sql=payload.get("sql"),
+        warnings=warnings,
+        row_count=payload.get("row_count", 0),
+        columns=payload.get("columns") or [],
+        tables_used=payload.get("tables_used") or [],
+        matched_groups=payload.get("matched_groups") or [],
+        attempt_count=payload.get("attempt_count", 0),
+        react_trace=react_trace,
+    )
+
+
 async def _log_request_event(pool: asyncpg.Pool, **kwargs: object) -> None:
     try:
         warning_codes = [str(code) for code in kwargs.get("warning_codes", []) or []]
@@ -212,7 +237,14 @@ async def cache_clear_endpoint() -> dict[str, int]:
     embed_cleared = cache.embed_cache.size()
     cache.embed_cache.clear()
     sql_cleared = cache.sql_cache.invalidate_all()
-    return {"embed_cleared": embed_cleared, "sql_cleared": sql_cleared}
+    sem_sql_cleared = cache.semantic_sql_cache.invalidate_all()
+    ask_cleared = ask_cache.invalidate_all()
+    return {
+        "embed_cleared": embed_cleared,
+        "sql_cleared": sql_cleared,
+        "semantic_sql_cleared": sem_sql_cleared,
+        "ask_cleared": ask_cleared,
+    }
 
 
 @app.get("/governance/rules", tags=["ops"])
@@ -937,6 +969,34 @@ async def ask_endpoint(
     request_id = _resolve_request_id(request.request_id)
     set_request_id(request_id)
     started = time.monotonic()
+
+    # --- Ask cache: exact match -------------------------------------------------
+    if settings.ask_cache_enabled:
+        cached_ask = ask_cache.get_exact(request.query, top_k)
+        if cached_ask:
+            cached_ask.pop("_top_k", None)
+            cached_ask["cache_hit"] = True
+            cached_ask["ask_cache_hit"] = True
+            return _ask_success_from_cache(cached_ask)
+
+    # --- Ask cache: semantic match -----------------------------------------------
+    if settings.ask_cache_enabled:
+        try:
+            q_vec = cache.embed_cache.get(request.query)
+            if q_vec is None:
+                vecs = await embed.embed_texts([request.query])
+                q_vec = vecs[0]
+                cache.embed_cache.set(request.query, q_vec)
+            sem_ask = ask_cache.get_semantic(q_vec, top_k, threshold=settings.ask_cache_semantic_threshold)
+            if sem_ask:
+                sem_ask.pop("_top_k", None)
+                sem_ask["cache_hit"] = True
+                sem_ask["ask_cache_hit"] = True
+                sem_ask["semantic_cache_hit"] = True
+                return _ask_success_from_cache(sem_ask)
+        except Exception:
+            pass  # semantic lookup is best-effort
+
     try:
         return await asyncio.wait_for(
             _run_ask_workflow(
@@ -1192,6 +1252,11 @@ async def _run_ask_workflow(
             },
         )
     )
+    if settings.ask_cache_enabled and response.row_count > 0:
+        payload = response.model_dump(mode="json")
+        payload["cache_hit"] = False
+        q_vec = cache.embed_cache.get(request.query)
+        ask_cache.set(request.query, top_k, payload, embedding=q_vec)
     return response
 
 
