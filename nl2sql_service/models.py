@@ -166,6 +166,14 @@ class SqlWarning(BaseModel):
     message: str
 
 
+class CacheSource(str, Enum):
+    NONE = "none"
+    MEMORY_EXACT = "memory_exact"
+    MEMORY_SEMANTIC = "memory_semantic"
+    DB_EXACT = "db_exact"
+    DB_SEMANTIC = "db_semantic"
+
+
 class ReActAction(str, Enum):
     RETRIEVE_MORE_CONTEXT = "RETRIEVE_MORE_CONTEXT"
     FETCH_SCHEMA = "FETCH_SCHEMA"
@@ -197,6 +205,7 @@ class GenerateSqlSuccess(BaseModel):
     matched_groups: list[str]
     attempt_count: int
     cache_hit: bool = False
+    cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
 
 
@@ -206,6 +215,7 @@ class GenerateSqlRejected(BaseModel):
     warnings: list[SqlWarning]
     attempt_count: int
     cache_hit: bool = False
+    cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
 
 
@@ -216,6 +226,7 @@ class GenerateSqlClarification(BaseModel):
     original_query: str
     failure_reason: str
     cache_hit: bool = False
+    cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
 
 
@@ -241,6 +252,8 @@ class AskSuccess(BaseModel):
     tables_used: list[str]
     matched_groups: list[str]
     attempt_count: int
+    cache_hit: bool = False
+    cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
 
 
@@ -250,6 +263,8 @@ class AskRejected(BaseModel):
     sql: str | None = None
     warnings: list[SqlWarning]
     attempt_count: int
+    cache_hit: bool = False
+    cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
 
 
@@ -326,6 +341,7 @@ class ConfirmRequest(BaseModel):
 class IngestResponse(BaseModel):
     inserted: int
     updated: int = 0
+    skipped: int = 0
     source: str
 
 
@@ -333,6 +349,10 @@ class IngestGroupsResponse(IngestResponse):
     enrichment_summary: EnrichmentSummary | None = None
     failed_groups: list[GroupIngestFailure] = Field(default_factory=list)
     failure_count: int = 0
+
+
+class EmbeddedIngestResponse(IngestResponse):
+    embedded: int = 0
 
 
 # ---------------------------------------------------------------------------

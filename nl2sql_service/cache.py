@@ -269,3 +269,17 @@ def cache_stats() -> dict[str, int]:
         "sql_cache_ttl_seconds": SQL_CACHE_TTL,
         "ask_cache_ttl_seconds": ASK_CACHE_TTL,
     }
+
+
+def clear_memory_caches() -> dict[str, int]:
+    embed_cleared = embed_cache.size()
+    sql_cleared = sql_cache.invalidate_all()
+    semantic_sql_cleared = semantic_sql_cache.invalidate_all()
+    ask_cleared = ask_cache.invalidate_all()
+    embed_cache.clear()
+    return {
+        "embed_cleared": embed_cleared,
+        "sql_cleared": sql_cleared,
+        "semantic_sql_cleared": semantic_sql_cleared,
+        "ask_cleared": ask_cleared,
+    }

@@ -11,12 +11,14 @@ from sqlparse import tokens as T
 from sqlparse.sql import Comment, Identifier, IdentifierList, Parenthesis, Statement, Token, TokenList
 
 from nl2sql_service import query_rewriter, retrieve
+from nl2sql_service import db
 from nl2sql_service.cache import sql_cache
 from nl2sql_service.cache import semantic_sql_cache
 from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.config import Settings, settings as default_settings
 from nl2sql_service.model_client import get_model_client
 from nl2sql_service.models import (
+    CacheSource,
     GenerateSqlClarification,
     GenerateSqlRejected,
     GenerateSqlResponse,
@@ -238,6 +240,31 @@ def _select_payment_columns(query: str, columns: list[str], max_columns: int = 8
 
 def _has_blocking_warnings(warnings: list[SqlWarning]) -> bool:
     return any(warning.code != WarningCode.MYSQL_EXPLAIN_UNAVAILABLE for warning in warnings)
+
+
+def _with_cache_metadata(payload: dict[str, Any], source: CacheSource) -> dict[str, Any]:
+    updated = dict(payload)
+    updated["cache_hit"] = source != CacheSource.NONE
+    updated["cache_source"] = source.value
+    return updated
+
+
+async def _load_query_embedding(
+    query: str,
+) -> list[float] | None:
+    from nl2sql_service.cache import embed_cache
+    from nl2sql_service import embed as embed_module
+
+    q_vec = embed_cache.get(query)
+    if q_vec is not None:
+        return q_vec
+
+    vecs = await embed_module.embed_texts([query])
+    if not vecs:
+        return None
+    q_vec = vecs[0]
+    embed_cache.set(query, q_vec)
+    return q_vec
 
 
 def build_deterministic_sql(
@@ -1008,31 +1035,72 @@ async def generate_sql(
     from nl2sql_service.react_agent import run as react_run
 
     effective_top_k = top_k or settings.top_k
+    cache_epoch: int | None = None
+    query_embedding: list[float] | None = None
     if settings.sql_cache_enabled:
         cached = sql_cache.get(query, effective_top_k)
         if cached:
-            cached["cache_hit"] = True
-            return _generate_sql_response_from_dict(cached)
+            return _generate_sql_response_from_dict(
+                _with_cache_metadata(cached, CacheSource.MEMORY_EXACT)
+            )
 
     # Semantic SQL cache: embed the query and look for a near-duplicate hit.
     if settings.sql_cache_enabled:
         try:
-            from nl2sql_service.cache import embed_cache
-            from nl2sql_service import embed as _embed_mod
-            q_vec: list[float] | None = embed_cache.get(query)
-            if q_vec is None:
-                vecs = await _embed_mod.embed_texts([query])
-                q_vec = vecs[0]
-                embed_cache.set(query, q_vec)
+            query_embedding = await _load_query_embedding(query)
+            if query_embedding is None:
+                raise ValueError("query embedding unavailable")
             sem_cached = semantic_sql_cache.get_semantic(
-                q_vec, effective_top_k, threshold=settings.sql_cache_semantic_threshold
+                query_embedding,
+                effective_top_k,
+                threshold=settings.sql_cache_semantic_threshold,
             )
             if sem_cached:
-                sem_cached["cache_hit"] = True
-                sem_cached["semantic_cache_hit"] = True
-                return _generate_sql_response_from_dict(sem_cached)
+                return _generate_sql_response_from_dict(
+                    _with_cache_metadata(sem_cached, CacheSource.MEMORY_SEMANTIC)
+                )
         except Exception:
             pass  # semantic lookup is best-effort; never block on failure
+
+    if settings.sql_cache_enabled:
+        cache_epoch = await db.get_query_cache_epoch(pool)
+        db_exact = await db.get_query_cache_exact(
+            pool,
+            endpoint="generate-sql",
+            query_text=query,
+            top_k=effective_top_k,
+            cache_epoch=cache_epoch,
+        )
+        if db_exact:
+            warmed = _with_cache_metadata(db_exact, CacheSource.DB_EXACT)
+            sql_cache.set(query, effective_top_k, db_exact)
+            if query_embedding is not None:
+                semantic_sql_cache.set(query, effective_top_k, db_exact, embedding=query_embedding)
+            return _generate_sql_response_from_dict(warmed)
+
+        if query_embedding is not None:
+            try:
+                db_semantic = await db.get_query_cache_semantic(
+                    pool,
+                    endpoint="generate-sql",
+                    query_embedding=query_embedding,
+                    top_k=effective_top_k,
+                    cache_epoch=cache_epoch,
+                    min_similarity=settings.sql_cache_semantic_threshold,
+                )
+                if db_semantic:
+                    sql_cache.set(query, effective_top_k, db_semantic)
+                    semantic_sql_cache.set(
+                        query,
+                        effective_top_k,
+                        db_semantic,
+                        embedding=query_embedding,
+                    )
+                    return _generate_sql_response_from_dict(
+                        _with_cache_metadata(db_semantic, CacheSource.DB_SEMANTIC)
+                    )
+            except Exception:
+                pass
 
     deterministic_result = await _try_deterministic_generation(
         query=query,
@@ -1043,18 +1111,27 @@ async def generate_sql(
         if settings.sql_cache_enabled and deterministic_result.status == "ok":
             payload = deterministic_result.model_dump(mode="json")
             payload["cache_hit"] = False
+            payload["cache_source"] = CacheSource.NONE.value
             sql_cache.set(query, effective_top_k, payload)
             try:
-                from nl2sql_service.cache import embed_cache
-                from nl2sql_service import embed as _embed_mod
-                q_vec = embed_cache.get(query)
-                if q_vec is None:
-                    vecs = await _embed_mod.embed_texts([query])
-                    q_vec = vecs[0]
-                    embed_cache.set(query, q_vec)
-                semantic_sql_cache.set(query, effective_top_k, payload, embedding=q_vec)
+                if query_embedding is None:
+                    query_embedding = await _load_query_embedding(query)
+                if query_embedding is not None:
+                    semantic_sql_cache.set(query, effective_top_k, payload, embedding=query_embedding)
             except Exception:
                 pass
+            try:
+                await db.upsert_query_cache_entry(
+                    pool,
+                    endpoint="generate-sql",
+                    query_text=query,
+                    top_k=effective_top_k,
+                    response_json=payload,
+                    query_embedding=query_embedding,
+                    cache_epoch=cache_epoch or await db.get_query_cache_epoch(pool),
+                )
+            except Exception:
+                logger.exception("Failed to persist generate-sql cache entry")
         return deterministic_result
 
     try:
@@ -1092,18 +1169,27 @@ async def generate_sql(
     if settings.sql_cache_enabled and result.status == "ok":
         payload = result.model_dump(mode="json")
         payload["cache_hit"] = False
+        payload["cache_source"] = CacheSource.NONE.value
         sql_cache.set(query, effective_top_k, payload)
         try:
-            from nl2sql_service.cache import embed_cache
-            from nl2sql_service import embed as _embed_mod
-            q_vec = embed_cache.get(query)
-            if q_vec is None:
-                vecs = await _embed_mod.embed_texts([query])
-                q_vec = vecs[0]
-                embed_cache.set(query, q_vec)
-            semantic_sql_cache.set(query, effective_top_k, payload, embedding=q_vec)
+            if query_embedding is None:
+                query_embedding = await _load_query_embedding(query)
+            if query_embedding is not None:
+                semantic_sql_cache.set(query, effective_top_k, payload, embedding=query_embedding)
         except Exception:
             pass
+        try:
+            await db.upsert_query_cache_entry(
+                pool,
+                endpoint="generate-sql",
+                query_text=query,
+                top_k=effective_top_k,
+                response_json=payload,
+                query_embedding=query_embedding,
+                cache_epoch=cache_epoch or await db.get_query_cache_epoch(pool),
+            )
+        except Exception:
+            logger.exception("Failed to persist generate-sql cache entry")
     return result
 
 

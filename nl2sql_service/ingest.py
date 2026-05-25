@@ -72,9 +72,9 @@ async def ensure_hnsw_index(pool: asyncpg.Pool) -> None:
 async def _filter_chunks_needing_upsert(
     chunks: list[dict],
     pool: asyncpg.Pool,
-) -> list[dict]:
+) -> tuple[list[dict], int]:
     if not chunks:
-        return []
+        return [], 0
 
     incoming = json.dumps(
         [
@@ -102,7 +102,7 @@ async def _filter_chunks_needing_upsert(
             skipped_count,
         )
 
-    return pending_chunks
+    return pending_chunks, skipped_count
 
 
 async def ingest_text(text: str, source: str, pool: asyncpg.Pool) -> int:
@@ -209,11 +209,12 @@ async def ingest_schema_groups(
         )
         chunks.append(chunk)
 
-    chunks = await _filter_chunks_needing_upsert(chunks, pool)
+    chunks, skipped_count = await _filter_chunks_needing_upsert(chunks, pool)
     if not chunks:
         return {
             "inserted_count": 0,
             "updated_count": 0,
+            "skipped_count": skipped_count,
             "failed_groups": failed_groups,
             "enrichment_summary": {
                 "groups_with_columns": groups_with_columns,
@@ -256,6 +257,7 @@ async def ingest_schema_groups(
     return {
         "inserted_count": inserted_count,
         "updated_count": updated_count,
+        "skipped_count": skipped_count,
         "failed_groups": failed_groups,
         "enrichment_summary": {
             "groups_with_columns": groups_with_columns,
@@ -270,9 +272,9 @@ async def _upsert_versioned_chunks(
     chunks: list[dict],
     pool: asyncpg.Pool,
 ) -> dict[str, int]:
-    chunks = await _filter_chunks_needing_upsert(chunks, pool)
+    chunks, skipped_count = await _filter_chunks_needing_upsert(chunks, pool)
     if not chunks:
-        return {"inserted_count": 0, "updated_count": 0}
+        return {"inserted_count": 0, "updated_count": 0, "skipped_count": skipped_count}
 
     embeddings = await embed.embed_texts([c["text"] for c in chunks])
 
@@ -304,7 +306,11 @@ async def _upsert_versioned_chunks(
                 elif bool(row["updated"]):
                     updated_count += 1
 
-    return {"inserted_count": inserted_count, "updated_count": updated_count}
+    return {
+        "inserted_count": inserted_count,
+        "updated_count": updated_count,
+        "skipped_count": skipped_count,
+    }
 
 
 async def ingest_enriched_knowledge(
@@ -372,6 +378,6 @@ async def ingest_enriched_knowledge(
         log.info("Prepared %d schema-rule chunks", len(rule_chunks))
 
     if not chunks:
-        return {"inserted_count": 0, "updated_count": 0}
+        return {"inserted_count": 0, "updated_count": 0, "skipped_count": 0}
 
     return await _upsert_versioned_chunks(chunks, pool)

@@ -156,6 +156,41 @@ CREATE INDEX IF NOT EXISTS nl2sql_benchmark_cases_created_idx
 
 CREATE INDEX IF NOT EXISTS nl2sql_benchmark_cases_active_idx
     ON nl2sql_benchmark_cases (is_active, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS nl2sql_cache_state (
+    cache_key         TEXT PRIMARY KEY,
+    cache_epoch       BIGINT NOT NULL DEFAULT 1,
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO nl2sql_cache_state (cache_key, cache_epoch)
+VALUES ('query_logic', 1)
+ON CONFLICT (cache_key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS nl2sql_query_cache (
+    id                BIGSERIAL PRIMARY KEY,
+    endpoint          TEXT NOT NULL,
+    normalized_query  TEXT NOT NULL,
+    top_k             INTEGER NOT NULL,
+    response_json     JSONB NOT NULL,
+    query_embedding   vector({settings.embedding_dimension}),
+    cache_epoch       BIGINT NOT NULL,
+    hit_count         INTEGER NOT NULL DEFAULT 0,
+    last_hit_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (endpoint, normalized_query, top_k, cache_epoch)
+);
+
+CREATE INDEX IF NOT EXISTS nl2sql_query_cache_lookup_idx
+    ON nl2sql_query_cache (endpoint, cache_epoch, top_k, normalized_query);
+
+CREATE INDEX IF NOT EXISTS nl2sql_query_cache_recent_idx
+    ON nl2sql_query_cache (endpoint, cache_epoch, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS nl2sql_query_cache_embedding_hnsw_idx
+    ON nl2sql_query_cache
+    USING hnsw (query_embedding vector_cosine_ops);
 """
 
 
@@ -521,3 +556,191 @@ async def list_benchmark_cases(
             )
 
     return [dict(row) for row in rows]
+
+
+def normalize_query_text(query: str) -> str:
+    return " ".join(query.strip().lower().split())
+
+
+async def get_query_cache_epoch(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT cache_epoch
+            FROM nl2sql_cache_state
+            WHERE cache_key = 'query_logic'
+            """
+        )
+    return int(row["cache_epoch"] if row else 1)
+
+
+async def bump_query_cache_epoch(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO nl2sql_cache_state (cache_key, cache_epoch)
+                VALUES ('query_logic', 1)
+                ON CONFLICT (cache_key) DO NOTHING
+                """
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE nl2sql_cache_state
+                SET cache_epoch = cache_epoch + 1,
+                    updated_at = NOW()
+                WHERE cache_key = 'query_logic'
+                RETURNING cache_epoch
+                """
+            )
+    return int(row["cache_epoch"] if row else 1)
+
+
+async def upsert_query_cache_entry(
+    pool: asyncpg.Pool,
+    *,
+    endpoint: str,
+    query_text: str,
+    top_k: int,
+    response_json: dict,
+    query_embedding: list[float] | None,
+    cache_epoch: int,
+) -> None:
+    normalized_query = normalize_query_text(query_text)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO nl2sql_query_cache (
+                endpoint,
+                normalized_query,
+                top_k,
+                response_json,
+                query_embedding,
+                cache_epoch,
+                hit_count,
+                last_hit_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, 0, NOW(), NOW())
+            ON CONFLICT (endpoint, normalized_query, top_k, cache_epoch)
+            DO UPDATE SET
+                response_json = EXCLUDED.response_json,
+                query_embedding = EXCLUDED.query_embedding,
+                updated_at = NOW()
+            """,
+            endpoint,
+            normalized_query,
+            top_k,
+            json.dumps(response_json),
+            query_embedding,
+            cache_epoch,
+        )
+
+
+async def get_query_cache_exact(
+    pool: asyncpg.Pool,
+    *,
+    endpoint: str,
+    query_text: str,
+    top_k: int,
+    cache_epoch: int,
+) -> dict | None:
+    normalized_query = normalize_query_text(query_text)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, response_json
+            FROM nl2sql_query_cache
+            WHERE endpoint = $1
+              AND normalized_query = $2
+              AND top_k = $3
+              AND cache_epoch = $4
+            """,
+            endpoint,
+            normalized_query,
+            top_k,
+            cache_epoch,
+        )
+        if row is None:
+            return None
+        await conn.execute(
+            """
+            UPDATE nl2sql_query_cache
+            SET hit_count = hit_count + 1,
+                last_hit_at = NOW()
+            WHERE id = $1
+            """,
+            row["id"],
+        )
+    return dict(row["response_json"] or {})
+
+
+async def get_query_cache_semantic(
+    pool: asyncpg.Pool,
+    *,
+    endpoint: str,
+    query_embedding: list[float],
+    top_k: int,
+    cache_epoch: int,
+    min_similarity: float,
+) -> dict | None:
+    max_distance = max(0.0, 1.0 - min_similarity)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                response_json,
+                1 - (query_embedding <=> $5) AS similarity
+            FROM nl2sql_query_cache
+            WHERE endpoint = $1
+              AND top_k = $2
+              AND cache_epoch = $3
+              AND query_embedding IS NOT NULL
+              AND (query_embedding <=> $5) <= $4
+            ORDER BY query_embedding <=> $5 ASC, updated_at DESC
+            LIMIT 1
+            """,
+            endpoint,
+            top_k,
+            cache_epoch,
+            max_distance,
+            query_embedding,
+        )
+        if row is None:
+            return None
+        await conn.execute(
+            """
+            UPDATE nl2sql_query_cache
+            SET hit_count = hit_count + 1,
+                last_hit_at = NOW()
+            WHERE id = $1
+            """,
+            row["id"],
+        )
+    return dict(row["response_json"] or {})
+
+
+async def get_query_cache_stats(pool: asyncpg.Pool) -> dict[str, int]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*)::bigint AS db_query_cache_size,
+                COALESCE(MAX(cache_epoch), 1)::bigint AS cache_epoch
+            FROM nl2sql_query_cache
+            """
+        )
+    return {
+        "db_query_cache_size": int(row["db_query_cache_size"] if row else 0),
+        "cache_epoch": int(row["cache_epoch"] if row else 1),
+    }
+
+
+async def clear_query_cache(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM nl2sql_query_cache")
+    try:
+        return int(result.split()[-1])
+    except (AttributeError, IndexError, ValueError):
+        return 0

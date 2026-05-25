@@ -46,7 +46,9 @@ from nl2sql_service.models import (
     AskSuccess,
     BenchmarkCaseCreateRequest,
     BenchmarkCaseCreateResponse,
+    CacheSource,
     ConfirmRequest,
+    EmbeddedIngestResponse,
     GenerateSqlRequest,
     GenerateSqlResponse,
     GroupEmbeddingStatusResponse,
@@ -144,8 +146,37 @@ def _ask_success_from_cache(payload: dict) -> AskSuccess:
         tables_used=payload.get("tables_used") or [],
         matched_groups=payload.get("matched_groups") or [],
         attempt_count=payload.get("attempt_count", 0),
+        cache_hit=bool(payload.get("cache_hit", False)),
+        cache_source=CacheSource(str(payload.get("cache_source", CacheSource.NONE.value))),
         react_trace=react_trace,
     )
+
+
+async def _load_query_embedding(query: str) -> list[float] | None:
+    query_vector = cache.embed_cache.get(query)
+    if query_vector is not None:
+        return query_vector
+
+    vectors = await embed.embed_texts([query])
+    if not vectors:
+        return None
+    query_vector = vectors[0]
+    cache.embed_cache.set(query, query_vector)
+    return query_vector
+
+
+async def _invalidate_query_caches(pool: asyncpg.Pool) -> int:
+    cache.clear_memory_caches()
+    return await db.bump_query_cache_epoch(pool)
+
+
+def _teach_mutates_cache(response: TeachResponse) -> bool:
+    return response.learning_status in {
+        LearningStatus.SAVED_NEW,
+        LearningStatus.SIMILAR_FOUND,
+        LearningStatus.CONFIRMED,
+        LearningStatus.UPDATED_EXISTING,
+    }
 
 
 async def _log_request_event(pool: asyncpg.Pool, **kwargs: object) -> None:
@@ -228,23 +259,27 @@ app = FastAPI(
 
 
 @app.get("/cache/stats", tags=["ops"])
-async def cache_stats_endpoint() -> dict[str, int]:
-    return cache.cache_stats()
+async def cache_stats_endpoint(request: Request) -> dict[str, int]:
+    stats = cache.cache_stats()
+    pool = request.app.state.pool
+    if pool is not None:
+        try:
+            stats.update(await db.get_query_cache_stats(pool))
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to load DB query cache stats")
+    return stats
 
 
 @app.post("/cache/clear", tags=["ops"])
-async def cache_clear_endpoint() -> dict[str, int]:
-    embed_cleared = cache.embed_cache.size()
-    cache.embed_cache.clear()
-    sql_cleared = cache.sql_cache.invalidate_all()
-    sem_sql_cleared = cache.semantic_sql_cache.invalidate_all()
-    ask_cleared = ask_cache.invalidate_all()
-    return {
-        "embed_cleared": embed_cleared,
-        "sql_cleared": sql_cleared,
-        "semantic_sql_cleared": sem_sql_cleared,
-        "ask_cleared": ask_cleared,
-    }
+async def cache_clear_endpoint(request: Request) -> dict[str, int]:
+    cleared = cache.clear_memory_caches()
+    pool = request.app.state.pool
+    if pool is not None:
+        try:
+            cleared["db_query_cache_cleared"] = await db.clear_query_cache(pool)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to clear DB query cache")
+    return cleared
 
 
 @app.get("/governance/rules", tags=["ops"])
@@ -610,9 +645,12 @@ async def ingest_groups_endpoint(
     else:
         counts = await ingest.ingest_schema_groups(body.group_names, pool)
         source = ", ".join(body.group_names)
+    if counts["inserted_count"] + counts["updated_count"] > 0:
+        await _invalidate_query_caches(pool)
     return IngestGroupsResponse(
         inserted=counts["inserted_count"],
         updated=counts["updated_count"],
+        skipped=counts.get("skipped_count", 0),
         source=source,
         enrichment_summary=counts.get("enrichment_summary"),
         failed_groups=counts.get("failed_groups", []),
@@ -641,15 +679,18 @@ async def ingest_knowledge_endpoint(
         view_registry_limit=body.view_registry_limit,
         pool=pool,
     )
+    if counts["inserted_count"] + counts["updated_count"] > 0:
+        await _invalidate_query_caches(pool)
     return IngestResponse(
         inserted=counts["inserted_count"],
         updated=counts["updated_count"],
+        skipped=counts.get("skipped_count", 0),
         source="knowledge",
     )
 
 
-@app.post("/ingest/patterns", tags=["ingestion"])
-async def ingest_patterns_endpoint(request: Request) -> dict[str, int | str]:
+@app.post("/ingest/patterns", response_model=EmbeddedIngestResponse, tags=["ingestion"])
+async def ingest_patterns_endpoint(request: Request) -> EmbeddedIngestResponse:
     pool = await _require_pool(request)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -704,14 +745,19 @@ async def ingest_patterns_endpoint(request: Request) -> dict[str, int | str]:
         )
 
     counts = await ingest._upsert_versioned_chunks(chunks, pool)
-    return {
-        "embedded": counts["inserted_count"] + counts["updated_count"],
-        "source": "learned_patterns",
-    }
+    if counts["inserted_count"] + counts["updated_count"] > 0:
+        await _invalidate_query_caches(pool)
+    return EmbeddedIngestResponse(
+        inserted=counts["inserted_count"],
+        updated=counts["updated_count"],
+        skipped=counts.get("skipped_count", 0),
+        embedded=counts["inserted_count"] + counts["updated_count"],
+        source="learned_patterns",
+    )
 
 
-@app.post("/ingest/instructions", tags=["ingestion"])
-async def ingest_instructions_endpoint(request: Request) -> dict[str, int | str]:
+@app.post("/ingest/instructions", response_model=EmbeddedIngestResponse, tags=["ingestion"])
+async def ingest_instructions_endpoint(request: Request) -> EmbeddedIngestResponse:
     pool = await _require_pool(request)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -755,10 +801,15 @@ async def ingest_instructions_endpoint(request: Request) -> dict[str, int | str]
         )
 
     counts = await ingest._upsert_versioned_chunks(chunks, pool)
-    return {
-        "embedded": counts["inserted_count"] + counts["updated_count"],
-        "source": "user_instructions",
-    }
+    if counts["inserted_count"] + counts["updated_count"] > 0:
+        await _invalidate_query_caches(pool)
+    return EmbeddedIngestResponse(
+        inserted=counts["inserted_count"],
+        updated=counts["updated_count"],
+        skipped=counts.get("skipped_count", 0),
+        embedded=counts["inserted_count"] + counts["updated_count"],
+        source="user_instructions",
+    )
 
 
 @app.post("/patterns/feedback", tags=["learning"])
@@ -805,7 +856,18 @@ async def teach_endpoint(
 ) -> TeachResponse:
     pool = await _require_pool(request)
     try:
-        return await process_teach_request(body, pool)
+        response = await process_teach_request(body, pool)
+        if _teach_mutates_cache(response):
+            await _invalidate_query_caches(pool)
+        return response
+    except HTTPException:
+        raise
+    except (
+        asyncpg.PostgresConnectionError,
+        asyncpg.CannotConnectNowError,
+        OSError,
+    ):
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Teach endpoint failed: %s", exc)
         return TeachResponse(
@@ -821,11 +883,22 @@ async def teach_confirm_endpoint(
 ) -> TeachResponse:
     pool = await _require_pool(request)
     try:
-        return await process_confirmation(
+        response = await process_confirmation(
             token=body.confirmation_token,
             action=body.action,
             pool=pool,
         )
+        if _teach_mutates_cache(response):
+            await _invalidate_query_caches(pool)
+        return response
+    except HTTPException:
+        raise
+    except (
+        asyncpg.PostgresConnectionError,
+        asyncpg.CannotConnectNowError,
+        OSError,
+    ):
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.warning("Teach confirmation endpoint failed: %s", exc)
         return TeachResponse(
@@ -969,6 +1042,8 @@ async def ask_endpoint(
     request_id = _resolve_request_id(request.request_id)
     set_request_id(request_id)
     started = time.monotonic()
+    cache_epoch: int | None = None
+    query_embedding: list[float] | None = None
 
     # --- Ask cache: exact match -------------------------------------------------
     if settings.ask_cache_enabled:
@@ -976,26 +1051,60 @@ async def ask_endpoint(
         if cached_ask:
             cached_ask.pop("_top_k", None)
             cached_ask["cache_hit"] = True
-            cached_ask["ask_cache_hit"] = True
+            cached_ask["cache_source"] = CacheSource.MEMORY_EXACT.value
             return _ask_success_from_cache(cached_ask)
 
     # --- Ask cache: semantic match -----------------------------------------------
     if settings.ask_cache_enabled:
         try:
-            q_vec = cache.embed_cache.get(request.query)
-            if q_vec is None:
-                vecs = await embed.embed_texts([request.query])
-                q_vec = vecs[0]
-                cache.embed_cache.set(request.query, q_vec)
-            sem_ask = ask_cache.get_semantic(q_vec, top_k, threshold=settings.ask_cache_semantic_threshold)
+            query_embedding = await _load_query_embedding(request.query)
+            if query_embedding is None:
+                raise ValueError("query embedding unavailable")
+            sem_ask = ask_cache.get_semantic(
+                query_embedding,
+                top_k,
+                threshold=settings.ask_cache_semantic_threshold,
+            )
             if sem_ask:
                 sem_ask.pop("_top_k", None)
                 sem_ask["cache_hit"] = True
-                sem_ask["ask_cache_hit"] = True
-                sem_ask["semantic_cache_hit"] = True
+                sem_ask["cache_source"] = CacheSource.MEMORY_SEMANTIC.value
                 return _ask_success_from_cache(sem_ask)
         except Exception:
             pass  # semantic lookup is best-effort
+
+    if settings.ask_cache_enabled:
+        cache_epoch = await db.get_query_cache_epoch(pool)
+        cached_ask = await db.get_query_cache_exact(
+            pool,
+            endpoint="ask",
+            query_text=request.query,
+            top_k=top_k,
+            cache_epoch=cache_epoch,
+        )
+        if cached_ask:
+            ask_cache.set(request.query, top_k, cached_ask, embedding=query_embedding)
+            cached_ask["cache_hit"] = True
+            cached_ask["cache_source"] = CacheSource.DB_EXACT.value
+            return _ask_success_from_cache(cached_ask)
+
+        if query_embedding is not None:
+            try:
+                sem_ask = await db.get_query_cache_semantic(
+                    pool,
+                    endpoint="ask",
+                    query_embedding=query_embedding,
+                    top_k=top_k,
+                    cache_epoch=cache_epoch,
+                    min_similarity=settings.ask_cache_semantic_threshold,
+                )
+                if sem_ask:
+                    ask_cache.set(request.query, top_k, sem_ask, embedding=query_embedding)
+                    sem_ask["cache_hit"] = True
+                    sem_ask["cache_source"] = CacheSource.DB_SEMANTIC.value
+                    return _ask_success_from_cache(sem_ask)
+            except Exception:
+                logger.exception("Failed semantic DB ask cache lookup")
 
     try:
         return await asyncio.wait_for(
@@ -1005,6 +1114,8 @@ async def ask_endpoint(
                 top_k=top_k,
                 request_id=request_id,
                 started=started,
+                cache_epoch=cache_epoch,
+                query_embedding=query_embedding,
             ),
             timeout=settings.ask_timeout,
         )
@@ -1048,6 +1159,8 @@ async def _run_ask_workflow(
     top_k: int,
     request_id: str,
     started: float,
+    cache_epoch: int | None = None,
+    query_embedding: list[float] | None = None,
 ) -> AskResponse:
     stage_latencies_ms: dict[str, int] = {}
 
@@ -1080,6 +1193,8 @@ async def _run_ask_workflow(
             sql=None,
             warnings=sql_result.warnings,
             attempt_count=sql_result.attempt_count,
+            cache_hit=False,
+            cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
         )
         asyncio.create_task(
@@ -1116,6 +1231,8 @@ async def _run_ask_workflow(
             sql=capped_sql,
             warnings=[*sql_result.warnings, *execution_warnings],
             attempt_count=sql_result.attempt_count,
+            cache_hit=False,
+            cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
         )
         asyncio.create_task(
@@ -1185,6 +1302,8 @@ async def _run_ask_workflow(
             sql=capped_sql,
             warnings=[*sql_result.warnings, *enriched_answer_warnings],
             attempt_count=sql_result.attempt_count,
+            cache_hit=False,
+            cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
         )
         asyncio.create_task(
@@ -1230,6 +1349,8 @@ async def _run_ask_workflow(
         tables_used=sql_result.tables_used,
         matched_groups=sql_result.matched_groups,
         attempt_count=sql_result.attempt_count,
+        cache_hit=False,
+        cache_source=CacheSource.NONE,
         react_trace=sql_result.react_trace,
     )
     asyncio.create_task(
@@ -1252,11 +1373,28 @@ async def _run_ask_workflow(
             },
         )
     )
-    if settings.ask_cache_enabled and response.row_count > 0:
+    if settings.ask_cache_enabled:
         payload = response.model_dump(mode="json")
         payload["cache_hit"] = False
-        q_vec = cache.embed_cache.get(request.query)
-        ask_cache.set(request.query, top_k, payload, embedding=q_vec)
+        payload["cache_source"] = CacheSource.NONE.value
+        if query_embedding is None:
+            try:
+                query_embedding = await _load_query_embedding(request.query)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to load ask cache embedding")
+        ask_cache.set(request.query, top_k, payload, embedding=query_embedding)
+        try:
+            await db.upsert_query_cache_entry(
+                pool,
+                endpoint="ask",
+                query_text=request.query,
+                top_k=top_k,
+                response_json=payload,
+                query_embedding=query_embedding,
+                cache_epoch=cache_epoch or await db.get_query_cache_epoch(pool),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to persist ask cache entry")
     return response
 
 
