@@ -28,6 +28,7 @@ Base URL examples assume `http://localhost:8080`.
 - `GET /health`
 - `GET /telemetry/recent`
 - `GET /telemetry/summary`
+- `GET /failures`
 - `GET /cache/stats`
 - `POST /cache/clear`
 - `GET /governance/rules`
@@ -77,6 +78,54 @@ Note:
 
 - persistent PostgreSQL query cache state is not cleared by TTL inspection here
 - current DB cache epoch can be inferred from the backing tables, not this route
+
+## GET /failures
+
+Returns the most recent entries from the `nl2sql_failure_log` table.
+
+Query parameters:
+
+- `limit` — integer, default `100`
+- `endpoint` — optional string filter (e.g. `/ask`)
+
+Each entry includes:
+
+- `id`, `request_id`, `endpoint`, `query_text`
+- `warning_codes` — JSONB array of warning code strings
+- `error_source` — derived from the first warning, nullable
+- `sql_preview` — SQL that caused the failure, nullable
+- `tables_attempted` — text array
+- `latency_ms`
+- `suggest_teach` — pre-built teach payload (see below)
+- `created_at`
+
+The `suggest_teach` field contains:
+
+```json
+{
+  "instruction_type": "term_mapping",
+  "content": "When the user asks '...', map ambiguous terms to correct table names.",
+  "tables_affected": [],
+  "source_query": "...",
+  "warning_codes": ["REQUEST_TIMEOUT"],
+  "sql_preview": ""
+}
+```
+
+This payload can be posted directly to `POST /teach` to teach the system
+how to handle the failed query.
+
+### Failure Log Population
+
+Entries are written automatically from the `/ask` endpoint on all rejection
+paths:
+
+- `asyncio.TimeoutError` (upstream timeout)
+- SQL generation `status == "rejected"`
+- Execution warnings (e.g. `TABLE_OUT_OF_SCOPE`)
+- Answer generation returning `None`
+
+The table is created automatically on service boot via the DDL bootstrap.
 
 ## POST /cache/clear
 

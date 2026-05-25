@@ -175,8 +175,8 @@ async def rewrite_search_query(
     original = " ".join(query.split())
     if not settings.query_rewrite_enabled or not original:
         return query
-    if len(original.split()) <= 3:
-        logger.info("Skipping rewrite for short query: '%s'", original)
+    if len(original.split()) <= 1:
+        logger.info("Skipping rewrite for single-word query: '%s'", original)
         return query
 
     try:

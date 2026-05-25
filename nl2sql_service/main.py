@@ -36,6 +36,7 @@ from nl2sql_service.embed import (
     EmbeddingUpstreamError,
 )
 from nl2sql_service.instruction_store import (
+    build_failure_teach_suggestion,
     process_confirmation,
     process_teach_request,
 )
@@ -189,6 +190,42 @@ async def _log_request_event(pool: asyncpg.Pool, **kwargs: object) -> None:
         await db.insert_request_event(pool, **kwargs)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to write request telemetry")
+
+
+async def _log_failure_event(
+    pool: asyncpg.Pool,
+    *,
+    request_id: str,
+    endpoint: str,
+    query_text: str,
+    warning_codes: list[str],
+    error_source: str | None,
+    sql_preview: str | None,
+    tables_attempted: list[str],
+    latency_ms: int,
+) -> None:
+    """Write to the dedicated failure log and attach a teach suggestion."""
+    try:
+        suggestion = build_failure_teach_suggestion(
+            query=query_text,
+            warning_codes=warning_codes,
+            tables_used=tables_attempted,
+            sql_preview=sql_preview,
+        )
+        await db.insert_failure_log(
+            pool,
+            request_id=request_id,
+            endpoint=endpoint,
+            query_text=query_text,
+            warning_codes=warning_codes,
+            error_source=error_source,
+            sql_preview=sql_preview,
+            tables_attempted=tables_attempted,
+            latency_ms=latency_ms,
+            suggest_teach=suggestion,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to write failure log entry")
 
 
 def _ensure_governance_enabled() -> None:
@@ -513,6 +550,17 @@ async def telemetry_summary_endpoint(
     summary["endpoint"] = endpoint
     summary["since_minutes"] = since_minutes
     return summary
+
+
+@app.get("/failures", tags=["ops"])
+async def list_failures_endpoint(
+    request: Request,
+    limit: int = 100,
+    endpoint: str | None = None,
+) -> list[dict[str, object]]:
+    """Return recent failed requests with pre-built teach suggestions for review."""
+    pool = await _require_pool(request)
+    return await db.list_failure_logs(pool, limit=limit, endpoint=endpoint)
 
 
 @app.post("/benchmark/cases", response_model=BenchmarkCaseCreateResponse, tags=["ops"])
@@ -1134,6 +1182,9 @@ async def ask_endpoint(
             attempt_count=0,
             react_trace=None,
         )
+        elapsed = _elapsed_ms(started)
+        warning_codes_list = [warning.code.value for warning in response.warnings]
+        error_src = _derive_error_source(response.warnings)
         asyncio.create_task(
             _log_request_event(
                 pool,
@@ -1143,11 +1194,24 @@ async def ask_endpoint(
                 top_k=top_k,
                 status=response.status,
                 attempt_count=response.attempt_count,
-                latency_ms=_elapsed_ms(started),
+                latency_ms=elapsed,
                 stage_latencies_ms={},
-                warning_codes=[warning.code.value for warning in response.warnings],
-                error_source=_derive_error_source(response.warnings),
+                warning_codes=warning_codes_list,
+                error_source=error_src,
                 metadata={"sql_present": False},
+            )
+        )
+        asyncio.create_task(
+            _log_failure_event(
+                pool,
+                request_id=request_id,
+                endpoint="/ask",
+                query_text=request.query,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                sql_preview=None,
+                tables_attempted=[],
+                latency_ms=elapsed,
             )
         )
         return response
@@ -1197,6 +1261,9 @@ async def _run_ask_workflow(
             cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
         )
+        elapsed = _elapsed_ms(started)
+        warning_codes_list = [warning.code.value for warning in response.warnings]
+        error_src = _derive_error_source(response.warnings)
         asyncio.create_task(
             _log_request_event(
                 pool,
@@ -1206,15 +1273,28 @@ async def _run_ask_workflow(
                 top_k=top_k,
                 status=response.status,
                 attempt_count=response.attempt_count,
-                latency_ms=_elapsed_ms(started),
+                latency_ms=elapsed,
                 stage_latencies_ms=stage_latencies_ms,
-                warning_codes=[warning.code.value for warning in response.warnings],
-                error_source=_derive_error_source(response.warnings),
+                warning_codes=warning_codes_list,
+                error_source=error_src,
                 metadata={
                     "sql_present": response.sql is not None,
                     "tables_used": [],
                     "matched_groups": [],
                 },
+            )
+        )
+        asyncio.create_task(
+            _log_failure_event(
+                pool,
+                request_id=request_id,
+                endpoint="/ask",
+                query_text=request.query,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                sql_preview=None,
+                tables_attempted=[],
+                latency_ms=elapsed,
             )
         )
         return response
@@ -1235,6 +1315,9 @@ async def _run_ask_workflow(
             cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
         )
+        elapsed = _elapsed_ms(started)
+        warning_codes_list = [warning.code.value for warning in response.warnings]
+        error_src = _derive_error_source(response.warnings)
         asyncio.create_task(
             _log_request_event(
                 pool,
@@ -1244,15 +1327,28 @@ async def _run_ask_workflow(
                 top_k=top_k,
                 status=response.status,
                 attempt_count=response.attempt_count,
-                latency_ms=_elapsed_ms(started),
+                latency_ms=elapsed,
                 stage_latencies_ms=stage_latencies_ms,
-                warning_codes=[warning.code.value for warning in response.warnings],
-                error_source=_derive_error_source(response.warnings),
+                warning_codes=warning_codes_list,
+                error_source=error_src,
                 metadata={
                     "sql_present": response.sql is not None,
                     "tables_used": sql_result.tables_used,
                     "matched_groups": sql_result.matched_groups,
                 },
+            )
+        )
+        asyncio.create_task(
+            _log_failure_event(
+                pool,
+                request_id=request_id,
+                endpoint="/ask",
+                query_text=request.query,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                sql_preview=capped_sql,
+                tables_attempted=sql_result.tables_used,
+                latency_ms=elapsed,
             )
         )
         return response
@@ -1306,6 +1402,9 @@ async def _run_ask_workflow(
             cache_source=CacheSource.NONE,
             react_trace=sql_result.react_trace,
         )
+        elapsed = _elapsed_ms(started)
+        warning_codes_list = [warning.code.value for warning in response.warnings]
+        error_src = _derive_error_source(response.warnings)
         asyncio.create_task(
             _log_request_event(
                 pool,
@@ -1315,16 +1414,29 @@ async def _run_ask_workflow(
                 top_k=top_k,
                 status=response.status,
                 attempt_count=response.attempt_count,
-                latency_ms=_elapsed_ms(started),
+                latency_ms=elapsed,
                 stage_latencies_ms=stage_latencies_ms,
-                warning_codes=[warning.code.value for warning in response.warnings],
-                error_source=_derive_error_source(response.warnings),
+                warning_codes=warning_codes_list,
+                error_source=error_src,
                 metadata={
                     "sql_present": response.sql is not None,
                     "row_count": len(rows),
                     "tables_used": sql_result.tables_used,
                     "matched_groups": sql_result.matched_groups,
                 },
+            )
+        )
+        asyncio.create_task(
+            _log_failure_event(
+                pool,
+                request_id=request_id,
+                endpoint="/ask",
+                query_text=request.query,
+                warning_codes=warning_codes_list,
+                error_source=error_src,
+                sql_preview=capped_sql,
+                tables_attempted=sql_result.tables_used,
+                latency_ms=elapsed,
             )
         )
         return response

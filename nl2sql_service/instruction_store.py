@@ -400,49 +400,140 @@ async def get_relevant_instructions(
     min_confidence: float = 0.5,
     limit: int = 5,
 ) -> list[dict]:
-    del query
+    # Build a content-match needle from significant words in the query so that
+    # instructions whose content mentions the same key terms are also returned
+    # even when the instruction has no table scope restriction.
+    needle = None
+    if query and query.strip():
+        words = [w.strip() for w in query.lower().split() if len(w.strip()) >= 4]
+        needle = f"%{words[0]}%" if words else None
     try:
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id,
-                    instruction_type,
-                    content,
-                    embedding_source,
-                    tables_affected,
-                    confidence_score,
-                    is_verified,
-                    is_active,
-                    conflict_group,
-                    source_query,
-                    use_count,
-                    success_count,
-                    failure_count,
-                    last_used_at,
-                    created_at,
-                    updated_at
-                FROM nl2sql_user_instructions
-                WHERE is_active = TRUE
-                  AND confidence_score >= $2
-                  AND (
-                    tables_affected && $1::text[]
-                    OR tables_affected = '{}'::text[]
-                  )
-                ORDER BY
-                    is_verified DESC,
-                    confidence_score DESC,
-                    use_count DESC
-                LIMIT $3
-                """,
-                tables_in_scope,
-                min_confidence,
-                limit,
-            )
+            if needle:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        id,
+                        instruction_type,
+                        content,
+                        embedding_source,
+                        tables_affected,
+                        confidence_score,
+                        is_verified,
+                        is_active,
+                        conflict_group,
+                        source_query,
+                        use_count,
+                        success_count,
+                        failure_count,
+                        last_used_at,
+                        created_at,
+                        updated_at
+                    FROM nl2sql_user_instructions
+                    WHERE is_active = TRUE
+                      AND confidence_score >= $2
+                      AND (
+                        tables_affected && $1::text[]
+                        OR tables_affected = '{}'::text[]
+                        OR content ILIKE $4
+                        OR embedding_source ILIKE $4
+                      )
+                    ORDER BY
+                        is_verified DESC,
+                        confidence_score DESC,
+                        use_count DESC
+                    LIMIT $3
+                    """,
+                    tables_in_scope,
+                    min_confidence,
+                    limit,
+                    needle,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        id,
+                        instruction_type,
+                        content,
+                        embedding_source,
+                        tables_affected,
+                        confidence_score,
+                        is_verified,
+                        is_active,
+                        conflict_group,
+                        source_query,
+                        use_count,
+                        success_count,
+                        failure_count,
+                        last_used_at,
+                        created_at,
+                        updated_at
+                    FROM nl2sql_user_instructions
+                    WHERE is_active = TRUE
+                      AND confidence_score >= $2
+                      AND (
+                        tables_affected && $1::text[]
+                        OR tables_affected = '{}'::text[]
+                      )
+                    ORDER BY
+                        is_verified DESC,
+                        confidence_score DESC,
+                        use_count DESC
+                    LIMIT $3
+                    """,
+                    tables_in_scope,
+                    min_confidence,
+                    limit,
+                )
         return [_instruction_row_to_dict(row) for row in rows]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to load relevant user instructions: %s", exc)
         return []
+
+
+def build_failure_teach_suggestion(
+    query: str,
+    warning_codes: list[str],
+    tables_used: list[str],
+    sql_preview: str | None = None,
+) -> dict:
+    """Return a pre-filled teach payload derived from a failed request.
+
+    The suggestion is returned to the caller (frontend) so the user can
+    review and submit it — nothing is persisted here.
+    """
+    is_timeout = "REQUEST_TIMEOUT" in warning_codes
+    is_table_scope = "TABLE_OUT_OF_SCOPE" in warning_codes
+    is_column_scope = "COLUMN_OUT_OF_SCOPE" in warning_codes
+
+    if is_timeout:
+        instruction_type = InstructionType.TERM_MAPPING.value
+        content = (
+            f"When the user asks '{query}', map any ambiguous business terms "
+            "to their correct database table names and relevant columns."
+        )
+    elif is_table_scope or is_column_scope:
+        instruction_type = InstructionType.CORRECTION.value
+        content = (
+            f"For the query '{query}', the SQL generator used tables or columns "
+            "outside the allowed scope. Ensure only in-scope tables are used."
+        )
+    else:
+        instruction_type = InstructionType.BUSINESS_RULE.value
+        content = (
+            f"Clarify how to handle: '{query}'. "
+            "Describe the expected table, filter, or business logic."
+        )
+
+    return {
+        "instruction_type": instruction_type,
+        "content": content,
+        "tables_affected": tables_used or [],
+        "source_query": query,
+        "warning_codes": warning_codes,
+        "sql_preview": sql_preview or "",
+    }
 
 
 async def get_rewrite_term_mapping_hints(

@@ -191,6 +191,26 @@ CREATE INDEX IF NOT EXISTS nl2sql_query_cache_recent_idx
 CREATE INDEX IF NOT EXISTS nl2sql_query_cache_embedding_hnsw_idx
     ON nl2sql_query_cache
     USING hnsw (query_embedding vector_cosine_ops);
+
+CREATE TABLE IF NOT EXISTS nl2sql_failure_log (
+    id                BIGSERIAL PRIMARY KEY,
+    request_id        TEXT NOT NULL,
+    endpoint          TEXT NOT NULL,
+    query_text        TEXT NOT NULL,
+    warning_codes     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    error_source      TEXT,
+    sql_preview       TEXT,
+    tables_attempted  TEXT[] NOT NULL DEFAULT '{{}}',
+    latency_ms        INTEGER NOT NULL DEFAULT 0,
+    suggest_teach     JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS nl2sql_failure_log_created_idx
+    ON nl2sql_failure_log (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS nl2sql_failure_log_endpoint_idx
+    ON nl2sql_failure_log (endpoint, created_at DESC);
 """
 
 
@@ -315,6 +335,107 @@ async def insert_request_event(
             error_source,
             json.dumps(metadata or {}),
         )
+
+
+async def insert_failure_log(
+    pool: asyncpg.Pool,
+    *,
+    request_id: str,
+    endpoint: str,
+    query_text: str,
+    warning_codes: list[str],
+    error_source: str | None,
+    sql_preview: str | None,
+    tables_attempted: list[str],
+    latency_ms: int,
+    suggest_teach: dict,
+) -> None:
+    """Persist a failed request into the dedicated failure log table."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO nl2sql_failure_log (
+                    request_id,
+                    endpoint,
+                    query_text,
+                    warning_codes,
+                    error_source,
+                    sql_preview,
+                    tables_attempted,
+                    latency_ms,
+                    suggest_teach
+                )
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::text[], $8, $9::jsonb)
+                """,
+                request_id,
+                endpoint,
+                query_text,
+                json.dumps(warning_codes),
+                error_source,
+                sql_preview or "",
+                tables_attempted,
+                latency_ms,
+                json.dumps(suggest_teach),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to write failure log entry: %s", exc)
+
+
+async def list_failure_logs(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 100,
+    endpoint: str | None = None,
+) -> list[dict]:
+    """Return recent failure log entries for operational review."""
+    safe_limit = max(1, min(limit, 500))
+    async with pool.acquire() as conn:
+        if endpoint:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    request_id,
+                    endpoint,
+                    query_text,
+                    warning_codes,
+                    error_source,
+                    sql_preview,
+                    tables_attempted,
+                    latency_ms,
+                    suggest_teach,
+                    created_at
+                FROM nl2sql_failure_log
+                WHERE endpoint = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                endpoint,
+                safe_limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    request_id,
+                    endpoint,
+                    query_text,
+                    warning_codes,
+                    error_source,
+                    sql_preview,
+                    tables_attempted,
+                    latency_ms,
+                    suggest_teach,
+                    created_at
+                FROM nl2sql_failure_log
+                ORDER BY created_at DESC
+                LIMIT $1
+                """,
+                safe_limit,
+            )
+    return [dict(row) for row in rows]
 
 
 async def list_recent_request_events(
