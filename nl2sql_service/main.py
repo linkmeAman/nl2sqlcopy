@@ -72,6 +72,7 @@ from nl2sql_service.models import (
     TeachResponse,
     WarningCode,
 )
+from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.rulebook import RULES, get_active_rules, get_config
 from nl2sql_service.sql_generator import generate_sql, review_sql
 from nl2sql_service.log_config import configure_logging, set_request_id

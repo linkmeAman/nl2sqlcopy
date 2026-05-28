@@ -470,6 +470,3 @@ def validate_loader() -> None:
         raise RuntimeError(f"Missing required path: {docs_path}")
     if not docs_path.is_dir():
         raise RuntimeError(f"Path is not a directory: {docs_path}")
-
-
-validate_loader()
