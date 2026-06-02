@@ -118,4 +118,9 @@ async def test_cache_ops_endpoints(client) -> None:
 
     clear_response = await client.post("/cache/clear")
     assert clear_response.status_code == 200
-    assert clear_response.json() == {"embed_cleared": 1, "sql_cleared": 1}
+    body = clear_response.json()
+    assert body["embed_cleared"] == 1
+    assert body["sql_cleared"] == 1
+    assert {"semantic_sql_cleared", "ask_cleared", "db_query_cache_cleared"}.issubset(
+        body.keys()
+    )

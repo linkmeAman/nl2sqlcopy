@@ -77,6 +77,24 @@ def _expect_key(body: Any, key: str) -> tuple[bool, str]:
     return True, "ok"
 
 
+def _lookup_path(body: Any, dotted_path: str) -> tuple[bool, Any]:
+    current = body
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False, None
+        current = current[part]
+    return True, current
+
+
+def _expect_path_value(body: Any, dotted_path: str, expected: str) -> tuple[bool, str]:
+    found, value = _lookup_path(body, dotted_path)
+    if not found:
+        return False, f"missing path '{dotted_path}'"
+    if str(value) != expected:
+        return False, f"expected {dotted_path}={expected!r}, got {value!r}"
+    return True, "ok"
+
+
 def _expect_ndjson_final(body: Any) -> tuple[bool, str]:
     if not isinstance(body, str):
         return False, "stream response was not text"
@@ -177,6 +195,11 @@ def main() -> None:
     parser.add_argument("--url", default="http://localhost:8080", help="Service base URL")
     parser.add_argument("--timeout", type=int, default=180, help="HTTP timeout in seconds")
     parser.add_argument("--output", help="Optional JSON or CSV output file")
+    parser.add_argument(
+        "--require-ready",
+        action="store_true",
+        help="Fail when readiness endpoints do not report status=ok.",
+    )
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
@@ -187,7 +210,9 @@ def main() -> None:
     delete_instruction_id: int | None = None
 
     checks: list[tuple[str, str, str, dict[str, Any] | None, set[int], str]] = [
-        ("health", "GET", "/health", None, {200}, "key:status"),
+        ("health", "GET", "/health", None, {200}, "path:status=ok" if args.require_ready else "key:status"),
+        ("health_config", "GET", "/health/config", None, {200}, "path:status=ok" if args.require_ready else "key:status"),
+        ("health_runtime", "GET", "/health/runtime", None, {200}, "path:status=ok" if args.require_ready else "key:status"),
         ("help_index", "GET", "/help", None, {200}, "text:NL2SQL Route Help"),
         ("help_generation", "GET", "/help/generation", None, {200}, "text:Generation Routes"),
         ("help_ask", "GET", "/help/generation/ask", None, {200}, "text:Ask Question"),
@@ -253,6 +278,10 @@ def main() -> None:
                 else:
                     key = validator.split(":", 1)[1]
                     passed, note = _expect_key(body, key)
+            elif validator.startswith("path:"):
+                path_spec = validator.split(":", 1)[1]
+                dotted_path, expected = path_spec.split("=", 1)
+                passed, note = _expect_path_value(body, dotted_path, expected)
             elif validator == "json:list":
                 passed = isinstance(body, list)
                 note = "ok" if passed else "response is not a JSON list"

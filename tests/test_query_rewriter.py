@@ -7,7 +7,7 @@ import pytest
 
 from nl2sql_service import query_rewriter, react_agent
 from nl2sql_service.config import settings
-from nl2sql_service.model_client import ModelResponse
+from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.models import GenerateSqlClarification
 
 
@@ -176,7 +176,7 @@ async def test_rewrite_timeout_falls_back_to_original(
     class _EmptyClient:
         async def generate(self, **kwargs):
             assert kwargs["response_format"] == "json"
-            return ModelResponse(text="")
+            return LLMResponse(text="")
 
     monkeypatch.setattr(settings, "query_rewrite_enabled", True)
     monkeypatch.setattr(

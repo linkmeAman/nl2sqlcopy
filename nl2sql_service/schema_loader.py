@@ -470,3 +470,45 @@ def validate_loader() -> None:
         raise RuntimeError(f"Missing required path: {docs_path}")
     if not docs_path.is_dir():
         raise RuntimeError(f"Path is not a directory: {docs_path}")
+
+
+def loader_readiness() -> dict[str, object]:
+    rag_schema_dir = _rag_schema_dir()
+    docs_dir = _docs_dir()
+    required_docs = [
+        docs_dir / "nl2sql-columns.jsonl",
+        docs_dir / "generated" / "nl2sql_schema_tables.jsonl",
+        docs_dir / "generated" / "nl2sql_schema_views.jsonl",
+        docs_dir / "mysql_schema_export.txt",
+    ]
+    issues: list[dict[str, str]] = []
+
+    try:
+        validate_loader()
+    except RuntimeError as exc:
+        issues.append({"code": "SCHEMA_LOADER_INVALID", "message": str(exc)})
+
+    missing_docs = [str(path) for path in required_docs if not path.exists()]
+    if missing_docs:
+        issues.append(
+            {
+                "code": "SCHEMA_DOCS_MISSING",
+                "message": "Missing required NL2SQL docs assets.",
+            }
+        )
+
+    entity_count = 0
+    relation_count = 0
+    if not issues:
+        entity_count = len(load_entities())
+        relation_count = len(load_relations())
+
+    return {
+        "status": "ok" if not issues else "error",
+        "rag_schema_dir": str(rag_schema_dir),
+        "docs_dir": str(docs_dir),
+        "entity_count": entity_count,
+        "relation_count": relation_count,
+        "missing_docs": missing_docs,
+        "issues": issues,
+    }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock
@@ -30,6 +31,14 @@ class _FakePool:
         return _Acquire(self.conn)
 
 
+class _Transaction:
+    async def __aenter__(self) -> "_Transaction":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
 class _GroupConn:
     async def fetch(self, sql: str, *args: Any) -> list[dict]:
         del sql, args
@@ -56,8 +65,16 @@ class _InstructionConn:
         self.instructions = instructions or []
         self.embedding_updates: list[str] = []
         self.next_id = max([item["id"] for item in self.instructions], default=0) + 1
+        self.cache_epoch = 1
+        self.pending_confirmations: dict[str, dict] = {}
+
+    def transaction(self) -> _Transaction:
+        return _Transaction()
 
     async def fetch(self, sql: str, *args: Any) -> list[dict]:
+        if "SELECT COUNT(*)::bigint AS pending_count" in sql:
+            return [{"pending_count": len(self.pending_confirmations)}]
+
         if "SELECT id, confidence_score, failure_count" in sql:
             tables = set(args[0])
             return [
@@ -96,6 +113,25 @@ class _InstructionConn:
         return []
 
     async def fetchrow(self, sql: str, *args: Any) -> dict | None:
+        if "DELETE FROM nl2sql_pending_teach_confirmations" in sql and "RETURNING instruction, conflicting_id, created_at" in sql:
+            token = args[0]
+            pending = self.pending_confirmations.get(token)
+            if pending and pending["expires_at"] > _now_like(pending["expires_at"]):
+                self.pending_confirmations.pop(token, None)
+                return {
+                    "instruction": pending["instruction"],
+                    "conflicting_id": pending["conflicting_id"],
+                    "created_at": pending["created_at"],
+                }
+            return None
+
+        if "SELECT COUNT(*)::bigint AS pending_count" in sql:
+            return {"pending_count": len(self.pending_confirmations)}
+
+        if "UPDATE nl2sql_cache_state" in sql:
+            self.cache_epoch += 1
+            return {"cache_epoch": self.cache_epoch}
+
         if "INSERT INTO nl2sql_user_instructions" not in sql:
             return None
 
@@ -124,6 +160,47 @@ class _InstructionConn:
         return {"id": instruction_id}
 
     async def execute(self, sql: str, *args: Any) -> str:
+        if "INSERT INTO nl2sql_pending_teach_confirmations" in sql:
+            token = args[0]
+            self.pending_confirmations[token] = {
+                "instruction": json.loads(args[1]),
+                "conflicting_id": args[2],
+                "expires_at": args[3],
+                "created_at": datetime(2026, 4, 29, 10, 0, 0, tzinfo=args[3].tzinfo),
+            }
+            return "INSERT 0 1"
+
+        if "DELETE FROM nl2sql_pending_teach_confirmations" in sql and "WHERE expires_at <= NOW()" in sql and "ORDER BY created_at ASC" not in sql:
+            removed = 0
+            for token, pending in list(self.pending_confirmations.items()):
+                if pending["expires_at"] <= _now_like(pending["expires_at"]):
+                    self.pending_confirmations.pop(token, None)
+                    removed += 1
+            return f"DELETE {removed}"
+
+        if "DELETE FROM nl2sql_pending_teach_confirmations" in sql and "ORDER BY created_at ASC" in sql:
+            limit = args[0]
+            ordered = sorted(
+                self.pending_confirmations.items(),
+                key=lambda item: item[1]["created_at"],
+            )
+            removed = 0
+            for token, _pending in ordered[:limit]:
+                self.pending_confirmations.pop(token, None)
+                removed += 1
+            return f"DELETE {removed}"
+
+        if "DELETE FROM nl2sql_pending_teach_confirmations" in sql and "AND expires_at <= NOW()" in sql:
+            token = args[0]
+            pending = self.pending_confirmations.get(token)
+            if pending and pending["expires_at"] <= _now_like(pending["expires_at"]):
+                self.pending_confirmations.pop(token, None)
+                return "DELETE 1"
+            return "DELETE 0"
+
+        if "INSERT INTO nl2sql_cache_state" in sql:
+            return "INSERT 0 1"
+
         if "failure_count = failure_count + 1" in sql:
             instruction_id = args[0]
             new_confidence = float(args[1])
@@ -154,6 +231,10 @@ class _InstructionConn:
             return "UPDATE 1"
 
         return "UPDATE 0"
+
+
+def _now_like(sample: datetime) -> datetime:
+    return datetime.now(tz=sample.tzinfo)
 
 
 def _instruction(
@@ -264,6 +345,38 @@ async def test_teach_confirm_replace(
         },
     )
     token = conflict_response.json()["confirmation_token"]
+
+    response = await client.post(
+        "/teach/confirm",
+        json={"confirmation_token": token, "action": "replace"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["learning_status"] == "confirmed"
+    assert "replaced" in body["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_teach_confirm_replace_survives_in_memory_clear(
+    app,
+    client,
+    mock_detect_conflict_found,
+) -> None:
+    del mock_detect_conflict_found
+    conn = _InstructionConn([_instruction(10)])
+    app.state.pool = _FakePool(conn)
+    conflict_response = await client.post(
+        "/teach",
+        json={
+            "instruction_type": "table_relationship",
+            "content": "employee.employee_id = contact.id",
+            "tables_affected": ["employee", "contact"],
+        },
+    )
+    token = conflict_response.json()["confirmation_token"]
+
+    instruction_store._pending_instructions.clear()
 
     response = await client.post(
         "/teach/confirm",

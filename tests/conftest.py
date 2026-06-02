@@ -19,6 +19,71 @@ from nl2sql_service.models import (
 )
 
 
+class _NoopTransaction:
+    async def __aenter__(self) -> "_NoopTransaction":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _NoopConn:
+    def __init__(self) -> None:
+        self.cache_epoch = 1
+
+    def transaction(self) -> _NoopTransaction:
+        return _NoopTransaction()
+
+    async def fetch(self, sql: str, *args):
+        del sql, args
+        return []
+
+    async def fetchrow(self, sql: str, *args):
+        del args
+        if "SELECT cache_epoch" in sql:
+            return {"cache_epoch": self.cache_epoch}
+        if "COUNT(*)::bigint AS db_query_cache_size" in sql:
+            return {"db_query_cache_size": 0, "cache_epoch": self.cache_epoch}
+        if "pending_active_count" in sql and "pending_expired_count" in sql:
+            return {
+                "pending_active_count": 0,
+                "pending_expired_count": 0,
+                "oldest_pending_created_at": None,
+                "next_pending_expiry_at": None,
+            }
+        if "UPDATE nl2sql_cache_state" in sql:
+            self.cache_epoch += 1
+            return {"cache_epoch": self.cache_epoch}
+        return None
+
+    async def execute(self, sql: str, *args) -> str:
+        del args
+        if "DELETE FROM nl2sql_query_cache" in sql:
+            return "DELETE 0"
+        if "INSERT INTO nl2sql_cache_state" in sql:
+            return "INSERT 0 1"
+        return "OK"
+
+
+class _NoopAcquire:
+    def __init__(self, conn: _NoopConn) -> None:
+        self.conn = conn
+
+    async def __aenter__(self) -> _NoopConn:
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _NoopPool:
+    def __init__(self) -> None:
+        self.conn = _NoopConn()
+
+    def acquire(self) -> _NoopAcquire:
+        return _NoopAcquire(self.conn)
+
+
 @pytest.fixture(autouse=True)
 def disable_query_rewrite_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "query_rewrite_enabled", False)
@@ -38,17 +103,19 @@ def disable_governance_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def clear_in_memory_caches() -> None:
-    from nl2sql_service.cache import embed_cache, sql_cache
+    from nl2sql_service.cache import ask_cache, embed_cache, semantic_sql_cache, sql_cache
 
     embed_cache.clear()
     sql_cache.invalidate_all()
+    semantic_sql_cache.invalidate_all()
+    ask_cache.invalidate_all()
 
 
 @pytest.fixture
 def app():
     from nl2sql_service.main import app as fastapi_app
 
-    fastapi_app.state.pool = object()
+    fastapi_app.state.pool = _NoopPool()
     settings.llm_max_retries = 2
     settings.react_max_iterations = 4
     settings.sql_generation_timeout = 90

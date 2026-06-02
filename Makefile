@@ -1,4 +1,4 @@
-.PHONY: setup run test ingest benchmark smoke smoke-report sync-schema
+.PHONY: setup run test ingest benchmark smoke smoke-report smoke-deploy sync-schema
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 setup:
@@ -28,6 +28,11 @@ benchmark:
 # ── Full-route smoke matrix ────────────────────────────────────────────────
 smoke:
 	./.venv/bin/python scripts/nl2sql_smoke_test.py --url http://localhost:8080
+
+smoke-deploy:
+	./.venv/bin/python scripts/nl2sql_smoke_test.py \
+		--url http://localhost:8080 \
+		--require-ready
 
 smoke-report:
 	mkdir -p reports

@@ -35,6 +35,14 @@ class _FakePool:
         return _Acquire(self.conn)
 
 
+class _Transaction:
+    async def __aenter__(self) -> "_Transaction":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
 class _GroupConn:
     async def fetch(self, sql: str, *args: Any) -> list[dict]:
         del sql, args
@@ -59,6 +67,10 @@ class _GroupConn:
 class _PatternConn:
     def __init__(self, patterns: list[dict]) -> None:
         self.patterns = patterns
+        self.cache_epoch = 1
+
+    def transaction(self) -> _Transaction:
+        return _Transaction()
 
     async def fetch(self, sql: str, *args: Any) -> list[dict]:
         if "tables_used &&" in sql:
@@ -83,6 +95,10 @@ class _PatternConn:
         ]
 
     async def fetchrow(self, sql: str, *args: Any) -> dict | None:
+        if "UPDATE nl2sql_cache_state" in sql:
+            self.cache_epoch += 1
+            return {"cache_epoch": self.cache_epoch}
+
         pattern_id = args[0]
         for pattern in self.patterns:
             if pattern["id"] != pattern_id:
@@ -93,6 +109,12 @@ class _PatternConn:
                 pattern["is_active"] = False
             return {"id": pattern_id}
         return None
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        del args
+        if "INSERT INTO nl2sql_cache_state" in sql:
+            return "INSERT 0 1"
+        return "OK"
 
 
 @pytest.fixture(autouse=True)

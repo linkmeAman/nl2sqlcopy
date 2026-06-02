@@ -25,7 +25,16 @@ Base URL examples assume `http://localhost:8080`.
 
 ### Ops
 
+- `GET /help`
+- `GET /help/{module}`
+- `GET /help/{module}/{route_slug}`
 - `GET /health`
+- `GET /health/config`
+- `GET /health/runtime`
+- `GET /health/llm`
+- `GET /health/vector`
+- `GET /metrics/llm`
+- `GET /metrics/teach`
 - `GET /telemetry/recent`
 - `GET /telemetry/summary`
 - `GET /failures`
@@ -38,6 +47,7 @@ Base URL examples assume `http://localhost:8080`.
 
 ### Retrieval and Ingest
 
+- `GET /ingest/groups/status`
 - `POST /ingest`
 - `POST /query`
 - `POST /ingest/groups`
@@ -50,6 +60,8 @@ Base URL examples assume `http://localhost:8080`.
 
 - `POST /teach`
 - `POST /teach/confirm`
+- `GET /teach/pending`
+- `POST /teach/pending/cleanup`
 - `GET /instructions`
 - `DELETE /instructions/{instruction_id}`
 - `POST /patterns/feedback`
@@ -59,6 +71,211 @@ Base URL examples assume `http://localhost:8080`.
 - `POST /generate-sql`
 - `POST /ask`
 - `POST /ask/stream`
+
+## GET /help
+
+Renders the in-app HTML help index.
+
+Related hidden routes:
+
+- `/help/{module}`
+- `/help/{module}/{route_slug}`
+
+These are operator-facing documentation pages and are intentionally excluded
+from the OpenAPI schema.
+
+## GET /health/llm
+
+Checks configured LLM connectivity for one workload role.
+
+Query parameters:
+
+- `role` - one of `sql`, `reasoning`, `query_rewrite`, `answer`, `default`
+
+Behavior:
+
+- resolves the same provider/model/fallback chain used by that workload
+- performs a short generation probe
+- returns provider, model, status, latency, and provider error details
+
+Example:
+
+```bash
+curl -s 'http://localhost:8080/health/llm?role=sql' | python -m json.tool
+```
+
+## GET /health
+
+Returns compact service and dependency readiness.
+
+Response fields include:
+
+- `status`
+- `db`
+- `provider_config.status`
+- `provider_config.issue_count`
+- `mysql_target.status`
+- `mysql_target.issue_count`
+- `schema_assets.status`
+- `schema_assets.issue_count`
+- `teach_confirmations.status`
+- `teach_confirmations.alerts`
+
+Status behavior:
+
+- escalates to `warning` when teach confirmation alerts fire
+- escalates to `error` when provider config, MySQL readiness, or schema assets are not ready
+
+## GET /health/config
+
+Returns the resolved provider configuration readiness report.
+
+Response fields include:
+
+- `status`
+- `issues`
+- `targets`
+
+## GET /config/model-routing
+
+Returns the active live routing snapshot for the current process.
+
+Response fields include:
+
+- `llm`
+- `sql`
+- `reasoning`
+- `query_rewrite`
+- `answer`
+- `embedding`
+- `startup_enforcement_mode`
+- `provider_readiness`
+
+## PATCH /config/model-routing
+
+Patches live task-to-model routing in the current process.
+
+Request body fields are optional and mirror the runtime routing settings.
+
+Behavior:
+
+- invalid provider combinations are rejected with HTTP `422`
+- successful updates apply immediately to the current process
+- changes are not persisted across process restarts
+
+## GET /health/runtime
+
+Returns detailed runtime readiness for SQL execution and local schema/docs assets.
+
+Response fields include:
+
+- `status`
+- `mysql_target`
+- `schema_assets`
+
+Operational note:
+
+- `STARTUP_ENFORCEMENT_MODE=strict` uses the same provider/runtime readiness
+  checks during startup and aborts boot when they are not ready
+- `make smoke-deploy` verifies `/health`, `/health/config`, and `/health/runtime`
+  all return `status=ok` before treating the service as deploy-ready
+
+## GET /health/vector
+
+Checks pgvector database connectivity and reports vector/embedding config.
+
+Response fields include:
+
+- `status`
+- `vector_db`
+- `db`
+- `embedding_provider`
+- `embedding_model`
+- `embedding_dimension`
+
+## GET /metrics/llm
+
+Returns in-memory provider usage counters captured by the LLM abstraction.
+
+Each result includes:
+
+- `role`
+- `provider`
+- `model`
+- `requests`
+- `failures`
+- `prompt_tokens`
+- `completion_tokens`
+- `total_tokens`
+- `total_latency_ms`
+- `avg_latency_ms`
+- `estimated_cost_usd`
+- `retries`
+
+## GET /metrics/teach
+
+Returns operational counts for pending teach confirmations.
+
+Response fields:
+
+- `pending_active_count`
+- `pending_expired_count`
+- `oldest_pending_created_at`
+- `next_pending_expiry_at`
+- `status`
+- `alerts`
+- `thresholds`
+
+Alert behavior:
+
+- warns when expired pending confirmations meet or exceed `TEACH_PENDING_EXPIRED_WARN_THRESHOLD`
+- warns when active pending confirmations meet or exceed `TEACH_PENDING_ACTIVE_WARN_THRESHOLD`
+
+## GET /telemetry/recent
+
+Returns recent request telemetry events for quick debugging.
+
+Query params:
+
+- `limit`
+- `endpoint`
+
+Response fields:
+
+- `results`
+
+## GET /telemetry/summary
+
+Returns aggregate request KPIs over a time window.
+
+Query params:
+
+- `endpoint`
+- `since_minutes`
+
+Response fields include:
+
+- `total_requests`
+- `ok_count`
+- `clarification_count`
+- `rejected_count`
+- `p50_latency_ms`
+- `p95_latency_ms`
+- `error_sources`
+
+## GET /telemetry/trace/{request_id}
+
+Returns ordered trace events for one request.
+
+Query params:
+
+- `limit`
+
+Response fields:
+
+- `request_id`
+- `results`
+- `total`
 
 ## GET /cache/stats
 
@@ -137,6 +354,90 @@ Response fields:
 - `sql_cleared`
 - `semantic_sql_cleared`
 - `ask_cleared`
+
+Behavior:
+
+- when the PostgreSQL pool is available, also clears DB-backed query cache rows
+
+## GET /governance/rules
+
+Returns all governance rules plus enabled status.
+
+Response fields include:
+
+- `total_rules`
+- `enabled_rules`
+- `governance_enabled`
+- `rules`
+
+## POST /governance/validate
+
+Runs the standalone SQL review gate against caller-supplied SQL.
+
+Request body fields:
+
+- `sql`
+- `query`
+- `tables_in_scope`
+
+Response fields:
+
+- `passes`
+- `violations`
+- `sql`
+- `query`
+
+## POST /benchmark/cases
+
+Stores a benchmark case for replay/regression runs.
+
+Response fields:
+
+- `id`
+- `query`
+- `expected_status`
+
+## GET /benchmark/cases
+
+Lists stored benchmark cases.
+
+Query params:
+
+- `limit`
+- `active_only`
+
+Response fields:
+
+- `results`
+
+## GET /ingest/groups/status
+
+Returns embedded-vs-current schema version status for each schema group.
+
+Response fields:
+
+- `groups`
+- `current_count`
+- `stale_count`
+- `never_embedded_count`
+
+## POST /ingest
+
+Ingests either free text or explicit schema table payloads.
+
+Response fields:
+
+- `inserted`
+- `updated`
+- `source`
+
+## POST /query
+
+Runs raw retrieval against the main embeddings corpus.
+
+Response fields:
+
+- `results`
 
 ## POST /ingest/groups
 
@@ -267,6 +568,9 @@ Mutation behavior:
 
 Resolves a pending teach conflict.
 
+Pending confirmation tokens are stored in PostgreSQL, so they survive service
+restarts until their 30-minute TTL expires.
+
 Request body:
 
 ```json
@@ -289,6 +593,41 @@ HTTP behavior:
 - HTTP `200` for controlled outcomes
 - HTTP `503` only when the DB pool is unavailable
 
+## GET /teach/pending
+
+Lists pending teach confirmations for operational or admin review.
+
+Query params:
+
+- `limit` — integer, default `100`, max `500`
+- `include_expired` — boolean, default `false`
+
+Response fields:
+
+- `results`
+- `stats`
+
+Each result includes:
+
+- `token`
+- `instruction_type`
+- `content`
+- `tables_affected`
+- `source_query`
+- `conflicting_id`
+- `created_at`
+- `expires_at`
+- `is_expired`
+
+## POST /teach/pending/cleanup
+
+Deletes expired pending teach confirmations immediately.
+
+Response fields:
+
+- `deleted`
+- `stats`
+
 ## GET /instructions
 
 Lists saved instructions for review.
@@ -301,6 +640,40 @@ Query params:
 Response:
 
 - array of instruction objects
+
+## DELETE /instructions/{instruction_id}
+
+Deactivates one saved instruction and marks its embedded chunk inactive.
+
+Response fields:
+
+- `deactivated`
+- `instruction_id`
+
+## POST /patterns/feedback
+
+Applies downstream feedback to a learned pattern.
+
+Request body fields:
+
+- `pattern_id`
+- `helpful`
+
+Behavior:
+
+- `helpful=true` boosts `use_count`
+- `helpful=false` deactivates the pattern
+
+## POST /query/groups
+
+Runs schema-group retrieval and returns a ready-to-use context block.
+
+Response fields include:
+
+- `matched_groups`
+- `tables_in_scope`
+- `context`
+- `results`
 
 ## POST /generate-sql
 
@@ -440,6 +813,17 @@ Event names:
 From `nl2sql_service/config.py`:
 
 ```env
+LLM_PROVIDER=ollama
+LLM_MODEL=deepseek-coder:6.7b
+LLM_TIMEOUT=60
+LLM_MAX_RETRIES=2
+
+EMBEDDING_PROVIDER=custom
+EMBEDDING_API_URL=http://<embedding-host>:8000/embed
+EMBEDDING_MODEL=bge-large-en-v1.5
+EMBEDDING_DIMENSION=1024
+
+VECTOR_PROVIDER=pgvector
 TOP_K=5
 SQL_GENERATION_TIMEOUT=90
 ASK_TIMEOUT=105
@@ -451,3 +835,7 @@ ASK_CACHE_ENABLED=true
 ASK_CACHE_SEMANTIC_THRESHOLD=0.97
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
 ```
+
+Provider/model routing is environment-driven. Role-specific `SQL_*`,
+`REASONING_*`, `QUERY_REWRITE_*`, and `ANSWER_*` settings override the global
+`LLM_*` defaults for those workloads.

@@ -12,6 +12,7 @@ from tenacity import (
 )
 
 from nl2sql_service.config import settings
+from nl2sql_service.llm.factory import LLMFactory
 
 if TYPE_CHECKING:
     pass
@@ -89,7 +90,7 @@ def _build_retry_decorator():
     )
 
 
-async def _call_embed_api(texts: list[str]) -> list[list[float]]:
+async def _call_custom_embed_api(texts: list[str]) -> list[list[float]]:
     """
     POST ``{"texts": texts}`` to the embedding endpoint.
     Validates the response shape and vector dimensions.
@@ -134,6 +135,20 @@ async def _call_embed_api(texts: list[str]) -> list[list[float]]:
             f"Embedding count mismatch: sent {len(texts)}, received {len(embeddings)}"
         )
 
+    _validate_embeddings(texts, embeddings)
+    return embeddings
+
+
+def _is_custom_provider() -> bool:
+    return settings.embedding_provider.strip().lower() in {"custom", "http", "tei", "external"}
+
+
+def _validate_embeddings(texts: list[str], embeddings: list[list[float]]) -> None:
+    if len(embeddings) != len(texts):
+        raise EmbeddingClientError(
+            f"Embedding count mismatch: sent {len(texts)}, received {len(embeddings)}"
+        )
+
     for i, vec in enumerate(embeddings):
         if len(vec) != settings.embedding_dimension:
             raise EmbeddingDimensionError(
@@ -141,6 +156,22 @@ async def _call_embed_api(texts: list[str]) -> list[list[float]]:
                 f"Check EMBEDDING_DIMENSION in config."
             )
 
+
+async def _call_embed_api(texts: list[str]) -> list[list[float]]:
+    if _is_custom_provider():
+        return await _call_custom_embed_api(texts)
+
+    try:
+        provider = LLMFactory.create_embedding_provider(settings)
+        embeddings = await provider.embeddings(texts)
+    except TimeoutError as exc:
+        raise EmbeddingTimeoutError(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise EmbeddingUpstreamError(
+            f"Embedding provider {settings.embedding_provider} failed: {exc}"
+        ) from exc
+
+    _validate_embeddings(texts, embeddings)
     return embeddings
 
 

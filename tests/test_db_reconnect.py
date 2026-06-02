@@ -123,9 +123,23 @@ async def test_health_attempts_reconnect_when_pool_missing(
     monkeypatch.setattr(main.db, "create_pool", AsyncMock(return_value=restored_pool))
     monkeypatch.setattr(main.db, "bootstrap", AsyncMock(return_value=None))
     monkeypatch.setattr(main.ingest, "ensure_hnsw_index", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        main.mysql_executor,
+        "mysql_target_readiness",
+        AsyncMock(return_value={"status": "ok", "issues": []}),
+    )
+    monkeypatch.setattr(
+        main.schema_loader,
+        "loader_readiness",
+        lambda: {"status": "ok", "issues": []},
+    )
 
     response = await client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "connected"}
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["db"] == "connected"
+    assert payload["provider_config"]["status"] == "ok"
+    assert payload["teach_confirmations"] == {"status": "unavailable", "alerts": []}
     assert app.state.pool is restored_pool

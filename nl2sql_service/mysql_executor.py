@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import re
 from typing import Any
 
@@ -101,6 +102,117 @@ async def execute_sql(
                 message=f"MySQL query failed: {exc}",
             )
         ]
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+async def mysql_target_readiness(
+    settings: Settings,
+    *,
+    timeout_seconds: float = 3.0,
+) -> dict[str, object]:
+    schema_name = (settings.db_name or settings.db_central or "").strip()
+    issues: list[dict[str, str]] = []
+    host = (settings.db_host or "").strip()
+    user = (settings.db_user or "").strip()
+
+    if not schema_name:
+        issues.append(
+            {
+                "code": "MYSQL_SCHEMA_REQUIRED",
+                "message": "DB_NAME or DB_CENTRAL must be set for MySQL execution.",
+            }
+        )
+    if not host:
+        issues.append(
+            {
+                "code": "MYSQL_HOST_REQUIRED",
+                "message": "DB_HOST must be set for MySQL execution.",
+            }
+        )
+    if not user:
+        issues.append(
+            {
+                "code": "MYSQL_USER_REQUIRED",
+                "message": "DB_USER must be set for MySQL execution.",
+            }
+        )
+    if settings.db_port <= 0:
+        issues.append(
+            {
+                "code": "MYSQL_PORT_INVALID",
+                "message": "DB_PORT must be a positive integer.",
+            }
+        )
+
+    if importlib.util.find_spec("aiomysql") is None:
+        issues.append(
+            {
+                "code": "MYSQL_DRIVER_MISSING",
+                "message": "aiomysql is not installed; SQL execution is unavailable.",
+            }
+        )
+
+    if issues:
+        return {
+            "status": "error",
+            "host": host or None,
+            "port": settings.db_port,
+            "schema": schema_name or None,
+            "issues": issues,
+        }
+
+    try:
+        import aiomysql
+    except ImportError:
+        return {
+            "status": "error",
+            "host": host,
+            "port": settings.db_port,
+            "schema": schema_name,
+            "issues": [
+                {
+                    "code": "MYSQL_DRIVER_MISSING",
+                    "message": "aiomysql is not installed; SQL execution is unavailable.",
+                }
+            ],
+        }
+
+    connection = None
+    try:
+        connection = await aiomysql.connect(
+            host=host,
+            port=settings.db_port,
+            user=user,
+            password=settings.db_password,
+            db=schema_name,
+            autocommit=True,
+            connect_timeout=timeout_seconds,
+        )
+        async with connection.cursor() as cursor:
+            await cursor.execute("SELECT 1")
+            await cursor.fetchone()
+        return {
+            "status": "ok",
+            "host": host,
+            "port": settings.db_port,
+            "schema": schema_name,
+            "issues": [],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "error",
+            "host": host,
+            "port": settings.db_port,
+            "schema": schema_name,
+            "issues": [
+                {
+                    "code": "MYSQL_CONNECT_FAILED",
+                    "message": f"MySQL readiness check failed: {exc}",
+                }
+            ],
+        }
     finally:
         if connection is not None:
             connection.close()

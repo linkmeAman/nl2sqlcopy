@@ -8,13 +8,116 @@ execution, interactive teaching, trace telemetry, and version-aware ingest.
 - PostgreSQL + pgvector store for retrieval, traces, failure logs, and persistent query cache
 - MySQL app DB introspection for column validation and bounded `/ask` execution
 - ReAct SQL generation with validation and optional governance review
+- Provider-agnostic LLM layer for SQL, reasoning, query rewrite, and answers
+- Provider-agnostic embedding layer with the existing custom HTTP embedding server as the default
 - Streaming Ask path with live NDJSON progress and trace events
-- Interactive instruction learning via `/teach` and `/teach/confirm`
+- Interactive instruction learning via `/teach` and `/teach/confirm`, with DB-backed pending confirmations
 - Version-aware ingest routes that skip unchanged chunks
 - In-memory exact/semantic caches plus DB-backed exact/semantic query cache
 
+## Provider-Agnostic Models
+
+All model calls go through `nl2sql_service/llm/`. Business logic depends on the
+unified provider interface instead of provider SDKs directly. Switching models
+should be an environment/config change, not a code change.
+
+Canonical LLM layer entry points:
+
+- `nl2sql_service.llm` - public import surface for `get_model_client`,
+  `LLMFactory`, `LLMRequest`, `LLMResponse`, `LLMChunk`, `GenerateInput`, and
+  `ProviderConfig`
+- `nl2sql_service.llm.factory` - provider selection, role routing, and fallback chains
+- `nl2sql_service.llm.interfaces` - canonical shared request/response/provider dataclasses and interfaces
+- `nl2sql_service.llm.providers.*` - concrete provider implementations
+- `nl2sql_service.llm.adapters.openai` - normalized OpenAI-compatible HTTP adapter
+
+Compatibility note:
+
+- `nl2sql_service.llm.types` remains only as a thin re-export for older imports.
+  It is not a second source of truth for LLM dataclasses.
+
+Supported LLM providers:
+
+- `ollama`
+- `openai`
+- `anthropic`
+- `gemini`
+- `groq`
+- `openrouter`
+- `togetherai`
+
+Supported embedding providers:
+
+- `custom` - current external bge/TEI-style HTTP embedding endpoint
+- `openai`
+- `gemini`
+- `ollama`
+- `voyageai`
+
+Role-specific routing lets different workloads use different models:
+
+```env
+LLM_PROVIDER=ollama
+LLM_MODEL=deepseek-coder:6.7b
+
+SQL_MODEL_PROVIDER=anthropic
+SQL_MODEL=claude-sonnet-4
+SQL_MODEL_API_KEY=env:ANTHROPIC_API_KEY
+
+REASONING_MODEL_PROVIDER=openai
+REASONING_MODEL=gpt-4.1-mini
+REASONING_MODEL_API_KEY=env:OPENAI_API_KEY
+
+QUERY_REWRITE_MODEL_PROVIDER=groq
+QUERY_REWRITE_MODEL=llama-3.3-70b-versatile
+QUERY_REWRITE_MODEL_API_KEY=env:GROQ_API_KEY
+
+ANSWER_MODEL_PROVIDER=openrouter
+ANSWER_MODEL=openai/gpt-4.1-mini
+ANSWER_MODEL_API_KEY=file:/run/secrets/openrouter_api_key
+```
+
+Fallbacks are configured independently:
+
+```env
+LLM_FALLBACK_PROVIDER=openai
+LLM_FALLBACK_MODEL=gpt-4.1-mini
+LLM_FALLBACK_API_KEY=env:OPENAI_API_KEY
+
+SQL_FALLBACK_PROVIDER=ollama
+SQL_FALLBACK_MODEL=deepseek-coder:6.7b
+```
+
+Secrets are never hardcoded. Config values can be raw env values, `env:NAME`,
+or `file:/path/to/secret` for Docker/Kubernetes secret mounts.
+
+Runtime routing is separate from the env file. Use `/config/model-routing` to
+inspect or patch the active process routing at runtime.
+
 ## Key Runtime Paths
 
+- `GET /help`, `GET /help/{module}`, `GET /help/{module}/{route_slug}`
+  - render in-app HTML route documentation for operators and integrators
+- `GET /health`, `GET /health/config`, `GET /health/runtime`, `GET /health/llm`, `GET /health/vector`
+  - expose compact and detailed readiness for provider config, MySQL execution,
+    schema assets, vector connectivity, and role-specific LLM health
+- `GET /config/model-routing`, `PATCH /config/model-routing`
+  - inspect and patch the live task-to-model routing used by SQL, reasoning,
+    query rewrite, answer, embedding, and fallback selection
+- `GET /metrics/llm`, `GET /metrics/teach`
+  - surface provider usage metrics and teach-confirmation operational drift
+- `GET /telemetry/recent`, `GET /telemetry/summary`, `GET /telemetry/trace/{request_id}`
+  - inspect request outcomes, aggregate KPIs, and per-request stage traces
+- `GET /failures`
+  - list recent failed requests with pre-built teach suggestions
+- `GET /cache/stats`, `POST /cache/clear`
+  - inspect cache sizes/TTLs and clear in-memory plus DB-backed query cache state
+- `GET /governance/rules`, `POST /governance/validate`
+  - inspect active governance rules and run the standalone SQL review gate
+- `POST /benchmark/cases`, `GET /benchmark/cases`
+  - persist and list benchmark cases for replay/regression gates
+- `GET /ingest/groups/status`
+  - compare current schema group hashes against embedded versions
 - `POST /generate-sql`
   - retrieve schema context
   - apply user instructions and learned patterns
@@ -29,14 +132,23 @@ execution, interactive teaching, trace telemetry, and version-aware ingest.
   - emit sanitized `trace` events and a terminal `final` response event
 - `GET /telemetry/trace/{request_id}`
   - return persisted trace events ordered by `seq`
+- `GET /health`, `GET /health/config`, `GET /health/runtime`, `GET /health/llm`, `GET /health/vector`, `GET /metrics/llm`, `GET /metrics/teach`
+  - validate provider connectivity and inspect provider/model usage
+  - `GET /health` now also surfaces compact teach-confirmation warning status for monitoring
 - `POST /teach`, `POST /teach/confirm`
   - save or resolve user-provided instructions
-- `GET /failures`
-- `POST /ingest/groups`
-- `POST /ingest/knowledge`
-- `POST /ingest/patterns`
-- `POST /ingest/instructions`
-- `GET /instructions`
+  - pending confirmations persist across service restarts until their 30-minute TTL expires
+- `GET /teach/pending`, `POST /teach/pending/cleanup`
+  - inspect and explicitly clean up pending teach confirmations
+  - `/metrics/teach` includes threshold-based alerts for backlog and expired-token drift
+- `GET /instructions`, `DELETE /instructions/{instruction_id}`
+  - review or deactivate saved instructions
+- `POST /patterns/feedback`
+  - boost or deactivate learned patterns from downstream feedback
+- `POST /query`, `POST /query/groups`
+  - run raw retrieval or schema-group retrieval without SQL generation
+- `POST /ingest`, `POST /ingest/groups`, `POST /ingest/knowledge`, `POST /ingest/patterns`, `POST /ingest/instructions`
+  - ingest free text, schema groups, enriched knowledge, learned patterns, and user instructions
 
 ## Streaming Ask
 
@@ -168,6 +280,19 @@ Epoch bump triggers:
 Key defaults from `nl2sql_service/config.py`:
 
 ```env
+LLM_PROVIDER=ollama
+LLM_BASE_URL=http://localhost:11434
+LLM_MODEL=deepseek-coder:6.7b
+LLM_TIMEOUT=60
+LLM_MAX_RETRIES=2
+LLM_RETRY_BASE_DELAY=0.5
+
+EMBEDDING_PROVIDER=custom
+EMBEDDING_API_URL=http://<embedding-host>:8000/embed
+EMBEDDING_MODEL=bge-large-en-v1.5
+EMBEDDING_DIMENSION=1024
+
+VECTOR_PROVIDER=pgvector
 TOP_K=5
 SQL_GENERATION_TIMEOUT=90
 ASK_TIMEOUT=105
@@ -178,6 +303,40 @@ SQL_CACHE_ENABLED=true
 ASK_CACHE_ENABLED=true
 ASK_CACHE_SEMANTIC_THRESHOLD=0.97
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
+```
+
+## Production Env Contract
+
+The service now enforces provider configuration at startup instead of relying on
+hidden dev defaults.
+
+- `LLM_BASE_URL` is required whenever the resolved provider for a generation role is `ollama`.
+- `EMBEDDING_API_URL` is required only when `EMBEDDING_PROVIDER=custom`.
+- Cloud providers such as `openai`, `groq`, `anthropic`, `gemini`, and `voyageai`
+  require a resolved API key. `env:NAME` and `file:/path` references are checked
+  during settings validation, not just at request time.
+- Role-specific overrides and fallbacks must be complete enough to run on their
+  own. For example, `QUERY_REWRITE_FALLBACK_PROVIDER=openai` without a usable API
+  key now fails fast.
+- There is no hardcoded remote Ollama host anymore. Production must set every
+  host explicitly.
+- `STARTUP_ENFORCEMENT_MODE=strict` turns provider/runtime readiness failures
+  into startup failures. In `warn` mode, the service still starts and exposes
+  those failures through `/health` and `/health/runtime`.
+
+Use `GET /health/config` to inspect the resolved provider readiness report and
+`GET /health` to confirm the service is starting with `provider_config.status=ok`.
+Use `GET /health/runtime` to inspect MySQL execution readiness and required
+schema/docs assets on disk.
+
+Provider-specific keys are optional until that provider is selected. Once
+selected, missing API keys, missing Ollama base URLs, and incomplete fallback
+configs fail fast during settings validation.
+
+Recommended production setting:
+
+```env
+STARTUP_ENFORCEMENT_MODE=strict
 ```
 
 Timeouts should be ordered from inner to outer:
@@ -217,6 +376,30 @@ curl -s 'http://localhost:8080/telemetry/trace/REQ_ID?limit=500' \
   | python -m json.tool
 ```
 
+Check provider and runtime health:
+
+```bash
+curl -s 'http://localhost:8080/health' | python -m json.tool
+curl -s 'http://localhost:8080/health/config' | python -m json.tool
+curl -s 'http://localhost:8080/health/runtime' | python -m json.tool
+curl -s 'http://localhost:8080/health/llm?role=sql' | python -m json.tool
+curl -s 'http://localhost:8080/health/vector' | python -m json.tool
+curl -s 'http://localhost:8080/metrics/llm' | python -m json.tool
+```
+
+`/health` now includes compact summaries for PostgreSQL connectivity, provider
+config, MySQL execution readiness, schema asset readiness, and teach
+confirmation alerts.
+
+For deployment gating, use:
+
+```bash
+make smoke-deploy
+```
+
+That runs the smoke matrix with `--require-ready`, which fails if `/health`,
+`/health/config`, or `/health/runtime` return anything other than `status=ok`.
+
 ## Verification
 
 Focused regression command used for trace, stream, cache, and teach behavior:
@@ -225,11 +408,10 @@ Focused regression command used for trace, stream, cache, and teach behavior:
 python -m pytest tests/test_ask.py tests/test_cache.py tests/test_interactive_learning.py
 ```
 
-For cold local environments, set `DATABASE_URL`, `EMBEDDING_API_URL`, and
-`RAG_SCHEMA_DIR` before running the tests.
+For cold local environments, set `DATABASE_URL`, `LLM_PROVIDER`, `LLM_MODEL`,
+`LLM_BASE_URL` when using `ollama`, `EMBEDDING_PROVIDER`, `EMBEDDING_API_URL`
+when using `custom`, and `RAG_SCHEMA_DIR` before running the tests.
 
 ## Docs
 
 - Route reference: `ROUTES.md`
-- Current implementation summary: `implementation_complete.md`
-- Historical planning notes: `nl2sql_refactor_plan.md`

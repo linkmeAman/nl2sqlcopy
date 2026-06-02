@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from nl2sql_service.config import Settings, settings as default_settings
-from nl2sql_service.model_client import get_model_client
+from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import SqlWarning, WarningCode
 from nl2sql_service.rulebook import build_governance_block, get_config
 from nl2sql_service.sql_generator import select_relevant_column_indexes
@@ -243,6 +243,7 @@ async def call_answer_model(
         settings=settings,
         model=model_name,
         default_timeout=settings.answer_timeout,
+        role="answer",
     )
     response = await client.generate(
         prompt=prompt,

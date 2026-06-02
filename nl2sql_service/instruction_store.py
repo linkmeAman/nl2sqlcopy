@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import secrets
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 UTC = timezone.utc
 _PENDING_TTL = timedelta(minutes=30)
 _MAX_PENDING = 100
+# Legacy test shim; runtime confirmations are persisted in PostgreSQL.
 _pending_instructions: dict[str, dict] = {}
 
 
@@ -219,9 +221,10 @@ async def process_teach_request(
                 pool=pool,
             )
             if similar:
-                token = _store_pending(
+                token = await _store_pending(
                     instruction=instruction,
                     conflicting_id=int(similar[0]["id"]),
+                    pool=pool,
                 )
                 return TeachResponse(
                     learning_status=LearningStatus.CONFLICT_DETECTED,
@@ -259,9 +262,10 @@ async def process_teach_request(
             pool=pool,
         )
         if conflict:
-            token = _store_pending(
+            token = await _store_pending(
                 instruction=instruction,
                 conflicting_id=int(conflict["id"]),
+                pool=pool,
             )
             tables = ", ".join(request.tables_affected) or "these tables"
             return TeachResponse(
@@ -324,12 +328,9 @@ async def process_confirmation(
     pool: asyncpg.Pool,
 ) -> TeachResponse:
     try:
-        pending = _pending_instructions.get(token)
-        if not pending or _is_expired(pending):
-            _pending_instructions.pop(token, None)
+        pending = await _pop_pending(pool, token)
+        if pending is None:
             return _rejected("Confirmation token expired or not found.")
-
-        pending = _pending_instructions.pop(token)
         instruction = pending["instruction"]
         conflicting_id = pending.get("conflicting_id")
 
@@ -691,46 +692,95 @@ async def record_instruction_outcome(
         logger.warning("Failed to record instruction outcome: %s", exc)
 
 
-def _store_pending(instruction: dict, conflicting_id: int | None) -> str:
-    _evict_pending()
+async def _store_pending(
+    instruction: dict,
+    conflicting_id: int | None,
+    pool: asyncpg.Pool,
+) -> str:
+    await _evict_pending(pool)
     token = secrets.token_hex(8)
-    _pending_instructions[token] = {
-        "instruction": instruction,
-        "conflicting_id": conflicting_id,
-        "created_at": datetime.now(UTC),
-    }
+    expires_at = datetime.now(UTC) + _PENDING_TTL
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO nl2sql_pending_teach_confirmations
+                (token, instruction, conflicting_id, expires_at)
+            VALUES ($1, $2::jsonb, $3, $4)
+            """,
+            token,
+            json.dumps(instruction),
+            conflicting_id,
+            expires_at,
+        )
     return token
 
 
-def _evict_pending() -> None:
-    now = datetime.now(UTC)
-    expired = [
-        token
-        for token, pending in _pending_instructions.items()
-        if now - _pending_created_at(pending) > _PENDING_TTL
-    ]
-    for token in expired:
-        _pending_instructions.pop(token, None)
+async def _evict_pending(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                DELETE FROM nl2sql_pending_teach_confirmations
+                WHERE expires_at <= NOW()
+                """
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT COUNT(*)::bigint AS pending_count
+                FROM nl2sql_pending_teach_confirmations
+                """
+            )
+            pending_count = int(row["pending_count"] if row else 0)
+            overflow = pending_count - _MAX_PENDING + 1
+            if overflow > 0:
+                await conn.execute(
+                    """
+                    DELETE FROM nl2sql_pending_teach_confirmations
+                    WHERE token IN (
+                        SELECT token
+                        FROM nl2sql_pending_teach_confirmations
+                        ORDER BY created_at ASC
+                        LIMIT $1
+                    )
+                    """,
+                    overflow,
+                )
 
-    while len(_pending_instructions) >= _MAX_PENDING:
-        oldest = min(
-            _pending_instructions,
-            key=lambda token: _pending_created_at(_pending_instructions[token]),
+
+async def _pop_pending(pool: asyncpg.Pool, token: str) -> dict | None:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            DELETE FROM nl2sql_pending_teach_confirmations
+            WHERE token = $1
+              AND expires_at > NOW()
+            RETURNING instruction, conflicting_id, created_at
+            """,
+            token,
         )
-        _pending_instructions.pop(oldest, None)
+        if row is None:
+            await conn.execute(
+                """
+                DELETE FROM nl2sql_pending_teach_confirmations
+                WHERE token = $1
+                  AND expires_at <= NOW()
+                """,
+                token,
+            )
+            return None
 
-
-def _is_expired(pending: dict) -> bool:
-    return datetime.now(UTC) - _pending_created_at(pending) > _PENDING_TTL
-
-
-def _pending_created_at(pending: dict) -> datetime:
-    created_at = pending.get("created_at")
-    if isinstance(created_at, datetime):
-        if created_at.tzinfo is None:
-            return created_at.replace(tzinfo=UTC)
-        return created_at
-    return datetime.now(UTC) - (_PENDING_TTL + timedelta(seconds=1))
+    instruction = row["instruction"]
+    if isinstance(instruction, str):
+        instruction = json.loads(instruction)
+    elif instruction is None:
+        instruction = {}
+    else:
+        instruction = dict(instruction)
+    return {
+        "instruction": instruction,
+        "conflicting_id": row["conflicting_id"],
+        "created_at": row["created_at"],
+    }
 
 
 def _similar_models(rows: list[dict]) -> list[SimilarInstruction]:

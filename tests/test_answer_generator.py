@@ -6,7 +6,7 @@ import pytest
 
 from nl2sql_service import answer_generator
 from nl2sql_service.config import settings
-from nl2sql_service.model_client import ModelResponse
+from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.models import SqlWarning, WarningCode
 
 
@@ -103,7 +103,7 @@ async def test_call_answer_model_disables_thinking_and_caps_tokens(
             assert kwargs["enable_thinking"] is settings.answer_allow_reasoning
             assert kwargs["max_tokens"] == settings.answer_max_tokens
             assert kwargs["temperature"] == settings.answer_temperature
-            return ModelResponse(text="Here are the matching rows.")
+            return LLMResponse(text="Here are the matching rows.")
 
     monkeypatch.setattr(
         answer_generator,

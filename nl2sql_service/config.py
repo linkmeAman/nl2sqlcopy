@@ -1,8 +1,50 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_OPENAI_COMPATIBLE = {"openai", "groq", "openrouter", "together", "togetherai"}
+_API_KEY_REQUIRED = _OPENAI_COMPATIBLE | {
+    "anthropic",
+    "claude",
+    "gemini",
+    "google",
+    "voyage",
+    "voyageai",
+}
+_PROVIDER_ALIASES = {
+    "claude": "anthropic",
+    "google": "gemini",
+    "together": "togetherai",
+    "voyageai": "voyage",
+}
+_EMBEDDING_CUSTOM_PROVIDERS = {"custom", "http", "tei", "external"}
+
+
+def _normalize_provider(provider: str | None) -> str:
+    cleaned = (provider or "").strip().lower().replace("-", "_")
+    return _PROVIDER_ALIASES.get(cleaned, cleaned)
+
+
+def _resolve_secret_reference(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.startswith("file:"):
+        path = cleaned.removeprefix("file:")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip() or None
+        except OSError:
+            return None
+    if cleaned.startswith("env:"):
+        return os.getenv(cleaned.removeprefix("env:"), "").strip() or None
+    return cleaned
 
 
 class Settings(BaseSettings):
@@ -16,19 +58,49 @@ class Settings(BaseSettings):
     # Database
     database_url: str
 
-    # Embedding service
-    embedding_api_url: str
+    # Embedding service. The default "custom" provider preserves the existing
+    # external bge-large FastAPI/TEI endpoint contract.
+    embedding_api_url: str | None = None
+    embedding_provider: str = "custom"
+    embedding_api_key: str | None = None
+    embedding_base_url: str | None = None
     embedding_model: str = "bge-large-en-v1.5"
     batch_size: int = 32
     embedding_dimension: int = 1024
 
     # LLM service
     llm_provider: str = "ollama"
-    llm_base_url: str = "http://100.120.187.84:11434"
+    llm_api_key: str | None = None
+    llm_base_url: str | None = None
     llm_model: str = "deepseek-coder:6.7b"
+    llm_temperature: float = 0.2
+    llm_max_tokens: int = 4096
     llm_timeout: int = 60
     llm_max_retries: int = 2
+    llm_retry_base_delay: float = 0.5
+    llm_fallback_provider: str | None = None
+    llm_fallback_model: str | None = None
+    llm_fallback_api_key: str | None = None
+    llm_fallback_base_url: str | None = None
+
+    # Role-specific model routing. Any unset value falls back to LLM_*.
+    sql_model_provider: str | None = None
+    sql_model: str | None = None
+    sql_model_api_key: str | None = None
+    sql_model_base_url: str | None = None
+    sql_fallback_provider: str | None = None
+    sql_fallback_model: str | None = None
+    sql_fallback_api_key: str | None = None
+    sql_fallback_base_url: str | None = None
+
+    reasoning_model_provider: str | None = None
     reasoning_model: str = "qwen3:4b"
+    reasoning_model_api_key: str | None = None
+    reasoning_model_base_url: str | None = None
+    reasoning_fallback_provider: str | None = None
+    reasoning_fallback_model: str | None = None
+    reasoning_fallback_api_key: str | None = None
+    reasoning_fallback_base_url: str | None = None
     reasoning_temperature: float = 0.6
     reasoning_timeout: int = 45
     react_max_iterations: int = 4
@@ -40,7 +112,10 @@ class Settings(BaseSettings):
     embed_max_retries: int = 3
     embed_retry_base_delay: float = 1.0
 
-    # Retrieval
+    # Retrieval / vector store
+    vector_provider: str = "pgvector"
+    vector_base_url: str | None = None
+    vector_api_key: str | None = None
     top_k: int = 5
     embed_cache_ttl_seconds: int = 3600
     sql_cache_ttl_seconds: int = 3600
@@ -53,7 +128,14 @@ class Settings(BaseSettings):
     min_pattern_use_count: int = 2
     min_instruction_confidence: float = 0.5
     query_rewrite_enabled: bool = True
+    query_rewrite_model_provider: str | None = None
     query_rewrite_model: str = "deepseek-coder:6.7b"
+    query_rewrite_model_api_key: str | None = None
+    query_rewrite_model_base_url: str | None = None
+    query_rewrite_fallback_provider: str | None = None
+    query_rewrite_fallback_model: str | None = None
+    query_rewrite_fallback_api_key: str | None = None
+    query_rewrite_fallback_base_url: str | None = None
     query_rewrite_timeout: int = 8
     query_rewrite_max_tokens: int = 120
     query_rewrite_hints: str = "counselor,counsellor,counsellors -> employee"
@@ -68,7 +150,14 @@ class Settings(BaseSettings):
     db_reconnect_min_interval: float = 5.0
 
     # Answer generation settings for /ask
+    answer_model_provider: str | None = None
     answer_model: str | None = None
+    answer_model_api_key: str | None = None
+    answer_model_base_url: str | None = None
+    answer_fallback_provider: str | None = None
+    answer_fallback_model: str | None = None
+    answer_fallback_api_key: str | None = None
+    answer_fallback_base_url: str | None = None
     answer_timeout: int = 45
     answer_temperature: float = 0.2
     answer_max_tokens: int = 300
@@ -77,12 +166,181 @@ class Settings(BaseSettings):
     answer_strict_concise: bool = True
     ask_timeout: int = 105
 
+    # Teach confirmation operational alerts
+    teach_pending_active_warn_threshold: int = 25
+    teach_pending_expired_warn_threshold: int = 1
+
+    # Startup dependency enforcement
+    startup_enforcement_mode: str = "warn"
+
     # Governance / rulebook system
     governance_enabled: bool = True
     governance_enabled_rules: str = "all"
     governance_inject_react: bool = True
     governance_inject_sql: bool = True
     governance_inject_answer: bool = True
+
+    def provider_readiness_report(self) -> dict[str, object]:
+        issues: list[dict[str, str]] = []
+        targets: list[dict[str, object]] = []
+
+        def add_issue(code: str, target: str, message: str) -> None:
+            issues.append({"code": code, "target": target, "message": message})
+
+        def validate_target(
+            *,
+            target: str,
+            provider: str | None,
+            model: str | None,
+            api_key: str | None,
+            base_url: str | None,
+            role: str,
+            capability: str,
+        ) -> None:
+            normalized = _normalize_provider(provider)
+            resolved_api_key = _resolve_secret_reference(api_key)
+            base_url_configured = bool((base_url or "").strip())
+            targets.append(
+                {
+                    "target": target,
+                    "role": role,
+                    "capability": capability,
+                    "provider": normalized or None,
+                    "model": (model or "").strip() or None,
+                    "base_url_configured": base_url_configured,
+                    "api_key_configured": bool(resolved_api_key),
+                }
+            )
+            if not normalized:
+                add_issue("PROVIDER_REQUIRED", target, f"{target} requires a provider.")
+            if not (model or "").strip():
+                add_issue("MODEL_REQUIRED", target, f"{target} requires a model.")
+            if normalized in _API_KEY_REQUIRED and not resolved_api_key:
+                add_issue("API_KEY_REQUIRED", target, f"{target} requires a resolved API key.")
+            if normalized == "ollama" and not base_url_configured:
+                add_issue(
+                    "BASE_URL_REQUIRED",
+                    target,
+                    f"{target} uses Ollama and requires an explicit base URL.",
+                )
+
+        validate_target(
+            target="LLM_PROVIDER",
+            provider=self.llm_provider,
+            model=self.llm_model,
+            api_key=self.llm_api_key,
+            base_url=self.llm_base_url,
+            role="default",
+            capability="generation",
+        )
+        if _normalize_provider(self.embedding_provider) in _EMBEDDING_CUSTOM_PROVIDERS:
+            if not (self.embedding_api_url or "").strip():
+                add_issue(
+                    "EMBEDDING_API_URL_REQUIRED",
+                    "EMBEDDING_PROVIDER",
+                    "EMBEDDING_API_URL is required when EMBEDDING_PROVIDER=custom.",
+                )
+            targets.append(
+                {
+                    "target": "EMBEDDING_PROVIDER",
+                    "role": "embedding",
+                    "capability": "embedding",
+                    "provider": _normalize_provider(self.embedding_provider) or None,
+                    "model": (self.embedding_model or "").strip() or None,
+                    "base_url_configured": bool((self.embedding_api_url or "").strip()),
+                    "api_key_configured": bool(_resolve_secret_reference(self.embedding_api_key)),
+                }
+            )
+        else:
+            embedding_base_url = self.embedding_base_url
+            if _normalize_provider(self.embedding_provider) == "ollama" and not embedding_base_url:
+                embedding_base_url = self.llm_base_url
+            validate_target(
+                target="EMBEDDING_PROVIDER",
+                provider=self.embedding_provider,
+                model=self.embedding_model,
+                api_key=self.embedding_api_key,
+                base_url=embedding_base_url,
+                role="embedding",
+                capability="embedding",
+            )
+
+        for role in ("sql", "reasoning", "query_rewrite", "answer"):
+            provider = getattr(self, f"{role}_model_provider", None) or self.llm_provider
+            if role == "answer" and not self.answer_model_provider and not self.answer_model:
+                provider = self.reasoning_model_provider or provider
+
+            role_model = getattr(self, f"{role}_model", None) or self.llm_model
+            if role == "answer" and not self.answer_model_provider and not self.answer_model:
+                role_model = self.reasoning_model or role_model
+
+            api_key = getattr(self, f"{role}_model_api_key", None) or self.llm_api_key
+            if role == "answer" and not self.answer_model_api_key and not self.answer_model:
+                api_key = self.reasoning_model_api_key or api_key
+
+            base_url = getattr(self, f"{role}_model_base_url", None)
+            if _normalize_provider(provider) == _normalize_provider(self.llm_provider):
+                base_url = base_url or self.llm_base_url
+            if role == "answer" and not self.answer_model_base_url and not self.answer_model:
+                base_url = self.reasoning_model_base_url or base_url
+
+            validate_target(
+                target=f"{role.upper()}_MODEL_PROVIDER",
+                provider=provider,
+                model=role_model,
+                api_key=api_key,
+                base_url=base_url,
+                role=role,
+                capability="generation",
+            )
+
+            fallback_provider = getattr(self, f"{role}_fallback_provider", None) or self.llm_fallback_provider
+            if not fallback_provider:
+                continue
+            fallback_model = (
+                getattr(self, f"{role}_fallback_model", None)
+                or self.llm_fallback_model
+                or role_model
+            )
+            fallback_api_key = (
+                getattr(self, f"{role}_fallback_api_key", None)
+                or self.llm_fallback_api_key
+                or self.llm_api_key
+            )
+            fallback_base_url = (
+                getattr(self, f"{role}_fallback_base_url", None)
+                or self.llm_fallback_base_url
+            )
+            if _normalize_provider(fallback_provider) == _normalize_provider(self.llm_provider):
+                fallback_base_url = fallback_base_url or self.llm_base_url
+            validate_target(
+                target=f"{role.upper()}_FALLBACK_PROVIDER",
+                provider=fallback_provider,
+                model=fallback_model,
+                api_key=fallback_api_key,
+                base_url=fallback_base_url,
+                role=f"{role}_fallback",
+                capability="generation",
+            )
+
+        return {
+            "status": "ok" if not issues else "error",
+            "issues": issues,
+            "targets": targets,
+        }
+
+    @model_validator(mode="after")
+    def validate_provider_settings(self) -> "Settings":
+        report = self.provider_readiness_report()
+        issues = report["issues"]
+        if issues:
+            messages = "; ".join(issue["message"] for issue in issues if isinstance(issue, dict))
+            raise ValueError(messages)
+        mode = self.startup_enforcement_mode.strip().lower()
+        if mode not in {"warn", "strict"}:
+            raise ValueError("STARTUP_ENFORCEMENT_MODE must be one of: warn, strict")
+        self.startup_enforcement_mode = mode
+        return self
 
 
 @lru_cache(maxsize=1)

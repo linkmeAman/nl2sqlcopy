@@ -59,6 +59,52 @@ async def test_ask_success_full_response(
 
 
 @pytest.mark.asyncio
+async def test_ask_deterministic_inquiry_uses_fallback_answer(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_embed,
+):
+    from nl2sql_service import answer_generator, main, mysql_executor
+
+    mock_generate_sql = AsyncMock(
+        return_value=GenerateSqlSuccess(
+            sql="SELECT id, contact_id, created_at FROM inquiry ORDER BY created_at DESC LIMIT 5",
+            warnings=[],
+            tables_used=["inquiry"],
+            matched_groups=["deterministic_inquiry"],
+            attempt_count=0,
+            react_trace=None,
+        )
+    )
+    mock_execute_sql = AsyncMock(
+        return_value=(
+            ["id", "contact_id", "created_at"],
+            [(10, 200, "2026-05-01"), (9, 199, "2026-04-30")],
+            [],
+        )
+    )
+    mock_generate_answer = AsyncMock(return_value=("unused", []))
+
+    monkeypatch.setattr(main, "generate_sql", mock_generate_sql)
+    monkeypatch.setattr(mysql_executor, "execute_sql", mock_execute_sql)
+    monkeypatch.setattr(answer_generator, "generate_answer", mock_generate_answer)
+
+    response = await client.post(
+        "/ask",
+        json={"query": "show me the 5 most recent inquiries", "top_k": 5},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "ok"
+    assert body["answer"].startswith("Found 2 rows.")
+    assert "10 | 2026-05-01 | 200" in body["answer"]
+    assert body["matched_groups"] == ["deterministic_inquiry"]
+    assert mock_generate_answer.await_count == 0
+    assert mock_embed.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_ask_rejected_sql_generation_skips_execution(
     client,
     monkeypatch: pytest.MonkeyPatch,
@@ -254,7 +300,7 @@ async def test_ask_success_response_includes_required_fields(
     body = response.json()
     assert response.status_code == 200
     assert body["status"] == "ok"
-    assert set(body.keys()) == {
+    assert {
         "status",
         "answer",
         "sql",
@@ -265,7 +311,10 @@ async def test_ask_success_response_includes_required_fields(
         "matched_groups",
         "attempt_count",
         "react_trace",
-    }
+    }.issubset(body.keys())
+    assert {"cache_hit", "cache_source", "stage_latencies_ms", "review_prompt"}.issubset(
+        body.keys()
+    )
 
 
 def test_ask_sql_without_limit_is_capped_to_50():
@@ -316,7 +365,8 @@ async def test_ask_stream_success_emits_progress_and_final(
     assert response.headers["content-type"].startswith("application/x-ndjson")
 
     events = [json.loads(line) for line in response.text.splitlines()]
-    event_names = [event["event"] for event in events]
+    visible_events = [event for event in events if event["event"] != "trace"]
+    event_names = [event["event"] for event in visible_events]
     assert event_names == [
         "started",
         "sql_generation_started",
@@ -328,10 +378,10 @@ async def test_ask_stream_success_emits_progress_and_final(
         "answer_generation_finished",
         "final",
     ]
-    assert events[2]["sql"] == "SELECT id, amount FROM payment ORDER BY date DESC"
-    assert events[5]["row_count"] == 2
-    assert events[-1]["response"]["status"] == "ok"
-    assert events[-1]["response"]["answer"] == "There are 2 matching rows."
+    assert visible_events[2]["sql"] == "SELECT id, amount FROM payment ORDER BY date DESC"
+    assert visible_events[5]["row_count"] == 2
+    assert visible_events[-1]["response"]["status"] == "ok"
+    assert visible_events[-1]["response"]["answer"] == "There are 2 matching rows."
 
 
 @pytest.mark.asyncio
@@ -361,7 +411,7 @@ async def test_ask_stream_rejected_sql_generation_returns_final_event(
     )
 
     events = [json.loads(line) for line in response.text.splitlines()]
-    assert [event["event"] for event in events] == [
+    assert [event["event"] for event in events if event["event"] != "trace"] == [
         "started",
         "sql_generation_started",
         "sql_generation_rejected",

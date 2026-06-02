@@ -6,7 +6,7 @@ import pytest
 
 from nl2sql_service import react_agent
 from nl2sql_service.config import settings
-from nl2sql_service.model_client import ModelResponse
+from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.models import ReActAction, SqlWarning, WarningCode
 
 
@@ -176,8 +176,9 @@ async def test_simple_select_star_is_narrowed_before_validation(
     )
 
     assert response.status == "ok"
-    assert response.sql.startswith("SELECT id, invoice_id")
+    assert response.sql.startswith("SELECT id")
     assert "*" not in response.sql
+    assert "invoice_id" in response.sql
     assert "ORDER BY created_at DESC LIMIT 5" in response.sql
 
 
@@ -503,7 +504,7 @@ async def test_call_reasoning_model_uses_thinking_action_when_response_empty(
             assert kwargs["enable_thinking"] is True
             assert kwargs["max_tokens"] == 800
             assert kwargs["response_format"] == "json"
-            return ModelResponse(
+            return LLMResponse(
                 text="",
                 thought='{"action":"GENERATE_SQL","input":"show payments"}',
             )

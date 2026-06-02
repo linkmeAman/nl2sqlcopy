@@ -11,7 +11,7 @@ from nl2sql_service import query_rewriter
 from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.config import Settings, settings as default_settings
 from nl2sql_service.instruction_store import record_instruction_outcome
-from nl2sql_service.model_client import get_model_client
+from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import (
     GenerateSqlClarification,
     GenerateSqlRejected,
@@ -126,6 +126,7 @@ async def call_reasoning_model(
         settings=settings,
         model=settings.reasoning_model,
         default_timeout=settings.reasoning_timeout,
+        role="reasoning",
     )
     response = await client.generate(
         prompt=prompt,
@@ -625,6 +626,7 @@ SUGGESTION_3: <optional third suggestion>
             settings=settings,
             model=settings.reasoning_model,
             default_timeout=settings.reasoning_timeout,
+            role="reasoning",
         )
         response = await client.generate(
             prompt=prompt,

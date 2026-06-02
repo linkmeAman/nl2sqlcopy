@@ -8,7 +8,7 @@ import asyncpg
 
 from nl2sql_service import instruction_store
 from nl2sql_service.config import Settings
-from nl2sql_service.model_client import get_model_client
+from nl2sql_service.llm import get_model_client
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +142,7 @@ async def _call_rewrite_model(
         settings=settings,
         model=settings.query_rewrite_model,
         default_timeout=settings.query_rewrite_timeout,
+        role="query_rewrite",
     )
     response = await client.generate(
         prompt=build_rewrite_prompt(query, hints),
@@ -175,8 +176,8 @@ async def rewrite_search_query(
     original = " ".join(query.split())
     if not settings.query_rewrite_enabled or not original:
         return query
-    if len(original.split()) <= 1:
-        logger.info("Skipping rewrite for single-word query: '%s'", original)
+    if len(original.split()) <= 2:
+        logger.info("Skipping rewrite for short query: '%s'", original)
         return query
 
     try:

@@ -5,12 +5,15 @@ Integration tests for core NL2SQL endpoints.
 
 Covers:
   GET  /health
+  GET  /metrics/teach
   POST /ingest  (text + schema variants)
   POST /query
   POST /ingest/groups
   POST /ingest/knowledge
   POST /query/groups
   GET  /ingest/groups/status
+  GET  /teach/pending
+  POST /teach/pending/cleanup
 """
 
 from __future__ import annotations
@@ -41,24 +44,280 @@ def _ok(resp: httpx.Response) -> dict:
 
 @pytest.mark.asyncio
 async def test_health_ok(client: httpx.AsyncClient) -> None:
-    resp = await client.get("/health")
+    from nl2sql_service import mysql_executor, schema_loader
+
+    with patch.object(
+        mysql_executor,
+        "mysql_target_readiness",
+        AsyncMock(return_value={"status": "ok", "issues": []}),
+    ), patch.object(
+        schema_loader,
+        "loader_readiness",
+        MagicMock(return_value={"status": "ok", "issues": []}),
+    ):
+        resp = await client.get("/health")
     data = _ok(resp)
     assert data["status"] == "ok"
+    assert data["provider_config"]["status"] == "ok"
+    assert data["mysql_target"]["status"] == "ok"
+    assert data["schema_assets"]["status"] == "ok"
+    assert "teach_confirmations" in data
 
 
 @pytest.mark.asyncio
 async def test_health_db_unavailable(app) -> None:
     """When the pool is missing the app must still return a degraded-but-200 health response."""
+    from nl2sql_service import mysql_executor, schema_loader
+
     original = getattr(app.state, "pool", None)
     app.state.pool = None
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
-            resp = await c.get("/health")
+            with patch.object(
+                mysql_executor,
+                "mysql_target_readiness",
+                AsyncMock(return_value={"status": "ok", "issues": []}),
+            ), patch.object(
+                schema_loader,
+                "loader_readiness",
+                MagicMock(return_value={"status": "ok", "issues": []}),
+            ):
+                resp = await c.get("/health")
         # /health should report degraded rather than 500
         assert resp.status_code in (200, 503), resp.text
     finally:
         app.state.pool = original
+
+
+@pytest.mark.asyncio
+async def test_teach_metrics_endpoint(client: httpx.AsyncClient) -> None:
+    from nl2sql_service import db
+
+    mock_stats = AsyncMock(
+        return_value={
+            "pending_active_count": 2,
+            "pending_expired_count": 1,
+            "oldest_pending_created_at": "2026-06-01T10:00:00Z",
+            "next_pending_expiry_at": "2026-06-01T10:30:00Z",
+        }
+    )
+    with patch.object(db, "get_pending_teach_confirmation_stats", mock_stats):
+        resp = await client.get("/metrics/teach")
+    data = _ok(resp)
+    assert data["pending_active_count"] == 2
+    assert data["pending_expired_count"] == 1
+    assert data["status"] == "warning"
+    assert len(data["alerts"]) == 1
+    assert data["alerts"][0]["code"] == "TEACH_PENDING_EXPIRED"
+    assert data["thresholds"]["pending_expired_warn_threshold"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_health_config_endpoint(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/health/config")
+    data = _ok(resp)
+    assert data["status"] == "ok"
+    assert any(target["target"] == "LLM_PROVIDER" for target in data["targets"])
+
+
+@pytest.mark.asyncio
+async def test_get_model_routing_endpoint(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/config/model-routing")
+    data = _ok(resp)
+    assert "sql" in data
+    assert "reasoning" in data
+    assert "provider_readiness" in data
+
+
+@pytest.mark.asyncio
+async def test_patch_model_routing_endpoint_updates_runtime_config(client: httpx.AsyncClient) -> None:
+    from nl2sql_service.config import settings
+
+    previous = {
+        "sql_model_provider": settings.sql_model_provider,
+        "sql_model": settings.sql_model,
+        "sql_model_base_url": settings.sql_model_base_url,
+    }
+    try:
+        resp = await client.patch(
+            "/config/model-routing",
+            json={
+                "sql_model_provider": "ollama",
+                "sql_model": "qwen2.5-coder:7b",
+                "sql_model_base_url": "http://localhost:11434",
+            },
+        )
+        data = _ok(resp)
+        assert data["sql"]["provider"] == "ollama"
+        assert data["sql"]["model"] == "qwen2.5-coder:7b"
+    finally:
+        for key, value in previous.items():
+            setattr(settings, key, value)
+        if hasattr(client.app.state, "provider_config_report"):
+            client.app.state.provider_config_report = settings.provider_readiness_report()
+
+
+@pytest.mark.asyncio
+async def test_patch_model_routing_rejects_invalid_config(client: httpx.AsyncClient) -> None:
+    resp = await client.patch(
+        "/config/model-routing",
+        json={
+            "sql_model_provider": "openai",
+            "sql_model": "gpt-4.1-mini",
+        },
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["detail"]["message"] == "Invalid model routing configuration"
+
+
+@pytest.mark.asyncio
+async def test_health_runtime_endpoint(client: httpx.AsyncClient) -> None:
+    from nl2sql_service import mysql_executor, schema_loader
+
+    with patch.object(
+        mysql_executor,
+        "mysql_target_readiness",
+        AsyncMock(
+            return_value={
+                "status": "ok",
+                "host": "localhost",
+                "port": 3306,
+                "schema": "demo",
+                "issues": [],
+            }
+        ),
+    ), patch.object(
+        schema_loader,
+        "loader_readiness",
+        MagicMock(
+            return_value={
+                "status": "ok",
+                "rag_schema_dir": "/tmp/rag_schema",
+                "docs_dir": "/tmp/docs",
+                "entity_count": 5,
+                "relation_count": 4,
+                "missing_docs": [],
+                "issues": [],
+            }
+        ),
+    ):
+        resp = await client.get("/health/runtime")
+    data = _ok(resp)
+    assert data["status"] == "ok"
+    assert data["mysql_target"]["schema"] == "demo"
+    assert data["schema_assets"]["entity_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_health_warns_on_teach_confirmation_alerts(client: httpx.AsyncClient) -> None:
+    from nl2sql_service import db, mysql_executor, schema_loader
+
+    mock_stats = AsyncMock(
+        return_value={
+            "pending_active_count": 30,
+            "pending_expired_count": 2,
+            "oldest_pending_created_at": "2026-06-01T10:00:00Z",
+            "next_pending_expiry_at": "2026-06-01T10:30:00Z",
+        }
+    )
+    with patch.object(db, "get_pending_teach_confirmation_stats", mock_stats), patch.object(
+        mysql_executor,
+        "mysql_target_readiness",
+        AsyncMock(return_value={"status": "ok", "issues": []}),
+    ), patch.object(
+        schema_loader,
+        "loader_readiness",
+        MagicMock(return_value={"status": "ok", "issues": []}),
+    ):
+        resp = await client.get("/health")
+    data = _ok(resp)
+    assert data["status"] == "warning"
+    assert data["teach_confirmations"]["status"] == "warning"
+    assert len(data["teach_confirmations"]["alerts"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_health_errors_on_runtime_dependency_failure(client: httpx.AsyncClient) -> None:
+    from nl2sql_service import mysql_executor, schema_loader
+
+    with patch.object(
+        mysql_executor,
+        "mysql_target_readiness",
+        AsyncMock(
+            return_value={
+                "status": "error",
+                "issues": [{"code": "MYSQL_DRIVER_MISSING", "message": "aiomysql missing"}],
+            }
+        ),
+    ), patch.object(
+        schema_loader,
+        "loader_readiness",
+        MagicMock(return_value={"status": "ok", "issues": []}),
+    ):
+        resp = await client.get("/health")
+    data = _ok(resp)
+    assert data["status"] == "error"
+    assert data["mysql_target"]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_teach_pending_list_endpoint(client: httpx.AsyncClient) -> None:
+    from nl2sql_service import db
+
+    mock_list = AsyncMock(
+        return_value=[
+            {
+                "token": "abc123",
+                "instruction_type": "table_relationship",
+                "content": "employee.employee_id = contact.id",
+                "tables_affected": ["employee", "contact"],
+                "source_query": None,
+                "conflicting_id": 12,
+                "created_at": "2026-06-01T10:00:00Z",
+                "expires_at": "2026-06-01T10:30:00Z",
+                "is_expired": False,
+            }
+        ]
+    )
+    mock_stats = AsyncMock(
+        return_value={
+            "pending_active_count": 1,
+            "pending_expired_count": 0,
+            "oldest_pending_created_at": "2026-06-01T10:00:00Z",
+            "next_pending_expiry_at": "2026-06-01T10:30:00Z",
+        }
+    )
+    with patch.object(db, "list_pending_teach_confirmations", mock_list), patch.object(
+        db, "get_pending_teach_confirmation_stats", mock_stats
+    ):
+        resp = await client.get("/teach/pending?limit=20&include_expired=false")
+    data = _ok(resp)
+    assert data["results"][0]["token"] == "abc123"
+    assert data["stats"]["pending_active_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_teach_pending_cleanup_endpoint(client: httpx.AsyncClient) -> None:
+    from nl2sql_service import db
+
+    mock_cleanup = AsyncMock(return_value=3)
+    mock_stats = AsyncMock(
+        return_value={
+            "pending_active_count": 2,
+            "pending_expired_count": 0,
+            "oldest_pending_created_at": "2026-06-01T10:00:00Z",
+            "next_pending_expiry_at": "2026-06-01T10:30:00Z",
+        }
+    )
+    with patch.object(db, "cleanup_pending_teach_confirmations", mock_cleanup), patch.object(
+        db, "get_pending_teach_confirmation_stats", mock_stats
+    ):
+        resp = await client.post("/teach/pending/cleanup")
+    data = _ok(resp)
+    assert data["deleted"] == 3
+    assert data["stats"]["pending_expired_count"] == 0
 
 
 # ---------------------------------------------------------------------------

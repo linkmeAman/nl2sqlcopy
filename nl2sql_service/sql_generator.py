@@ -16,7 +16,7 @@ from nl2sql_service.cache import sql_cache
 from nl2sql_service.cache import semantic_sql_cache
 from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.config import Settings, settings as default_settings
-from nl2sql_service.model_client import get_model_client
+from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import (
     CacheSource,
     GenerateSqlClarification,
@@ -146,19 +146,23 @@ _COLUMN_NAME_SKIP_KEYWORDS = {
     "YEAR",
 }
 _RECENT_QUERY_TERMS = ("recent", "latest", "newest", "last")
-_PAYMENT_QUERY_RE = re.compile(r"\bpayments?\b", re.IGNORECASE)
 _COUNT_RE = re.compile(r"\b(\d{1,3})\b")
+_RECENT_LIST_QUERY_RE = re.compile(
+    r"\b(?:show|list|get|fetch|display|find)\b.*\b(?:recent|latest|newest|last)\b"
+    r"|\b(?:recent|latest|newest|last)\b.*\b(?:show|list|get|fetch|display|find)\b"
+    r"|\b(?:recent|latest|newest|last)\b",
+    re.IGNORECASE,
+)
+_COMPLEX_QUERY_RE = re.compile(
+    r"\b(?:count|sum|average|avg|total|revenue|group by|per|by status|by month)\b",
+    re.IGNORECASE,
+)
 _FINANCIAL_QUERY_TERMS = (
     "amount",
     "balance",
-    "billing",
-    "invoice",
-    "invoices",
+    "cost",
+    "fee",
     "paid",
-    "payment",
-    "payments",
-    "receipt",
-    "revenue",
     "total",
 )
 _AUDIT_QUERY_TERMS = (
@@ -170,16 +174,6 @@ _AUDIT_QUERY_TERMS = (
     "modified by",
     "updated",
     "updated by",
-)
-_INQUIRY_QUERY_TERMS = (
-    "enquiries",
-    "enquiry",
-    "inquiries",
-    "inquiry",
-    "lead",
-    "leads",
-    "prospect",
-    "prospects",
 )
 COLUMN_SELECTION_RULE = """COLUMN SELECTION RULE:
  For listing queries (show, list, find, get, fetch):
@@ -201,22 +195,16 @@ def _quote_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
 
 
-def _query_requests_recent_payment(query: str) -> bool:
-    query_lower = query.lower()
-    return bool(_PAYMENT_QUERY_RE.search(query_lower)) and any(
-        term in query_lower for term in _RECENT_QUERY_TERMS
-    )
+def is_deterministic_generation_candidate(query: str) -> bool:
+    return bool(_RECENT_LIST_QUERY_RE.search(query)) and not _COMPLEX_QUERY_RE.search(query)
 
 
-def _deterministic_limit(query: str, top_k: int) -> int:
+def _deterministic_limit(query: str, top_k: int, target_table: str | None = None) -> int:
     match = _COUNT_RE.search(query)
     if match:
         return max(1, min(int(match.group(1)), 50))
-    if re.search(r"\bpayment\b", query, flags=re.IGNORECASE) and not re.search(
-        r"\bpayments\b",
-        query,
-        flags=re.IGNORECASE,
-    ):
+
+    if target_table and _query_mentions_table_form(query, target_table, plural=False):
         return 1
     return max(1, min(top_k, 50))
 
@@ -225,43 +213,147 @@ def _best_recent_order_columns(columns: list[str]) -> list[str]:
     lookup = {column.lower(): column for column in columns}
     ordered: list[str] = []
     for preferred in (
-        "date",
         "created_at",
+        "updated_at",
+        "date",
         "modified_at",
+        "last_updated",
         "id",
     ):
         column = lookup.get(preferred)
         if column:
             ordered.append(column)
+
+    for column in columns:
+        column_lower = column.lower()
+        if column in ordered:
+            continue
+        if any(fragment in column_lower for fragment in ("date", "time", "_at")):
+            ordered.append(column)
+        if len(ordered) >= 4:
+            break
     return ordered
 
 
-def _select_payment_columns(query: str, columns: list[str], max_columns: int = 8) -> list[str]:
-    del query
-    lookup = {column.lower(): column for column in columns}
+def _select_listing_columns(
+    columns: list[str],
+    order_columns: list[str],
+    max_columns: int = 8,
+) -> list[str]:
     selected: list[str] = []
-    for preferred in (
-        "id",
-        "invoice_id",
-        "date",
-        "amount",
-        "actual_amount",
-        "calculated_amount",
-        "receipt",
-        "pay_mode_text",
-        "payment_mode",
-        "pay_mode",
-        "txn_number",
-        "tracking_id",
-        "bank_ref_no",
-        "created_at",
-    ):
-        column = lookup.get(preferred)
-        if column and column not in selected:
+
+    def add(column: str) -> None:
+        if column not in selected and len(selected) < max_columns:
             selected.append(column)
+
+    for column in columns:
+        column_lower = column.lower()
+        if column_lower == "id" or column_lower.endswith("_id"):
+            add(column)
+
+    for column in columns:
+        column_lower = column.lower()
+        if any(
+            fragment in column_lower
+            for fragment in (
+                "name",
+                "title",
+                "subject",
+                "status",
+                "type",
+                "number",
+                "no",
+                "code",
+                "amount",
+                "total",
+            )
+        ):
+            add(column)
+
+    for column in order_columns[:1]:
+        add(column)
+
+    for column in columns:
         if len(selected) >= max_columns:
             break
-    return selected or columns[:max_columns]
+        column_lower = column.lower()
+        if _is_audit_column(column_lower):
+            continue
+        add(column)
+
+    return (selected or columns[:max_columns])[:max_columns]
+
+
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _singularize(term: str) -> str:
+    if len(term) > 3 and term.endswith("ies"):
+        return term[:-3] + "y"
+    if len(term) > 3 and term.endswith("ses"):
+        return term[:-2]
+    if len(term) > 2 and term.endswith("s"):
+        return term[:-1]
+    return term
+
+
+def _pluralize(term: str) -> str:
+    if term.endswith("y") and len(term) > 1 and term[-2] not in "aeiou":
+        return term[:-1] + "ies"
+    if term.endswith("s"):
+        return term + "es"
+    return term + "s"
+
+
+def _table_aliases(table: str) -> set[str]:
+    normalized = _normalize_match_text(table)
+    tokens = [token for token in normalized.split() if token]
+    aliases = {normalized}
+    aliases.update(tokens)
+    aliases.update(_singularize(token) for token in tokens)
+    aliases.update(_pluralize(_singularize(token)) for token in tokens)
+    if len(tokens) > 1:
+        singular_last = _singularize(tokens[-1])
+        aliases.add(" ".join([*tokens[:-1], singular_last]))
+        aliases.add(" ".join([*tokens[:-1], _pluralize(singular_last)]))
+    return {alias for alias in aliases if alias}
+
+
+def _query_mentions_table_form(
+    query: str,
+    table: str,
+    *,
+    plural: bool | None = None,
+) -> bool:
+    query_text = f" {_normalize_match_text(query)} "
+    for alias in _table_aliases(table):
+        if plural is True and alias != _pluralize(_singularize(alias)):
+            continue
+        if plural is False and alias != _singularize(alias):
+            continue
+        if f" {alias} " in query_text:
+            return True
+    return False
+
+
+def _choose_explicit_table(query: str, tables: list[str]) -> str | None:
+    query_text = f" {_normalize_match_text(query)} "
+    scored: list[tuple[int, int, str]] = []
+    for index, table in enumerate(tables):
+        table_normalized = _normalize_match_text(table)
+        score = 0
+        if table_normalized and f" {table_normalized} " in query_text:
+            score += 500 + len(table_normalized)
+        for alias in _table_aliases(table):
+            if f" {alias} " in query_text:
+                score += (700 if " " in alias else 100) + len(alias)
+        if score > 0:
+            scored.append((-score, index, table))
+
+    if not scored:
+        return None
+    return sorted(scored)[0][2]
 
 
 def _has_blocking_warnings(warnings: list[SqlWarning]) -> bool:
@@ -299,33 +391,38 @@ def build_deterministic_sql(
     top_k: int,
 ) -> tuple[str, list[str]] | None:
     """Return validated-template SQL for high-confidence simple intents."""
-    if not _query_requests_recent_payment(query):
+    if not is_deterministic_generation_candidate(query):
         return None
 
-    payment_columns = allowed_columns.get("payment") or allowed_columns.get("Payment")
-    if not payment_columns:
+    tables = list(allowed_columns)
+    target_table = _choose_explicit_table(query, tables)
+    if target_table is None:
         return None
 
-    order_columns = _best_recent_order_columns(payment_columns)
+    columns = allowed_columns.get(target_table) or allowed_columns.get(target_table.lower())
+    if not columns:
+        return None
+
+    order_columns = _best_recent_order_columns(columns)
     if not order_columns:
         return None
 
-    selected_columns = _select_payment_columns(
-        query=query,
-        columns=payment_columns,
+    selected_columns = _select_listing_columns(
+        columns=columns,
+        order_columns=order_columns,
         max_columns=8,
     )
-    for required in order_columns:
-        if required not in selected_columns and len(selected_columns) < 8:
-            selected_columns.append(required)
     if not selected_columns:
         return None
 
-    limit = _deterministic_limit(query, top_k)
+    limit = _deterministic_limit(query, top_k, target_table=target_table)
     select_list = ", ".join(_quote_identifier(column) for column in selected_columns)
     order_by = ", ".join(f"{_quote_identifier(column)} DESC" for column in order_columns)
-    sql = f"SELECT {select_list} FROM payment ORDER BY {order_by} LIMIT {limit}"
-    return sql, ["payment"]
+    sql = (
+        f"SELECT {select_list} FROM {_quote_identifier(target_table)} "
+        f"ORDER BY {order_by} LIMIT {limit}"
+    )
+    return sql, [target_table]
 
 
 def build_sql_prompt(
@@ -468,8 +565,9 @@ async def call_ollama(
 ) -> tuple[str | None, list[SqlWarning]]:
     client = get_model_client(
         settings=settings,
-        model=settings.llm_model,
+        model=settings.sql_model or settings.llm_model,
         default_timeout=settings.llm_timeout,
+        role="sql",
     )
     response = await client.generate(
         prompt=prompt,
@@ -565,7 +663,6 @@ def select_relevant_column_indexes(
     recent_query = any(term in query_lower for term in _RECENT_QUERY_TERMS)
     financial_query = any(term in query_lower for term in _FINANCIAL_QUERY_TERMS)
     audit_query = any(term in query_lower for term in _AUDIT_QUERY_TERMS)
-    inquiry_query = any(term in query_lower for term in _INQUIRY_QUERY_TERMS)
     scored: list[tuple[int, int]] = []
     for index, column in enumerate(columns):
         column_lower = column.lower()
@@ -575,7 +672,6 @@ def select_relevant_column_indexes(
             recent_query=recent_query,
             financial_query=financial_query,
             audit_query=audit_query,
-            inquiry_query=inquiry_query,
         )
         if score > 0:
             scored.append((-score, index))
@@ -598,7 +694,6 @@ def _score_column_for_query(
     recent_query: bool,
     financial_query: bool,
     audit_query: bool,
-    inquiry_query: bool,
 ) -> int:
     score = 0
     mentioned = _query_mentions_column(query_lower, column_lower)
@@ -607,10 +702,8 @@ def _score_column_for_query(
 
     if column_lower == "id":
         score += 130
-    elif column_lower == "invoice_id":
-        score += 120 if financial_query else 60
     elif column_lower == "contact_id":
-        score += 95 if inquiry_query else 65
+        score += 65
     elif column_lower.endswith("_id"):
         score += 45
 
@@ -619,32 +712,15 @@ def _score_column_for_query(
     elif column_lower in {"date", "doi", "doc"}:
         score += 95 if recent_query else 55
     elif column_lower == "allocation_date":
-        score += 100 if inquiry_query and recent_query else 65
+        score += 65
     elif any(fragment in column_lower for fragment in ("date", "time")):
         score += 70 if recent_query else 40
-
-    if inquiry_query and column_lower in {
-        "type",
-        "source",
-        "heard_from",
-        "primary_heard_from",
-        "primary_source",
-        "converted",
-        "allocation_date",
-        "created_at",
-        "doi",
-        "doc",
-    }:
-        score += 75
 
     if any(fragment in column_lower for fragment in ("amount", "total")):
         score += 95 if financial_query else 20
     if column_lower == "balance":
         score += 90 if financial_query else -120
-    if any(
-        fragment in column_lower
-        for fragment in ("receipt", "pay_mode", "payment_mode", "method")
-    ):
+    if any(fragment in column_lower for fragment in ("mode", "method", "reference")):
         score += 80 if financial_query else 30
     if any(fragment in column_lower for fragment in ("reference", "txn", "tracking")):
         score += 55
@@ -655,7 +731,7 @@ def _score_column_for_query(
         )
         score += 70 if status_query else 45
     if "source" in column_lower or column_lower == "heard_from":
-        score += 70 if inquiry_query or "source" in query_lower else 35
+        score += 70 if "source" in query_lower else 35
 
     if _is_audit_column(column_lower) and not (audit_query or mentioned):
         score -= 120
@@ -947,6 +1023,7 @@ REASON: <one sentence explaining the verdict>
         settings=settings,
         model=settings.reasoning_model,
         default_timeout=15,
+        role="reasoning",
     )
     response = await client.generate(
         prompt=prompt,
@@ -1086,7 +1163,9 @@ async def generate_sql(
             )
 
     # Semantic SQL cache: embed the query and look for a near-duplicate hit.
-    if settings.sql_cache_enabled:
+    deterministic_candidate = is_deterministic_generation_candidate(query)
+
+    if settings.sql_cache_enabled and not deterministic_candidate:
         try:
             query_embedding = await _load_query_embedding(query)
             if query_embedding is None:
@@ -1174,6 +1253,7 @@ async def generate_sql(
 
     deterministic_result = await _try_deterministic_generation(
         query=query,
+        pool=pool,
         settings=settings,
         top_k=effective_top_k,
     )
@@ -1195,10 +1275,13 @@ async def generate_sql(
             payload["cache_source"] = CacheSource.NONE.value
             sql_cache.set(query, effective_top_k, payload)
             try:
-                if query_embedding is None:
-                    query_embedding = await _load_query_embedding(query)
                 if query_embedding is not None:
-                    semantic_sql_cache.set(query, effective_top_k, payload, embedding=query_embedding)
+                    semantic_sql_cache.set(
+                        query,
+                        effective_top_k,
+                        payload,
+                        embedding=query_embedding,
+                    )
             except Exception:
                 pass
             try:
@@ -1316,11 +1399,31 @@ async def generate_sql(
 
 async def _try_deterministic_generation(
     query: str,
+    pool: asyncpg.Pool,
     settings: Settings,
     top_k: int,
 ) -> GenerateSqlSuccess | None:
+    if not is_deterministic_generation_candidate(query):
+        return None
+
+    try:
+        search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+        retrieved = await retrieve.retrieve_groups(
+            query=query,
+            top_k=top_k,
+            pool=pool,
+            search_query=search_query,
+        )
+        tables_in_scope = _result_value(retrieved, "tables_in_scope")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Deterministic retrieval failed for query %r: %s", query[:80], exc)
+        return None
+
+    if not tables_in_scope:
+        return None
+
     allowed_columns = await load_columns_for_tables(
-        tables=["payment"],
+        tables=tables_in_scope,
         settings=settings,
     )
     built = build_deterministic_sql(
@@ -1364,7 +1467,7 @@ async def _try_deterministic_generation(
             if warning.code == WarningCode.MYSQL_EXPLAIN_UNAVAILABLE
         ],
         tables_used=validated_tables,
-        matched_groups=["deterministic_payment"],
+        matched_groups=[f"deterministic_{tables_used[0]}"],
         attempt_count=0,
         react_trace=None,
     )

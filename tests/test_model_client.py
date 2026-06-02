@@ -4,7 +4,8 @@ import pytest
 
 from nl2sql_service import sql_generator
 from nl2sql_service.config import settings
-from nl2sql_service.model_client import ModelResponse, OllamaClient
+from nl2sql_service.llm.interfaces import LLMResponse
+from nl2sql_service.llm.providers.ollama import OllamaProvider
 from nl2sql_service.models import WarningCode
 
 
@@ -33,11 +34,11 @@ async def test_ollama_client_generate_success(monkeypatch: pytest.MonkeyPatch) -
             assert timeout == 5
             return FakeResponse()
 
-    from nl2sql_service import model_client
+    from nl2sql_service.llm.providers import ollama
 
-    monkeypatch.setattr(model_client.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(ollama.httpx, "AsyncClient", FakeClient)
 
-    client = OllamaClient("http://ollama", "deepseek-coder:6.7b", default_timeout=60)
+    client = OllamaProvider("http://ollama", "deepseek-coder:6.7b", default_timeout=60)
     response = await client.generate(
         "prompt",
         max_tokens=128,
@@ -55,8 +56,6 @@ async def test_ollama_client_generate_success(monkeypatch: pytest.MonkeyPatch) -
 async def test_ollama_client_timeout_returns_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import model_client
-
     class FakeClient:
         async def __aenter__(self):
             return self
@@ -66,11 +65,15 @@ async def test_ollama_client_timeout_returns_empty(
 
         async def post(self, url: str, json: dict, timeout: int):
             del url, json, timeout
-            raise model_client.httpx.TimeoutException("timeout")
+            from nl2sql_service.llm.providers import ollama
 
-    monkeypatch.setattr(model_client.httpx, "AsyncClient", FakeClient)
+            raise ollama.httpx.TimeoutException("timeout")
 
-    client = OllamaClient("http://ollama", "qwen3:4b", default_timeout=1)
+    from nl2sql_service.llm.providers import ollama
+
+    monkeypatch.setattr(ollama.httpx, "AsyncClient", FakeClient)
+
+    client = OllamaProvider("http://ollama", "qwen3:4b", default_timeout=1)
     response = await client.generate("prompt")
 
     assert response.text == ""
@@ -89,7 +92,7 @@ async def test_sql_wrapper_returns_warning_when_model_client_is_empty(
 
         async def generate(self, **kwargs):
             del kwargs
-            return ModelResponse(text="", provider="fake")
+            return LLMResponse(text="", provider="fake")
 
     monkeypatch.setattr(
         sql_generator,
@@ -112,7 +115,7 @@ async def test_sql_wrapper_maps_timeout_warning(
 
         async def generate(self, **kwargs):
             del kwargs
-            return ModelResponse(
+            return LLMResponse(
                 text="",
                 provider="fake",
                 error_type="timeout",

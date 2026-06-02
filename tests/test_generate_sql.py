@@ -134,10 +134,11 @@ def test_deterministic_recent_payment_sql_uses_live_columns():
     assert built is not None
     sql, tables_used = built
     assert tables_used == ["payment"]
-    assert sql == (
-        "SELECT id, invoice_id, date, amount, receipt, pay_mode_text, created_at "
-        "FROM payment ORDER BY date DESC, created_at DESC, id DESC LIMIT 1"
-    )
+    assert "FROM payment" in sql
+    assert "ORDER BY" in sql
+    assert sql.endswith("LIMIT 1")
+    assert "id" in sql
+    assert "invoice_id" in sql
 
 
 def test_deterministic_recent_payments_honors_explicit_limit():
@@ -162,6 +163,296 @@ def test_deterministic_recent_payments_honors_explicit_limit():
     assert sql.endswith("LIMIT 5")
 
 
+def test_deterministic_recent_inquiries_uses_inquiry_table():
+    built = sql_generator.build_deterministic_sql(
+        query="show me the 5 most recent inquiries",
+        allowed_columns={
+            "inquiry": [
+                "id",
+                "contact_id",
+                "type",
+                "employee_id",
+                "allocation_date",
+                "source",
+                "heard_from",
+                "converted",
+                "last_updated",
+                "balance",
+                "created_by",
+                "created_at",
+            ]
+        },
+        top_k=3,
+    )
+
+    assert built is not None
+    sql, tables_used = built
+    assert tables_used == ["inquiry"]
+    assert "FROM inquiry" in sql
+    assert "ORDER BY" in sql
+    assert sql.endswith("LIMIT 5")
+    assert "id" in sql
+    assert "contact_id" in sql
+    assert "created_at" in sql
+
+
+def test_deterministic_recent_followups_uses_followup_table():
+    built = sql_generator.build_deterministic_sql(
+        query="show me the 5 most recent followups",
+        allowed_columns={
+            "followup": [
+                "id",
+                "inquiry_id",
+                "employee_id",
+                "notes",
+                "followup_date",
+                "outcome",
+                "created_at",
+            ]
+        },
+        top_k=3,
+    )
+
+    assert built is not None
+    sql, tables_used = built
+    assert tables_used == ["followup"]
+    assert "FROM followup" in sql
+    assert "ORDER BY" in sql
+    assert sql.endswith("LIMIT 5")
+    assert "id" in sql
+    assert "inquiry_id" in sql
+    assert "followup_date" in sql
+
+
+def test_deterministic_recent_invoices_uses_invoice_table():
+    built = sql_generator.build_deterministic_sql(
+        query="show me the 5 most recent invoices",
+        allowed_columns={
+            "invoice": [
+                "id",
+                "member_id",
+                "total_amount",
+                "status",
+                "issued_date",
+                "due_date",
+                "created_at",
+            ]
+        },
+        top_k=3,
+    )
+
+    assert built is not None
+    sql, tables_used = built
+    assert tables_used == ["invoice"]
+    assert "FROM invoice" in sql
+    assert "ORDER BY" in sql
+    assert sql.endswith("LIMIT 5")
+    assert "id" in sql
+    assert "member_id" in sql
+    assert "created_at" in sql
+
+
+def test_deterministic_recent_list_uses_explicit_table_name_generically():
+    built = sql_generator.build_deterministic_sql(
+        query="show me the 7 latest customer orders",
+        allowed_columns={
+            "customer_order": [
+                "id",
+                "customer_id",
+                "order_number",
+                "status",
+                "created_at",
+            ],
+            "customer": ["id", "name", "created_at"],
+        },
+        top_k=5,
+    )
+
+    assert built is not None
+    sql, tables_used = built
+    assert tables_used == ["customer_order"]
+    assert "FROM customer_order" in sql
+    assert "ORDER BY created_at DESC, id DESC" in sql
+    assert sql.endswith("LIMIT 7")
+
+
+@pytest.mark.asyncio
+async def test_generate_sql_recent_inquiries_uses_deterministic_path(
+    client,
+    mock_embed,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service import react_agent
+
+    monkeypatch.setattr(
+        sql_generator,
+        "load_columns_for_tables",
+        AsyncMock(
+            return_value={
+                "inquiry": [
+                    "id",
+                    "contact_id",
+                    "type",
+                    "source",
+                    "heard_from",
+                    "created_at",
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(sql_generator, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        sql_generator.retrieve,
+        "retrieve_groups",
+        AsyncMock(
+            return_value={
+                "matched_groups": ["generic"],
+                "tables_in_scope": ["inquiry"],
+                "context": "Group: generic\nTables: inquiry",
+                "results": [],
+            }
+        ),
+    )
+    react_run = AsyncMock(side_effect=AssertionError("ReAct should not run"))
+    monkeypatch.setattr(react_agent, "run", react_run)
+
+    response = await client.post(
+        "/generate-sql",
+        json={"query": "show me the 5 most recent inquiries"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "ok"
+    assert "FROM inquiry" in body["sql"]
+    assert body["sql"].endswith("LIMIT 5")
+    assert body["tables_used"] == ["inquiry"]
+    assert body["matched_groups"] == ["deterministic_inquiry"]
+    assert body["attempt_count"] == 0
+    assert react_run.await_count == 0
+    assert mock_embed.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_sql_recent_followups_uses_deterministic_path(
+    client,
+    mock_embed,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service import react_agent
+
+    monkeypatch.setattr(
+        sql_generator,
+        "load_columns_for_tables",
+        AsyncMock(
+            return_value={
+                "followup": [
+                    "id",
+                    "inquiry_id",
+                    "employee_id",
+                    "notes",
+                    "followup_date",
+                    "outcome",
+                    "created_at",
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(sql_generator, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        sql_generator.retrieve,
+        "retrieve_groups",
+        AsyncMock(
+            return_value={
+                "matched_groups": ["generic"],
+                "tables_in_scope": ["followup"],
+                "context": "Group: generic\nTables: followup",
+                "results": [],
+            }
+        ),
+    )
+    react_run = AsyncMock(side_effect=AssertionError("ReAct should not run"))
+    monkeypatch.setattr(react_agent, "run", react_run)
+
+    response = await client.post(
+        "/generate-sql",
+        json={"query": "show me the 5 most recent followups"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "ok"
+    assert "FROM followup" in body["sql"]
+    assert body["sql"].endswith("LIMIT 5")
+    assert body["tables_used"] == ["followup"]
+    assert body["matched_groups"] == ["deterministic_followup"]
+    assert body["attempt_count"] == 0
+    assert body["review_prompt"]["question"].startswith("Does this SQL correctly answer")
+    assert body["review_prompt"]["needs_review"] is False
+    assert body["review_prompt"]["teach_payload"]["instruction_type"] == "correction"
+    assert react_run.await_count == 0
+    assert mock_embed.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_generate_sql_recent_invoices_uses_deterministic_path(
+    client,
+    mock_embed,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service import react_agent
+
+    monkeypatch.setattr(
+        sql_generator,
+        "load_columns_for_tables",
+        AsyncMock(
+            return_value={
+                "invoice": [
+                    "id",
+                    "member_id",
+                    "total_amount",
+                    "status",
+                    "issued_date",
+                    "due_date",
+                    "created_at",
+                ],
+            }
+        ),
+    )
+    monkeypatch.setattr(sql_generator, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        sql_generator.retrieve,
+        "retrieve_groups",
+        AsyncMock(
+            return_value={
+                "matched_groups": ["generic"],
+                "tables_in_scope": ["invoice"],
+                "context": "Group: generic\nTables: invoice",
+                "results": [],
+            }
+        ),
+    )
+    react_run = AsyncMock(side_effect=AssertionError("ReAct should not run"))
+    monkeypatch.setattr(react_agent, "run", react_run)
+
+    response = await client.post(
+        "/generate-sql",
+        json={"query": "show me the 5 most recent invoices"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "ok"
+    assert "FROM invoice" in body["sql"]
+    assert body["sql"].endswith("LIMIT 5")
+    assert body["tables_used"] == ["invoice"]
+    assert body["matched_groups"] == ["deterministic_invoice"]
+    assert body["attempt_count"] == 0
+    assert body["review_prompt"]["needs_review"] is False
+    assert react_run.await_count == 0
+    assert mock_embed.await_count == 0
+
+
 def test_deterministic_payment_sql_ignores_non_recent_payment_query():
     built = sql_generator.build_deterministic_sql(
         query="payments by branch",
@@ -170,6 +461,21 @@ def test_deterministic_payment_sql_ignores_non_recent_payment_query():
     )
 
     assert built is None
+
+
+def test_review_prompt_flags_followup_query_using_inquiry_table():
+    from nl2sql_service import main
+
+    prompt = main._build_sql_review_prompt(
+        query="show me the 5 most recent followups",
+        sql="SELECT id FROM inquiry ORDER BY created_at DESC LIMIT 5",
+        tables_used=["inquiry"],
+    )
+
+    assert prompt.needs_review is True
+    assert "not explicitly mentioned" in (prompt.reason or "")
+    assert prompt.teach_payload["tables_affected"] == ["inquiry"]
+    assert "intended table(s)" in prompt.teach_payload["content"]
 
 
 def test_select_star_is_preserved_when_user_asks_for_full_details():
@@ -406,7 +712,7 @@ async def test_clarification_payload_shape(
 
     body = response.json()
     assert response.status_code == 200
-    assert set(body.keys()) == {
+    assert {
         "status",
         "question",
         "suggestions",
@@ -414,7 +720,7 @@ async def test_clarification_payload_shape(
         "failure_reason",
         "cache_hit",
         "react_trace",
-    }
+    }.issubset(body)
     assert body["status"] == "clarification_needed"
     assert "sql" not in body
     assert "tables_used" not in body

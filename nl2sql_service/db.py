@@ -116,6 +116,21 @@ CREATE TABLE IF NOT EXISTS nl2sql_user_instructions (
     updated_at        TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS nl2sql_pending_teach_confirmations (
+    token             TEXT PRIMARY KEY,
+    instruction       JSONB NOT NULL,
+    conflicting_id    INTEGER REFERENCES nl2sql_user_instructions(id)
+                      ON DELETE SET NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at        TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS nl2sql_pending_teach_confirmations_expires_idx
+    ON nl2sql_pending_teach_confirmations (expires_at);
+
+CREATE INDEX IF NOT EXISTS nl2sql_pending_teach_confirmations_created_idx
+    ON nl2sql_pending_teach_confirmations (created_at);
+
 CREATE TABLE IF NOT EXISTS nl2sql_request_events (
     id                   BIGSERIAL PRIMARY KEY,
     request_id           TEXT NOT NULL,
@@ -779,6 +794,89 @@ async def list_benchmark_cases(
             )
 
     return [dict(row) for row in rows]
+
+
+async def get_pending_teach_confirmation_stats(pool: asyncpg.Pool) -> dict[str, object]:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE expires_at > NOW())::bigint AS pending_active_count,
+                COUNT(*) FILTER (WHERE expires_at <= NOW())::bigint AS pending_expired_count,
+                MIN(created_at) FILTER (WHERE expires_at > NOW()) AS oldest_pending_created_at,
+                MIN(expires_at) FILTER (WHERE expires_at > NOW()) AS next_pending_expiry_at
+            FROM nl2sql_pending_teach_confirmations
+            """
+        )
+    return {
+        "pending_active_count": int(row["pending_active_count"] if row else 0),
+        "pending_expired_count": int(row["pending_expired_count"] if row else 0),
+        "oldest_pending_created_at": row["oldest_pending_created_at"] if row else None,
+        "next_pending_expiry_at": row["next_pending_expiry_at"] if row else None,
+    }
+
+
+async def list_pending_teach_confirmations(
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 100,
+    include_expired: bool = False,
+) -> list[dict[str, object]]:
+    safe_limit = max(1, min(limit, 500))
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                token,
+                instruction,
+                conflicting_id,
+                created_at,
+                expires_at,
+                expires_at <= NOW() AS is_expired
+            FROM nl2sql_pending_teach_confirmations
+            WHERE $2::boolean = TRUE OR expires_at > NOW()
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            safe_limit,
+            include_expired,
+        )
+
+    results: list[dict[str, object]] = []
+    for row in rows:
+        instruction = row["instruction"]
+        if instruction is None:
+            instruction_data: dict[str, object] = {}
+        else:
+            instruction_data = dict(instruction)
+        results.append(
+            {
+                "token": str(row["token"]),
+                "instruction_type": str(instruction_data.get("instruction_type") or ""),
+                "content": str(instruction_data.get("content") or ""),
+                "tables_affected": list(instruction_data.get("tables_affected") or []),
+                "source_query": instruction_data.get("source_query"),
+                "conflicting_id": row["conflicting_id"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+                "is_expired": bool(row["is_expired"]),
+            }
+        )
+    return results
+
+
+async def cleanup_pending_teach_confirmations(pool: asyncpg.Pool) -> int:
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM nl2sql_pending_teach_confirmations
+            WHERE expires_at <= NOW()
+            """
+        )
+    try:
+        return int(result.split()[-1])
+    except (AttributeError, IndexError, ValueError):
+        return 0
 
 
 def normalize_query_text(query: str) -> str:

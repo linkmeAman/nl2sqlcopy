@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +61,79 @@ class QueryResult(BaseModel):
 
 class QueryResponse(BaseModel):
     results: list[QueryResult]
+
+
+# ---------------------------------------------------------------------------
+# Runtime model routing
+# ---------------------------------------------------------------------------
+
+
+class ModelRoutingPatchRequest(BaseModel):
+    llm_provider: str | None = None
+    llm_model: str | None = None
+    llm_api_key: str | None = None
+    llm_base_url: str | None = None
+    llm_fallback_provider: str | None = None
+    llm_fallback_model: str | None = None
+    llm_fallback_api_key: str | None = None
+    llm_fallback_base_url: str | None = None
+
+    sql_model_provider: str | None = None
+    sql_model: str | None = None
+    sql_model_api_key: str | None = None
+    sql_model_base_url: str | None = None
+    sql_fallback_provider: str | None = None
+    sql_fallback_model: str | None = None
+    sql_fallback_api_key: str | None = None
+    sql_fallback_base_url: str | None = None
+
+    reasoning_model_provider: str | None = None
+    reasoning_model: str | None = None
+    reasoning_model_api_key: str | None = None
+    reasoning_model_base_url: str | None = None
+    reasoning_fallback_provider: str | None = None
+    reasoning_fallback_model: str | None = None
+    reasoning_fallback_api_key: str | None = None
+    reasoning_fallback_base_url: str | None = None
+
+    query_rewrite_model_provider: str | None = None
+    query_rewrite_model: str | None = None
+    query_rewrite_model_api_key: str | None = None
+    query_rewrite_model_base_url: str | None = None
+    query_rewrite_fallback_provider: str | None = None
+    query_rewrite_fallback_model: str | None = None
+    query_rewrite_fallback_api_key: str | None = None
+    query_rewrite_fallback_base_url: str | None = None
+
+    answer_model_provider: str | None = None
+    answer_model: str | None = None
+    answer_model_api_key: str | None = None
+    answer_model_base_url: str | None = None
+    answer_fallback_provider: str | None = None
+    answer_fallback_model: str | None = None
+    answer_fallback_api_key: str | None = None
+    answer_fallback_base_url: str | None = None
+
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    embedding_api_key: str | None = None
+    embedding_base_url: str | None = None
+    embedding_api_url: str | None = None
+
+    startup_enforcement_mode: str | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class ModelRoutingSnapshot(BaseModel):
+    llm: dict[str, Any]
+    sql: dict[str, Any]
+    reasoning: dict[str, Any]
+    query_rewrite: dict[str, Any]
+    answer: dict[str, Any]
+    embedding: dict[str, Any]
+    startup_enforcement_mode: str
+    provider_readiness: dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +271,15 @@ class ReactTrace(BaseModel):
     final_action: ReActAction
 
 
+class HumanReviewPrompt(BaseModel):
+    question: str
+    accept_label: str = "Looks correct"
+    reject_label: str = "Needs correction"
+    needs_review: bool = False
+    reason: str | None = None
+    teach_payload: dict[str, Any]
+
+
 class GenerateSqlSuccess(BaseModel):
     status: Literal["ok"] = "ok"
     sql: str
@@ -209,6 +291,7 @@ class GenerateSqlSuccess(BaseModel):
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
     stage_latencies_ms: dict[str, int] | None = None
+    review_prompt: HumanReviewPrompt | None = None
 
 
 class GenerateSqlRejected(BaseModel):
@@ -260,6 +343,7 @@ class AskSuccess(BaseModel):
     cache_source: CacheSource = CacheSource.NONE
     react_trace: ReactTrace | None = None
     stage_latencies_ms: dict[str, int] | None = None
+    review_prompt: HumanReviewPrompt | None = None
 
 
 class AskRejected(BaseModel):

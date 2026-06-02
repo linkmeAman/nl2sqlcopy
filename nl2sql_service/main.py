@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -30,6 +32,8 @@ from nl2sql_service import (
 )
 from nl2sql_service.cache import ask_cache
 from nl2sql_service.config import settings
+from nl2sql_service.llm.factory import LLMFactory
+from nl2sql_service.llm import metrics as llm_metrics
 from nl2sql_service.embed import (
     EmbeddingClientError,
     EmbeddingDimensionError,
@@ -55,6 +59,7 @@ from nl2sql_service.models import (
     GenerateSqlResponse,
     GroupEmbeddingStatusResponse,
     GroupQueryResponse,
+    HumanReviewPrompt,
     InstructionType,
     IngestGroupsResponse,
     IngestGroupsRequest,
@@ -63,6 +68,8 @@ from nl2sql_service.models import (
     IngestResponse,
     IngestSchemaRequest,
     IngestTextRequest,
+    ModelRoutingPatchRequest,
+    ModelRoutingSnapshot,
     LearningStatus,
     PatternFeedbackRequest,
     QueryRequest,
@@ -74,7 +81,11 @@ from nl2sql_service.models import (
 )
 from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.rulebook import RULES, get_active_rules, get_config
-from nl2sql_service.sql_generator import generate_sql, review_sql
+from nl2sql_service.sql_generator import (
+    generate_sql,
+    is_deterministic_generation_candidate,
+    review_sql,
+)
 from nl2sql_service.log_config import configure_logging, set_request_id
 
 configure_logging()
@@ -140,6 +151,12 @@ def _ask_success_from_cache(payload: dict) -> AskSuccess:
     react_trace_raw = payload.get("react_trace")
     from nl2sql_service.models import ReactTrace
     react_trace = ReactTrace(**react_trace_raw) if isinstance(react_trace_raw, dict) else react_trace_raw
+    review_prompt_raw = payload.get("review_prompt")
+    review_prompt = (
+        HumanReviewPrompt(**review_prompt_raw)
+        if isinstance(review_prompt_raw, dict)
+        else review_prompt_raw
+    )
     return AskSuccess(
         answer=payload.get("answer", ""),
         sql=payload.get("sql"),
@@ -152,6 +169,7 @@ def _ask_success_from_cache(payload: dict) -> AskSuccess:
         cache_hit=bool(payload.get("cache_hit", False)),
         cache_source=CacheSource(str(payload.get("cache_source", CacheSource.NONE.value))),
         react_trace=react_trace,
+        review_prompt=review_prompt,
     )
 
 
@@ -275,6 +293,109 @@ def _generation_metadata(result: GenerateSqlResponse) -> dict[str, object]:
     return base
 
 
+def _normalize_review_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _review_singularize(term: str) -> str:
+    if len(term) > 3 and term.endswith("ies"):
+        return term[:-3] + "y"
+    if len(term) > 3 and term.endswith("ses"):
+        return term[:-2]
+    if len(term) > 2 and term.endswith("s"):
+        return term[:-1]
+    return term
+
+
+def _review_pluralize(term: str) -> str:
+    if term.endswith("y") and len(term) > 1 and term[-2] not in "aeiou":
+        return term[:-1] + "ies"
+    if term.endswith("s"):
+        return term + "es"
+    return term + "s"
+
+
+def _review_table_aliases(table: str) -> set[str]:
+    normalized = _normalize_review_text(table)
+    tokens = [token for token in normalized.split() if token]
+    aliases = {normalized}
+    aliases.update(tokens)
+    aliases.update(_review_singularize(token) for token in tokens)
+    aliases.update(_review_pluralize(_review_singularize(token)) for token in tokens)
+    if len(tokens) > 1:
+        singular_last = _review_singularize(tokens[-1])
+        aliases.add(" ".join([*tokens[:-1], singular_last]))
+        aliases.add(" ".join([*tokens[:-1], _review_pluralize(singular_last)]))
+    return {alias for alias in aliases if alias}
+
+
+def _query_mentions_table(query: str, table: str) -> bool:
+    query_text = f" {_normalize_review_text(query)} "
+    return any(f" {alias} " in query_text for alias in _review_table_aliases(table))
+
+
+def _build_sql_review_prompt(
+    *,
+    query: str,
+    sql: str,
+    tables_used: list[str],
+) -> HumanReviewPrompt:
+    used_table_mentioned = any(_query_mentions_table(query, table) for table in tables_used)
+    needs_review = bool(tables_used) and not used_table_mentioned
+    reason = None
+    if needs_review:
+        reason = (
+            "The generated table name is not explicitly mentioned in the question. "
+            "Review whether the chosen table matches the intended business term."
+        )
+
+    table_text = ", ".join(tables_used) if tables_used else "the selected tables"
+    content = (
+        f"For the query '{query}', verify whether this SQL uses the correct "
+        f"tables and business meaning. Current SQL: {sql}"
+    )
+    if needs_review:
+        content = (
+            f"For the query '{query}', the generated SQL used {table_text}, "
+            "but the user wording did not explicitly mention that table name. "
+            f"If this is wrong, replace this correction with the intended table(s), "
+            f"columns, or business rule. Incorrect SQL observed: {sql}"
+        )
+
+    return HumanReviewPrompt(
+        question=(
+            "Does this SQL correctly answer the question? "
+            "If not, edit and save the correction so future prompts learn it."
+        ),
+        needs_review=needs_review,
+        reason=reason,
+        teach_payload={
+            "instruction_type": InstructionType.CORRECTION.value,
+            "content": content,
+            "tables_affected": tables_used,
+            "source_query": query,
+            "sql_preview": sql,
+        },
+    )
+
+
+def _attach_review_prompt(
+    result: GenerateSqlResponse,
+    query: str,
+) -> GenerateSqlResponse:
+    if result.status != "ok":
+        return result
+    return result.model_copy(
+        update={
+            "review_prompt": _build_sql_review_prompt(
+                query=query,
+                sql=result.sql,
+                tables_used=result.tables_used,
+            )
+        }
+    )
+
+
 class TraceRecorder:
     """Per-request sanitized trace logger and optional stream queue."""
 
@@ -369,6 +490,26 @@ async def lifespan(app: FastAPI):
     await embed.init_client()
     app.state.pool_reconnect_lock = asyncio.Lock()
     app.state.pool_last_reconnect_attempt = 0.0
+    app.state.provider_config_report = settings.provider_readiness_report()
+    app.state.runtime_readiness_report = await _runtime_readiness_report()
+    if app.state.provider_config_report["status"] == "ok":
+        logger.info("Provider configuration readiness passed.")
+    else:
+        logger.warning(
+            "Provider configuration readiness failed: %s",
+            json.dumps(app.state.provider_config_report["issues"], separators=(",", ":")),
+        )
+    if app.state.runtime_readiness_report["status"] == "ok":
+        logger.info("Runtime dependency readiness passed.")
+    else:
+        logger.warning(
+            "Runtime dependency readiness failed: %s",
+            json.dumps(app.state.runtime_readiness_report, separators=(",", ":")),
+        )
+    _enforce_startup_readiness(
+        app.state.provider_config_report,
+        app.state.runtime_readiness_report,
+    )
     try:
         pool = await db.create_pool()
         await db.bootstrap(pool)
@@ -619,6 +760,218 @@ async def _require_pool(request: Request) -> asyncpg.Pool:
     return pool
 
 
+def _teach_alerts_from_stats(stats: dict[str, object]) -> tuple[str, list[dict[str, object]]]:
+    active_count = int(stats.get("pending_active_count") or 0)
+    expired_count = int(stats.get("pending_expired_count") or 0)
+    alerts: list[dict[str, object]] = []
+
+    if expired_count >= settings.teach_pending_expired_warn_threshold:
+        alerts.append(
+            {
+                "code": "TEACH_PENDING_EXPIRED",
+                "severity": "warning",
+                "message": (
+                    f"{expired_count} expired teach confirmation token(s) are waiting for cleanup."
+                ),
+                "value": expired_count,
+                "threshold": settings.teach_pending_expired_warn_threshold,
+            }
+        )
+
+    if active_count >= settings.teach_pending_active_warn_threshold:
+        alerts.append(
+            {
+                "code": "TEACH_PENDING_BACKLOG",
+                "severity": "warning",
+                "message": (
+                    f"{active_count} active teach confirmation token(s) exceed the backlog threshold."
+                ),
+                "value": active_count,
+                "threshold": settings.teach_pending_active_warn_threshold,
+            }
+        )
+
+    status = "warning" if alerts else "ok"
+    return status, alerts
+
+
+def _merge_health_status(current: str, candidate: str) -> str:
+    order = {"ok": 0, "warning": 1, "error": 2}
+    return candidate if order.get(candidate, 0) > order.get(current, 0) else current
+
+
+def _routing_section(
+    *,
+    provider: str | None,
+    model: str | None,
+    api_key: str | None,
+    base_url: str | None,
+    fallback_provider: str | None = None,
+    fallback_model: str | None = None,
+    fallback_api_key: str | None = None,
+    fallback_base_url: str | None = None,
+) -> dict[str, object]:
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "api_key_configured": bool((api_key or "").strip()),
+        "fallback_provider": fallback_provider,
+        "fallback_model": fallback_model,
+        "fallback_base_url": fallback_base_url,
+        "fallback_api_key_configured": bool((fallback_api_key or "").strip()),
+    }
+
+
+def _model_routing_snapshot() -> ModelRoutingSnapshot:
+    return ModelRoutingSnapshot(
+        llm=_routing_section(
+            provider=settings.llm_provider,
+            model=settings.llm_model,
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+            fallback_provider=settings.llm_fallback_provider,
+            fallback_model=settings.llm_fallback_model,
+            fallback_api_key=settings.llm_fallback_api_key,
+            fallback_base_url=settings.llm_fallback_base_url,
+        ),
+        sql=_routing_section(
+            provider=settings.sql_model_provider or settings.llm_provider,
+            model=settings.sql_model or settings.llm_model,
+            api_key=settings.sql_model_api_key or settings.llm_api_key,
+            base_url=settings.sql_model_base_url or settings.llm_base_url,
+            fallback_provider=settings.sql_fallback_provider or settings.llm_fallback_provider,
+            fallback_model=settings.sql_fallback_model or settings.llm_fallback_model,
+            fallback_api_key=settings.sql_fallback_api_key or settings.llm_fallback_api_key,
+            fallback_base_url=settings.sql_fallback_base_url or settings.llm_fallback_base_url,
+        ),
+        reasoning=_routing_section(
+            provider=settings.reasoning_model_provider or settings.llm_provider,
+            model=settings.reasoning_model,
+            api_key=settings.reasoning_model_api_key or settings.llm_api_key,
+            base_url=settings.reasoning_model_base_url or settings.llm_base_url,
+            fallback_provider=settings.reasoning_fallback_provider or settings.llm_fallback_provider,
+            fallback_model=settings.reasoning_fallback_model or settings.llm_fallback_model,
+            fallback_api_key=settings.reasoning_fallback_api_key or settings.llm_fallback_api_key,
+            fallback_base_url=settings.reasoning_fallback_base_url or settings.llm_fallback_base_url,
+        ),
+        query_rewrite=_routing_section(
+            provider=settings.query_rewrite_model_provider or settings.llm_provider,
+            model=settings.query_rewrite_model,
+            api_key=settings.query_rewrite_model_api_key or settings.llm_api_key,
+            base_url=settings.query_rewrite_model_base_url or settings.llm_base_url,
+            fallback_provider=settings.query_rewrite_fallback_provider or settings.llm_fallback_provider,
+            fallback_model=settings.query_rewrite_fallback_model or settings.llm_fallback_model,
+            fallback_api_key=settings.query_rewrite_fallback_api_key or settings.llm_fallback_api_key,
+            fallback_base_url=settings.query_rewrite_fallback_base_url or settings.llm_fallback_base_url,
+        ),
+        answer=_routing_section(
+            provider=settings.answer_model_provider or settings.reasoning_model_provider or settings.llm_provider,
+            model=settings.answer_model or settings.reasoning_model or settings.llm_model,
+            api_key=settings.answer_model_api_key or settings.reasoning_model_api_key or settings.llm_api_key,
+            base_url=settings.answer_model_base_url or settings.reasoning_model_base_url or settings.llm_base_url,
+            fallback_provider=settings.answer_fallback_provider or settings.llm_fallback_provider,
+            fallback_model=settings.answer_fallback_model or settings.llm_fallback_model,
+            fallback_api_key=settings.answer_fallback_api_key or settings.llm_fallback_api_key,
+            fallback_base_url=settings.answer_fallback_base_url or settings.llm_fallback_base_url,
+        ),
+        embedding=_routing_section(
+            provider=settings.embedding_provider,
+            model=settings.embedding_model,
+            api_key=settings.embedding_api_key,
+            base_url=settings.embedding_base_url or settings.embedding_api_url,
+        ),
+        startup_enforcement_mode=settings.startup_enforcement_mode,
+        provider_readiness=settings.provider_readiness_report(),
+    )
+
+
+def _apply_model_routing_patch(patch: ModelRoutingPatchRequest) -> ModelRoutingSnapshot:
+    updates = patch.model_dump(exclude_unset=True)
+    if not updates:
+        return _model_routing_snapshot()
+
+    snapshot: dict[str, object] = {}
+    for key, value in updates.items():
+        snapshot[key] = getattr(settings, key, None)
+        setattr(settings, key, value)
+
+    if "startup_enforcement_mode" in updates:
+        mode = str(settings.startup_enforcement_mode).strip().lower()
+        if mode not in {"warn", "strict"}:
+            for key, value in snapshot.items():
+                setattr(settings, key, value)
+            raise HTTPException(
+                status_code=422,
+                detail="STARTUP_ENFORCEMENT_MODE must be one of: warn, strict",
+            )
+        settings.startup_enforcement_mode = mode
+
+    report = settings.provider_readiness_report()
+    if report["issues"]:
+        for key, value in snapshot.items():
+            setattr(settings, key, value)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Invalid model routing configuration",
+                "issues": report["issues"],
+            },
+        )
+
+    return _model_routing_snapshot()
+
+
+async def _runtime_readiness_report() -> dict[str, object]:
+    mysql_target = await mysql_executor.mysql_target_readiness(settings)
+    schema_assets = schema_loader.loader_readiness()
+    status = _merge_health_status(
+        str(mysql_target.get("status", "ok")),
+        str(schema_assets.get("status", "ok")),
+    )
+    return {
+        "status": status,
+        "mysql_target": mysql_target,
+        "schema_assets": schema_assets,
+    }
+
+
+def _startup_enforcement_errors(
+    provider_config: dict[str, object],
+    runtime_report: dict[str, object],
+) -> list[str]:
+    errors: list[str] = []
+    if provider_config.get("status") != "ok":
+        errors.append(
+            f"provider config not ready ({len(provider_config.get('issues', []))} issue(s))"
+        )
+    if runtime_report.get("status") != "ok":
+        mysql_target = runtime_report.get("mysql_target", {})
+        schema_assets = runtime_report.get("schema_assets", {})
+        if isinstance(mysql_target, dict) and mysql_target.get("status") != "ok":
+            errors.append(
+                f"MySQL target not ready ({len(mysql_target.get('issues', []))} issue(s))"
+            )
+        if isinstance(schema_assets, dict) and schema_assets.get("status") != "ok":
+            errors.append(
+                f"schema assets not ready ({len(schema_assets.get('issues', []))} issue(s))"
+            )
+    return errors
+
+
+def _enforce_startup_readiness(
+    provider_config: dict[str, object],
+    runtime_report: dict[str, object],
+) -> None:
+    if settings.startup_enforcement_mode != "strict":
+        return
+    errors = _startup_enforcement_errors(provider_config, runtime_report)
+    if errors:
+        raise RuntimeError(
+            "Startup readiness enforcement failed in strict mode: " + "; ".join(errors)
+        )
+
+
 @app.get("/health", tags=["ops"])
 async def health(request: Request) -> dict:
     if request.app.state.pool is None:
@@ -630,7 +983,162 @@ async def health(request: Request) -> dict:
             db_status = "connected"
         except Exception:
             db_status = "unreachable"
-    return {"status": "ok", "db": db_status}
+    health_status = "ok"
+    provider_config = getattr(request.app.state, "provider_config_report", settings.provider_readiness_report())
+    if provider_config.get("status") != "ok":
+        health_status = "error"
+    mysql_target = await mysql_executor.mysql_target_readiness(settings)
+    health_status = _merge_health_status(health_status, str(mysql_target.get("status", "ok")))
+    schema_assets = schema_loader.loader_readiness()
+    health_status = _merge_health_status(health_status, str(schema_assets.get("status", "ok")))
+    teach_status = "unavailable"
+    teach_alerts: list[dict[str, object]] = []
+    pool = request.app.state.pool
+    acquire = getattr(pool, "acquire", None)
+    if pool is not None and acquire is not None and not inspect.iscoroutinefunction(acquire):
+        try:
+            teach_stats = await db.get_pending_teach_confirmation_stats(pool)
+            teach_status, teach_alerts = _teach_alerts_from_stats(teach_stats)
+            if teach_status == "warning":
+                health_status = _merge_health_status(health_status, "warning")
+        except Exception:
+            teach_status = "unavailable"
+    return {
+        "status": health_status,
+        "db": db_status,
+        "provider_config": {
+            "status": provider_config.get("status", "error"),
+            "issue_count": len(provider_config.get("issues", [])),
+        },
+        "mysql_target": {
+            "status": mysql_target.get("status", "error"),
+            "issue_count": len(mysql_target.get("issues", [])),
+        },
+        "schema_assets": {
+            "status": schema_assets.get("status", "error"),
+            "issue_count": len(schema_assets.get("issues", [])),
+        },
+        "teach_confirmations": {
+            "status": teach_status,
+            "alerts": teach_alerts,
+        },
+    }
+
+
+
+
+@app.get("/health/llm", tags=["ops"])
+async def health_llm(role: str = "sql") -> dict[str, object]:
+    allowed_roles = {"sql", "reasoning", "query_rewrite", "answer", "default"}
+    if role not in allowed_roles:
+        raise HTTPException(status_code=422, detail=f"Unsupported LLM health role: {role}")
+
+    model = {
+        "sql": settings.sql_model or settings.llm_model,
+        "reasoning": settings.reasoning_model,
+        "query_rewrite": settings.query_rewrite_model,
+        "answer": settings.answer_model or settings.reasoning_model,
+        "default": settings.llm_model,
+    }[role]
+    timeout = min(settings.llm_timeout, 10)
+    provider = LLMFactory.create_for_role(
+        settings,
+        role=role,
+        model=model,
+        default_timeout=timeout,
+    )
+    result = await provider.health()
+    provider_config = settings.provider_readiness_report()
+    return {
+        "role": role,
+        "provider_config": {
+            "status": provider_config["status"],
+            "issues": [
+                issue
+                for issue in provider_config["issues"]
+                if str(issue.get("target", "")).startswith(role.upper())
+                or issue.get("target") == "LLM_PROVIDER"
+            ],
+        },
+        **result,
+    }
+
+
+@app.get("/health/config", tags=["ops"])
+async def health_config() -> dict[str, object]:
+    return settings.provider_readiness_report()
+
+
+@app.get("/health/runtime", tags=["ops"])
+async def health_runtime() -> dict[str, object]:
+    return await _runtime_readiness_report()
+
+
+@app.get("/config/model-routing", tags=["ops"])
+async def get_model_routing() -> ModelRoutingSnapshot:
+    return _model_routing_snapshot()
+
+
+@app.patch("/config/model-routing", tags=["ops"])
+async def patch_model_routing(body: ModelRoutingPatchRequest) -> ModelRoutingSnapshot:
+    return _apply_model_routing_patch(body)
+
+
+@app.get("/health/vector", tags=["ops"])
+async def health_vector(request: Request) -> dict[str, object]:
+    provider_config = settings.provider_readiness_report()
+    if request.app.state.pool is None:
+        await _try_reconnect_pool(request)
+    if request.app.state.pool is None:
+        return {
+            "status": "warning" if provider_config["status"] == "ok" else "error",
+            "vector_db": settings.vector_provider,
+            "db": "unavailable",
+            "embedding_provider": settings.embedding_provider,
+            "embedding_model": settings.embedding_model,
+            "embedding_dimension": settings.embedding_dimension,
+            "provider_config": provider_config,
+        }
+    try:
+        await asyncio.wait_for(request.app.state.pool.execute("SELECT 1"), timeout=3)
+        return {
+            "status": "ok" if provider_config["status"] == "ok" else "error",
+            "vector_db": settings.vector_provider,
+            "db": "connected",
+            "embedding_provider": settings.embedding_provider,
+            "embedding_model": settings.embedding_model,
+            "embedding_dimension": settings.embedding_dimension,
+            "provider_config": provider_config,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "warning" if provider_config["status"] == "ok" else "error",
+            "vector_db": settings.vector_provider,
+            "db": "unreachable",
+            "error": str(exc),
+            "provider_config": provider_config,
+        }
+
+
+@app.get("/metrics/llm", tags=["ops"])
+async def llm_metrics_endpoint() -> dict[str, object]:
+    return {"results": llm_metrics.snapshot()}
+
+
+@app.get("/metrics/teach", tags=["ops"])
+async def teach_metrics_endpoint(request: Request) -> dict[str, object]:
+    pool = await _require_pool(request)
+    stats = await db.get_pending_teach_confirmation_stats(pool)
+    status, alerts = _teach_alerts_from_stats(stats)
+    return {
+        **stats,
+        "status": status,
+        "alerts": alerts,
+        "thresholds": {
+            "pending_active_warn_threshold": settings.teach_pending_active_warn_threshold,
+            "pending_expired_warn_threshold": settings.teach_pending_expired_warn_threshold,
+        },
+    }
 
 
 @app.get("/telemetry/recent", tags=["ops"])
@@ -1078,6 +1586,32 @@ async def teach_confirm_endpoint(
         )
 
 
+@app.get("/teach/pending", tags=["learning"])
+async def list_pending_teach_confirmations_endpoint(
+    request: Request,
+    limit: int = 100,
+    include_expired: bool = False,
+) -> dict[str, object]:
+    pool = await _require_pool(request)
+    results = await db.list_pending_teach_confirmations(
+        pool,
+        limit=limit,
+        include_expired=include_expired,
+    )
+    stats = await db.get_pending_teach_confirmation_stats(pool)
+    return {"results": results, "stats": stats}
+
+
+@app.post("/teach/pending/cleanup", tags=["learning"])
+async def cleanup_pending_teach_confirmations_endpoint(
+    request: Request,
+) -> dict[str, object]:
+    pool = await _require_pool(request)
+    deleted = await db.cleanup_pending_teach_confirmations(pool)
+    stats = await db.get_pending_teach_confirmation_stats(pool)
+    return {"deleted": deleted, "stats": stats}
+
+
 @app.get("/instructions", tags=["learning"])
 async def list_instructions_endpoint(
     request: Request,
@@ -1197,6 +1731,7 @@ async def generate_sql_endpoint(
         top_k,
         trace_callback=trace_recorder.emit,
     )
+    result = _attach_review_prompt(result, request.query)
     await trace_recorder.emit(
         stage="complete",
         status=result.status,
@@ -1244,6 +1779,7 @@ async def ask_endpoint(
     )
     cache_epoch: int | None = None
     query_embedding: list[float] | None = None
+    deterministic_candidate = is_deterministic_generation_candidate(request.query)
 
     # --- Ask cache: exact match -------------------------------------------------
     if settings.ask_cache_enabled:
@@ -1268,7 +1804,7 @@ async def ask_endpoint(
             return response
 
     # --- Ask cache: semantic match -----------------------------------------------
-    if settings.ask_cache_enabled:
+    if settings.ask_cache_enabled and not deterministic_candidate:
         try:
             query_embedding = await _load_query_embedding(request.query)
             if query_embedding is None:
@@ -1654,7 +2190,7 @@ async def _run_ask_workflow(
             message="Generating final answer from result rows.",
             details={"row_count": len(rows), "columns": columns},
         )
-    if "deterministic_payment" in sql_result.matched_groups:
+    if any(group.startswith("deterministic_") for group in sql_result.matched_groups):
         answer_text = answer_generator.build_fallback_answer(
             query=request.query,
             columns=columns,
@@ -1790,6 +2326,11 @@ async def _run_ask_workflow(
         cache_source=CacheSource.NONE,
         react_trace=sql_result.react_trace,
         stage_latencies_ms={**_merged_sql_latencies, **stage_latencies_ms},
+        review_prompt=_build_sql_review_prompt(
+            query=request.query,
+            sql=capped_sql,
+            tables_used=sql_result.tables_used,
+        ),
     )
     asyncio.create_task(
         _log_request_event(
@@ -1811,11 +2352,14 @@ async def _run_ask_workflow(
             },
         )
     )
+    deterministic_response = any(
+        group.startswith("deterministic_") for group in response.matched_groups
+    )
     if settings.ask_cache_enabled:
         payload = response.model_dump(mode="json")
         payload["cache_hit"] = False
         payload["cache_source"] = CacheSource.NONE.value
-        if query_embedding is None:
+        if query_embedding is None and not deterministic_response:
             try:
                 query_embedding = await _load_query_embedding(request.query)
             except Exception:  # noqa: BLE001
