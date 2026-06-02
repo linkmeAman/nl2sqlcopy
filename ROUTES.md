@@ -35,6 +35,9 @@ Base URL examples assume `http://localhost:8080`.
 - `GET /health/vector`
 - `GET /metrics/llm`
 - `GET /metrics/teach`
+- `GET /logs/days`
+- `GET /logs/recent`
+- `GET /logs/stream`
 - `GET /telemetry/recent`
 - `GET /telemetry/summary`
 - `GET /failures`
@@ -230,6 +233,65 @@ Alert behavior:
 
 - warns when expired pending confirmations meet or exceed `TEACH_PENDING_EXPIRED_WARN_THRESHOLD`
 - warns when active pending confirmations meet or exceed `TEACH_PENDING_ACTIVE_WARN_THRESHOLD`
+
+## GET /logs/days
+
+Lists the active repo-local log file plus rotated daily log files.
+
+Response fields:
+
+- `log_dir`
+- `results`
+
+Each item in `results` includes:
+
+- `day`
+- `file`
+- `path`
+- `size_bytes`
+- `modified_at`
+- `is_active`
+
+## GET /logs/recent
+
+Returns the most recent lines from the selected repo-local log file.
+
+Query params:
+
+- `day` - `current` or `YYYY-MM-DD`
+- `lines` - integer, default `200`
+
+Response fields:
+
+- `day`
+- `file`
+- `path`
+- `lines`
+- `total_lines_returned`
+
+Notes:
+
+- reads from `logs/nl2sql.log` when `day=current`
+- reads from rotated files like `logs/nl2sql.log.2026-06-02` for older days
+- returns raw JSON log lines as strings
+
+## GET /logs/stream
+
+Streams repo-local log lines as NDJSON.
+
+Query params:
+
+- `day` - `current` or `YYYY-MM-DD`
+- `backlog` - integer, default `100`
+- `follow` - boolean, default `true`
+- `poll_interval_ms` - integer, default `1000`
+
+Behavior:
+
+- sends backlog lines first as `{"event":"log_line",...}` records
+- when `day=current`, follows new lines written to the active log file
+- when an older day is selected, the stream sends the requested backlog and ends
+- output media type is `application/x-ndjson`
 
 ## GET /telemetry/recent
 

@@ -6,6 +6,8 @@ from typing import Any
 from nl2sql_service.config import Settings, settings as default_settings
 from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import SqlWarning, WarningCode
+from nl2sql_service.observability.context import emit_current_trace_event
+from nl2sql_service.observability.sanitization import stable_hash, summarize_text
 from nl2sql_service.rulebook import build_governance_block, get_config
 from nl2sql_service.sql_generator import select_relevant_column_indexes
 
@@ -245,6 +247,20 @@ async def call_answer_model(
         default_timeout=settings.answer_timeout,
         role="answer",
     )
+    await emit_current_trace_event(
+        event="prompt_construction",
+        stage="answer_prompt",
+        status="completed",
+        message="Answer prompt constructed.",
+        provider=client.provider_name,
+        model=getattr(client, "model_name", model_name),
+        input_summary={
+            "prompt_hash": stable_hash(prompt),
+            "prompt_chars": len(prompt),
+            "prompt_preview": summarize_text(prompt, limit=min(settings.observability_prompt_char_limit, 500)),
+        },
+        metadata={"prompt_version": "answer_generator.v1"},
+    )
     response = await client.generate(
         prompt=prompt,
         max_tokens=settings.answer_max_tokens,
@@ -268,6 +284,20 @@ async def call_answer_model(
             )
         ]
 
+    await emit_current_trace_event(
+        event="llm_request_completed",
+        stage="answer_generation",
+        status="completed",
+        message="Answer provider returned text.",
+        duration_ms=response.latency_ms,
+        provider=response.provider or client.provider_name,
+        model=response.model_name or getattr(client, "model_name", model_name),
+        token_usage={
+            "total_tokens": response.tokens_used,
+            "prompt_tokens": response.prompt_tokens,
+            "completion_tokens": response.completion_tokens,
+        },
+    )
     return response.text.strip(), []
 
 

@@ -23,6 +23,7 @@ from nl2sql_service.models import (
     SqlWarning,
     WarningCode,
 )
+from nl2sql_service.observability.sanitization import summarize_text
 from nl2sql_service.rulebook import build_governance_block, get_config
 from nl2sql_service.retrieve import retrieve_groups
 from nl2sql_service.sql_generator import (
@@ -50,6 +51,7 @@ async def _emit_trace(
     warning_codes: list[str] | None = None,
     error_source: str | None = None,
     details: dict[str, Any] | None = None,
+    **extra: Any,
 ) -> None:
     if trace is None:
         return
@@ -61,6 +63,7 @@ async def _emit_trace(
         warning_codes=warning_codes,
         error_source=error_source,
         details=details or {},
+        **extra,
     )
 
 
@@ -824,6 +827,7 @@ async def run(
             message=f"Planning iteration {iteration} selected {action.value}.",
             duration_ms=step_duration_ms,
             warning_codes=warning_codes,
+            reasoning_summary=summarize_text(thought),
             details={
                 "iteration": iteration,
                 "action": action.value,
@@ -834,6 +838,8 @@ async def run(
                 "tables_in_scope": state.get("tables_in_scope", []),
                 "tables_used": state.get("tables_used", []),
             },
+            input_summary={"iteration": iteration, "action_input": summarize_text(action_input)},
+            output_summary={"completed_action": completed_action.value},
         )
         steps.append(
             ReActStep(

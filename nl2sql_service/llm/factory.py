@@ -6,6 +6,9 @@ from collections.abc import Iterable
 from nl2sql_service.config import Settings
 from nl2sql_service.llm.interfaces import LLMProvider, LLMResponse, ProviderConfig
 from nl2sql_service.llm.metrics import record_llm_response
+from nl2sql_service.observability.context import emit_current_trace_event
+from nl2sql_service.observability.metrics import observe_provider
+from nl2sql_service.observability.sanitization import stable_hash
 from nl2sql_service.llm.providers import (
     AnthropicProvider,
     GeminiProvider,
@@ -88,7 +91,24 @@ class FallbackLLMProvider(LLMProvider):
         response_format: str | None = None,
     ) -> LLMResponse:
         last_response: LLMResponse | None = None
-        for provider in self._providers:
+        for index, provider in enumerate(self._providers):
+            await emit_current_trace_event(
+                event="llm_request_started",
+                stage="llm_provider",
+                status="started",
+                message="LLM provider request started.",
+                provider=provider.provider_name,
+                model=provider.model_name,
+                retry_count=index,
+                input_summary={
+                    "role": self._role,
+                    "prompt_hash": stable_hash(prompt),
+                    "prompt_chars": len(prompt),
+                    "max_tokens": max_tokens,
+                    "response_format": response_format,
+                },
+                metadata={"fallback_attempt": index > 0},
+            )
             response = await provider.generate(
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -98,7 +118,41 @@ class FallbackLLMProvider(LLMProvider):
                 response_format=response_format,
             )
             record_llm_response(self._role, response)
+            outcome = "ok" if response.text else (response.error_type or "empty")
+            observe_provider(self._role, response.provider or provider.provider_name, response.model_name or provider.model_name, outcome)
+            await emit_current_trace_event(
+                event="llm_request_completed",
+                stage="llm_provider",
+                status="completed" if response.text else "failed",
+                message="LLM provider request completed." if response.text else "LLM provider request failed.",
+                duration_ms=response.latency_ms,
+                provider=response.provider or provider.provider_name,
+                model=response.model_name or provider.model_name,
+                retry_count=response.retries + index,
+                token_usage={
+                    "total_tokens": response.tokens_used,
+                    "prompt_tokens": response.prompt_tokens,
+                    "completion_tokens": response.completion_tokens,
+                },
+                errors=[response.error_message] if response.error_message else [],
+                metadata={
+                    "role": self._role,
+                    "fallback_attempt": index > 0,
+                    "error_type": response.error_type,
+                },
+            )
             if response.text:
+                if index > 0:
+                    await emit_current_trace_event(
+                        event="fallback_provider_used",
+                        stage="llm_provider",
+                        status="completed",
+                        message="Fallback provider produced the response.",
+                        provider=response.provider or provider.provider_name,
+                        model=response.model_name or provider.model_name,
+                        retry_count=index,
+                        metadata={"role": self._role},
+                    )
                 return response
             last_response = response
         return last_response or LLMResponse(

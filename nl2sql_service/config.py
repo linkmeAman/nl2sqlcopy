@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from functools import lru_cache
 
 from pydantic import model_validator
@@ -166,6 +167,22 @@ class Settings(BaseSettings):
     answer_strict_concise: bool = True
     ask_timeout: int = 105
 
+    # Backend observability
+    observability_service_name: str = "nl2sql-api"
+    observability_enabled: bool = True
+    observability_queue_size: int = 5000
+    observability_batch_size: int = 50
+    observability_flush_interval_seconds: float = 0.2
+    observability_prompt_char_limit: int = 4000
+    observability_sql_char_limit: int = 1000
+    observability_sampling_ratio: float = 1.0
+    observability_file_logging_enabled: bool = True
+    observability_log_dir: str = "logs"
+    observability_log_file_basename: str = "nl2sql.log"
+    observability_log_retention_days: int = 30
+    otel_enabled: bool = True
+    otel_exporter_otlp_endpoint: str | None = None
+
     # Teach confirmation operational alerts
     teach_pending_active_warn_threshold: int = 25
     teach_pending_expired_warn_threshold: int = 1
@@ -328,6 +345,13 @@ class Settings(BaseSettings):
             "issues": issues,
             "targets": targets,
         }
+
+    def observability_log_dir_path(self) -> Path:
+        configured = (self.observability_log_dir or "").strip() or "logs"
+        path = Path(configured)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path
 
     @model_validator(mode="after")
     def validate_provider_settings(self) -> "Settings":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import asyncpg
 
 from nl2sql_service import embed
@@ -9,6 +10,9 @@ from nl2sql_service import instruction_store
 from nl2sql_service import pattern_store
 from nl2sql_service.config import settings
 from nl2sql_service.models import GroupQueryResponse, QueryResult
+from nl2sql_service.observability.context import emit_current_trace_event
+from nl2sql_service.observability.metrics import observe_retrieval
+from nl2sql_service.observability.sanitization import summarize_text
 
 _QUERY_SQL = """
 SELECT
@@ -26,15 +30,40 @@ LIMIT $2
 
 
 async def _embed_for_retrieval(text: str) -> list[float]:
+    await emit_current_trace_event(
+        event="embedding_generation_started",
+        stage="retrieval_embedding",
+        status="started",
+        message="Generating embedding for retrieval.",
+        input_summary={"search_query_preview": summarize_text(text)},
+        metadata={"embedding_provider": settings.embedding_provider, "embedding_model": settings.embedding_model},
+    )
+    started = time.monotonic()
     if settings.embed_cache_enabled:
         cached = embed_cache.get(text)
         if cached:
+            await emit_current_trace_event(
+                event="embedding_generation_completed",
+                stage="retrieval_embedding",
+                status="completed",
+                message="Reused cached retrieval embedding.",
+                duration_ms=int((time.monotonic() - started) * 1000),
+                metadata={"cache_hit": True},
+            )
             return cached
 
     vectors = await embed.embed_texts([text])
     vector = vectors[0]
     if settings.embed_cache_enabled:
         embed_cache.set(text, vector)
+    await emit_current_trace_event(
+        event="embedding_generation_completed",
+        stage="retrieval_embedding",
+        status="completed",
+        message="Generated retrieval embedding.",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        metadata={"cache_hit": False, "dimension": len(vector)},
+    )
     return vector
 
 
@@ -50,7 +79,15 @@ async def retrieve(
     Similarity is cosine similarity expressed as ``1 - cosine_distance``,
     so 1.0 is an exact match and −1.0 is the opposite direction.
     """
+    retrieval_started = time.monotonic()
     query_vec = await _embed_for_retrieval(search_query or query)
+    await emit_current_trace_event(
+        event="vector_search_started",
+        stage="vector_search",
+        status="started",
+        message="Vector search started.",
+        metadata={"top_k": top_k, "search_query_preview": summarize_text(search_query or query)},
+    )
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(_QUERY_SQL, query_vec, top_k)
@@ -76,6 +113,18 @@ async def retrieve(
             )
         )
 
+    observe_retrieval("completed")
+    await emit_current_trace_event(
+        event="vector_search_completed",
+        stage="vector_search",
+        status="completed",
+        message="Vector search completed.",
+        duration_ms=int((time.monotonic() - retrieval_started) * 1000),
+        output_summary={
+            "retrieved_chunks": len(results),
+            "similarity_scores": [round(result.similarity, 4) for result in results],
+        },
+    )
     return results
 
 
@@ -115,7 +164,15 @@ async def retrieve_groups(
       from all matched groups, preserving insertion order.
     * ``context`` – formatted multi-block string ready to paste into an LLM prompt.
     """
+    retrieval_started = time.monotonic()
     query_vec = await _embed_for_retrieval(search_query or query)
+    await emit_current_trace_event(
+        event="vector_search_started",
+        stage="schema_retrieval",
+        status="started",
+        message="Schema-group vector search started.",
+        metadata={"top_k": top_k, "search_query_preview": summarize_text(search_query or query)},
+    )
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(_GROUP_QUERY_SQL, query_vec, top_k)
@@ -196,6 +253,24 @@ async def retrieve_groups(
         if instruction_text:
             context = instruction_text + "\n\n" + context
 
+    await emit_current_trace_event(
+        event="vector_search_completed",
+        stage="schema_retrieval",
+        status="completed",
+        message="Schema-group vector search completed.",
+        duration_ms=int((time.monotonic() - retrieval_started) * 1000),
+        output_summary={
+            "matched_groups": matched_groups,
+            "selected_tables": list(seen_tables),
+            "retrieved_chunks": len(results),
+            "similarity_scores": [round(result.similarity, 4) for result in results],
+        },
+        metadata={
+            "embedding_provider": settings.embedding_provider,
+            "embedding_model": settings.embedding_model,
+        },
+    )
+    observe_retrieval("completed")
     return GroupQueryResponse(
         matched_groups=matched_groups,
         tables_in_scope=list(seen_tables),

@@ -104,8 +104,10 @@ inspect or patch the active process routing at runtime.
 - `GET /config/model-routing`, `PATCH /config/model-routing`
   - inspect and patch the live task-to-model routing used by SQL, reasoning,
     query rewrite, answer, embedding, and fallback selection
-- `GET /metrics/llm`, `GET /metrics/teach`
-  - surface provider usage metrics and teach-confirmation operational drift
+- `GET /metrics/llm`, `GET /metrics/teach`, `GET /metrics/prometheus`
+  - surface provider usage metrics, teach-confirmation operational drift, and Prometheus-formatted backend observability metrics
+- `GET /logs/days`, `GET /logs/recent`, `GET /logs/stream`
+  - inspect repo-local day-wise JSON log files and tail the active log over HTTP
 - `GET /telemetry/recent`, `GET /telemetry/summary`, `GET /telemetry/trace/{request_id}`
   - inspect request outcomes, aggregate KPIs, and per-request stage traces
 - `GET /failures`
@@ -163,9 +165,9 @@ curl -N -s -X POST http://localhost:8080/ask/stream \
 Example NDJSON lines:
 
 ```json
-{"event":"started","message":"Received question.","query":"newest payment","top_k":5,"request_id":"req-demo"}
-{"event":"trace","request_id":"req-demo","seq":2,"layer":"nl2sql-service","stage":"schema_retrieval","status":"completed","message":"Retrieved 3 table(s) for SQL planning.","duration_ms":42,"warning_codes":[],"error_source":null,"details":{"tables_in_scope":["payment"]}}
-{"event":"final","response":{"status":"ok","answer":"...","sql":"SELECT ...","warnings":[]}}
+{"event":"started","request_id":"req-demo","trace_id":"trace-demo","workflow_id":"req-demo","message":"Received question.","query":"newest payment","top_k":5}
+{"event":"trace","request_id":"req-demo","trace_id":"trace-demo","workflow_id":"req-demo","seq":2,"layer":"nl2sql-service","stage":"schema_retrieval","status":"completed","message":"Schema-group vector search completed.","provider":"custom","model":"bge-large-en-v1.5","duration_ms":42,"warning_codes":[],"error_source":null,"output_summary":{"matched_groups":["billing"],"selected_tables":["payment"]},"metadata":{"details":{"top_k":5}}}
+{"event":"final","request_id":"req-demo","trace_id":"trace-demo","workflow_id":"req-demo","response":{"status":"ok","request_id":"req-demo","trace_id":"trace-demo","workflow_id":"req-demo","answer":"...","sql":"SELECT ...","warnings":[]}}
 ```
 
 The stream has explicit service timeout handling. If SQL generation, MySQL
@@ -186,15 +188,37 @@ Shared event shape:
 ```json
 {
   "request_id": "req-demo",
+  "trace_id": "otel-trace-id",
+  "correlation_id": "corr-123",
+  "session_id": "session-123",
+  "workflow_id": "req-demo",
   "seq": 1,
+  "event": "request_received",
   "layer": "nl2sql-service",
   "stage": "request_received",
   "status": "started",
   "message": "Received ask request.",
+  "span_id": "otel-span-id",
+  "parent_span_id": null,
   "duration_ms": null,
+  "provider": null,
+  "model": null,
+  "retry_count": 0,
+  "reasoning_summary": null,
+  "input_summary": {
+    "query_preview": "newest payment",
+    "top_k": 5
+  },
+  "output_summary": {},
   "warning_codes": [],
   "error_source": null,
+  "token_usage": {},
+  "errors": [],
   "details": {},
+  "metadata": {},
+  "started_at": "2026-06-02T08:00:00Z",
+  "ended_at": null,
+  "schema_version": "nl2sql.observability.v1",
   "created_at": "2026-05-25T00:00:00Z"
 }
 ```
@@ -207,6 +231,43 @@ write, and complete.
 Trace output is sanitized. It may include action summaries, observations, SQL
 previews, timings, warning codes, and provider/model errors. It must not expose
 hidden reasoning/thought text.
+
+The current backend implementation also adds:
+
+- request-scoped `trace_id`, `correlation_id`, `session_id`, and `workflow_id`
+- async trace persistence through the in-process observability pipeline
+- safe `reasoning_summary`, `input_summary`, `output_summary`, and `token_usage`
+- provider and fallback instrumentation for LLM and embedding calls
+- Prometheus metrics for request, stage, retrieval, and provider activity
+- optional OpenTelemetry bootstrap through the `otel_*` settings
+
+## Observability Configuration
+
+Relevant backend settings now include:
+
+```env
+OBSERVABILITY_ENABLED=true
+OBSERVABILITY_SERVICE_NAME=nl2sql-api
+OBSERVABILITY_QUEUE_SIZE=5000
+OBSERVABILITY_BATCH_SIZE=50
+OBSERVABILITY_FLUSH_INTERVAL_SECONDS=0.2
+OBSERVABILITY_PROMPT_CHAR_LIMIT=4000
+OBSERVABILITY_SQL_CHAR_LIMIT=1000
+OBSERVABILITY_FILE_LOGGING_ENABLED=true
+OBSERVABILITY_LOG_DIR=logs
+OBSERVABILITY_LOG_FILE_BASENAME=nl2sql.log
+OBSERVABILITY_LOG_RETENTION_DAYS=30
+OTEL_ENABLED=true
+OTEL_EXPORTER_OTLP_ENDPOINT=
+```
+
+When the OTLP exporter endpoint is not set, the service still emits structured
+JSON logs, persisted trace events, and Prometheus metrics locally.
+
+When `OBSERVABILITY_FILE_LOGGING_ENABLED=true`, the service also writes JSON
+logs into the repo-local `logs/` directory. The active file is
+`logs/nl2sql.log`, and older files rotate at midnight into day-wise files such
+as `logs/nl2sql.log.2026-06-02`. By default, the service keeps 30 daily files.
 
 ## Failure Context And Teaching
 
@@ -303,6 +364,8 @@ SQL_CACHE_ENABLED=true
 ASK_CACHE_ENABLED=true
 ASK_CACHE_SEMANTIC_THRESHOLD=0.97
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
+OBSERVABILITY_LOG_DIR=logs
+OBSERVABILITY_LOG_RETENTION_DAYS=30
 ```
 
 ## Production Env Contract
@@ -385,6 +448,16 @@ curl -s 'http://localhost:8080/health/runtime' | python -m json.tool
 curl -s 'http://localhost:8080/health/llm?role=sql' | python -m json.tool
 curl -s 'http://localhost:8080/health/vector' | python -m json.tool
 curl -s 'http://localhost:8080/metrics/llm' | python -m json.tool
+```
+
+Inspect repo-local daily logs:
+
+```bash
+ls -lh logs/
+tail -f logs/nl2sql.log
+curl -s 'http://localhost:8080/logs/days' | python -m json.tool
+curl -s 'http://localhost:8080/logs/recent?day=current&lines=50' | python -m json.tool
+curl -N -s 'http://localhost:8080/logs/stream?day=current&backlog=20&follow=true'
 ```
 
 `/health` now includes compact summaries for PostgreSQL connectivity, provider

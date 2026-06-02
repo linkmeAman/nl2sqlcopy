@@ -134,6 +134,10 @@ CREATE INDEX IF NOT EXISTS nl2sql_pending_teach_confirmations_created_idx
 CREATE TABLE IF NOT EXISTS nl2sql_request_events (
     id                   BIGSERIAL PRIMARY KEY,
     request_id           TEXT NOT NULL,
+    trace_id             TEXT,
+    correlation_id       TEXT,
+    session_id           TEXT,
+    workflow_id          TEXT,
     endpoint             TEXT NOT NULL,
     query_text           TEXT,
     top_k                INTEGER,
@@ -210,14 +214,21 @@ CREATE INDEX IF NOT EXISTS nl2sql_query_cache_embedding_hnsw_idx
 CREATE TABLE IF NOT EXISTS nl2sql_failure_log (
     id                BIGSERIAL PRIMARY KEY,
     request_id        TEXT NOT NULL,
+    trace_id          TEXT,
+    correlation_id    TEXT,
+    session_id        TEXT,
+    workflow_id       TEXT,
     endpoint          TEXT NOT NULL,
     query_text        TEXT NOT NULL,
     warning_codes     JSONB NOT NULL DEFAULT '[]'::jsonb,
     error_source      TEXT,
+    failure_type      TEXT,
+    root_cause        TEXT,
     sql_preview       TEXT,
     tables_attempted  TEXT[] NOT NULL DEFAULT '{{}}',
     latency_ms        INTEGER NOT NULL DEFAULT 0,
     suggest_teach     JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    failure_details   JSONB NOT NULL DEFAULT '{{}}'::jsonb,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -230,15 +241,34 @@ CREATE INDEX IF NOT EXISTS nl2sql_failure_log_endpoint_idx
 CREATE TABLE IF NOT EXISTS nl2sql_trace_events (
     id              BIGSERIAL PRIMARY KEY,
     request_id      TEXT NOT NULL,
+    trace_id        TEXT,
+    correlation_id  TEXT,
+    session_id      TEXT,
+    workflow_id     TEXT,
     seq             INTEGER NOT NULL,
+    event           TEXT,
     layer           TEXT NOT NULL,
     stage           TEXT NOT NULL,
     status          TEXT NOT NULL,
     message         TEXT NOT NULL,
+    span_id         TEXT,
+    parent_span_id  TEXT,
     duration_ms     INTEGER,
+    provider        TEXT,
+    model           TEXT,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    reasoning_summary TEXT,
+    input_summary   JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    output_summary  JSONB NOT NULL DEFAULT '{{}}'::jsonb,
     warning_codes   JSONB NOT NULL DEFAULT '[]'::jsonb,
     error_source    TEXT,
+    token_usage     JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    errors          JSONB NOT NULL DEFAULT '[]'::jsonb,
     details         JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    metadata        JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+    started_at      TIMESTAMPTZ,
+    ended_at        TIMESTAMPTZ,
+    schema_version  TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (request_id, seq)
 );
@@ -248,6 +278,39 @@ CREATE INDEX IF NOT EXISTS nl2sql_trace_events_request_idx
 
 CREATE INDEX IF NOT EXISTS nl2sql_trace_events_created_idx
     ON nl2sql_trace_events (created_at DESC);
+
+ALTER TABLE nl2sql_request_events ADD COLUMN IF NOT EXISTS trace_id TEXT;
+ALTER TABLE nl2sql_request_events ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+ALTER TABLE nl2sql_request_events ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE nl2sql_request_events ADD COLUMN IF NOT EXISTS workflow_id TEXT;
+
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS trace_id TEXT;
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS workflow_id TEXT;
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS failure_type TEXT;
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS root_cause TEXT;
+ALTER TABLE nl2sql_failure_log ADD COLUMN IF NOT EXISTS failure_details JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS trace_id TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS correlation_id TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS workflow_id TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS event TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS span_id TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS parent_span_id TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS provider TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS reasoning_summary TEXT;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS input_summary JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS output_summary JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS token_usage JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS errors JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ;
+ALTER TABLE nl2sql_trace_events ADD COLUMN IF NOT EXISTS schema_version TEXT;
 """
 
 
@@ -329,6 +392,10 @@ async def insert_request_event(
     pool: asyncpg.Pool,
     *,
     request_id: str,
+    trace_id: str | None = None,
+    correlation_id: str | None = None,
+    session_id: str | None = None,
+    workflow_id: str | None = None,
     endpoint: str,
     query_text: str,
     top_k: int | None,
@@ -344,6 +411,10 @@ async def insert_request_event(
     sql = """
         INSERT INTO nl2sql_request_events (
             request_id,
+            trace_id,
+            correlation_id,
+            session_id,
+            workflow_id,
             endpoint,
             query_text,
             top_k,
@@ -355,12 +426,16 @@ async def insert_request_event(
             error_source,
             metadata
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $11::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15::jsonb)
     """
     async with pool.acquire() as conn:
         await conn.execute(
             sql,
             request_id,
+            trace_id,
+            correlation_id,
+            session_id,
+            workflow_id,
             endpoint,
             query_text,
             top_k,
@@ -378,14 +453,21 @@ async def insert_failure_log(
     pool: asyncpg.Pool,
     *,
     request_id: str,
+    trace_id: str | None = None,
+    correlation_id: str | None = None,
+    session_id: str | None = None,
+    workflow_id: str | None = None,
     endpoint: str,
     query_text: str,
     warning_codes: list[str],
     error_source: str | None,
+    failure_type: str | None = None,
+    root_cause: str | None = None,
     sql_preview: str | None,
     tables_attempted: list[str],
     latency_ms: int,
     suggest_teach: dict,
+    failure_details: dict | None = None,
 ) -> None:
     """Persist a failed request into the dedicated failure log table."""
     try:
@@ -394,26 +476,40 @@ async def insert_failure_log(
                 """
                 INSERT INTO nl2sql_failure_log (
                     request_id,
+                    trace_id,
+                    correlation_id,
+                    session_id,
+                    workflow_id,
                     endpoint,
                     query_text,
                     warning_codes,
                     error_source,
+                    failure_type,
+                    root_cause,
                     sql_preview,
                     tables_attempted,
                     latency_ms,
-                    suggest_teach
+                    suggest_teach,
+                    failure_details
                 )
-                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7::text[], $8, $9::jsonb)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::text[], $14, $15::jsonb, $16::jsonb)
                 """,
                 request_id,
+                trace_id,
+                correlation_id,
+                session_id,
+                workflow_id,
                 endpoint,
                 query_text,
                 json.dumps(warning_codes),
                 error_source,
+                failure_type,
+                root_cause,
                 sql_preview or "",
                 tables_attempted,
                 latency_ms,
                 json.dumps(suggest_teach),
+                json.dumps(failure_details or {}),
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to write failure log entry: %s", exc)
@@ -423,15 +519,34 @@ async def insert_trace_event(
     pool: asyncpg.Pool,
     *,
     request_id: str,
+    trace_id: str | None = None,
+    correlation_id: str | None = None,
+    session_id: str | None = None,
+    workflow_id: str | None = None,
     seq: int,
+    event: str | None = None,
     layer: str,
     stage: str,
     status: str,
     message: str,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
     duration_ms: int | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    retry_count: int = 0,
+    reasoning_summary: str | None = None,
+    input_summary: dict | None = None,
+    output_summary: dict | None = None,
     warning_codes: list[str] | None = None,
     error_source: str | None = None,
+    token_usage: dict | None = None,
+    errors: list[str] | None = None,
     details: dict | None = None,
+    metadata: dict | None = None,
+    started_at: str | None = None,
+    ended_at: str | None = None,
+    schema_version: str | None = None,
 ) -> None:
     """Persist one sanitized per-stage trace event for request debugging."""
     async with pool.acquire() as conn:
@@ -439,29 +554,67 @@ async def insert_trace_event(
             """
             INSERT INTO nl2sql_trace_events (
                 request_id,
+                trace_id,
+                correlation_id,
+                session_id,
+                workflow_id,
                 seq,
+                event,
                 layer,
                 stage,
                 status,
                 message,
+                span_id,
+                parent_span_id,
                 duration_ms,
+                provider,
+                model,
+                retry_count,
+                reasoning_summary,
+                input_summary,
+                output_summary,
                 warning_codes,
                 error_source,
-                details
+                token_usage,
+                errors,
+                details,
+                metadata,
+                started_at,
+                ended_at,
+                schema_version
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10::jsonb)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20::jsonb, $21::jsonb, $22, $23::jsonb, $24::jsonb, $25::jsonb, $26::jsonb, $27, $28, $29)
             ON CONFLICT (request_id, seq) DO NOTHING
             """,
             request_id,
+            trace_id,
+            correlation_id,
+            session_id,
+            workflow_id,
             seq,
+            event,
             layer,
             stage,
             status,
             message,
+            span_id,
+            parent_span_id,
             duration_ms,
+            provider,
+            model,
+            retry_count,
+            reasoning_summary,
+            json.dumps(input_summary or {}),
+            json.dumps(output_summary or {}),
             json.dumps(warning_codes or []),
             error_source,
+            json.dumps(token_usage or {}),
+            json.dumps(errors or []),
             json.dumps(details or {}),
+            json.dumps(metadata or {}),
+            started_at,
+            ended_at,
+            schema_version,
         )
 
 
@@ -534,15 +687,34 @@ async def list_trace_events(
             """
             SELECT
                 request_id,
+                trace_id,
+                correlation_id,
+                session_id,
+                workflow_id,
                 seq,
+                event,
                 layer,
                 stage,
                 status,
                 message,
+                span_id,
+                parent_span_id,
                 duration_ms,
+                provider,
+                model,
+                retry_count,
+                reasoning_summary,
+                input_summary,
+                output_summary,
                 warning_codes,
                 error_source,
+                token_usage,
+                errors,
                 details,
+                metadata,
+                started_at,
+                ended_at,
+                schema_version,
                 created_at
             FROM nl2sql_trace_events
             WHERE request_id = $1
@@ -569,6 +741,10 @@ async def list_recent_request_events(
                 """
                 SELECT
                     request_id,
+                    trace_id,
+                    correlation_id,
+                    session_id,
+                    workflow_id,
                     endpoint,
                     query_text,
                     top_k,
@@ -593,6 +769,10 @@ async def list_recent_request_events(
                 """
                 SELECT
                     request_id,
+                    trace_id,
+                    correlation_id,
+                    session_id,
+                    workflow_id,
                     endpoint,
                     query_text,
                     top_k,

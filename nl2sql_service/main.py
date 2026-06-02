@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import hashlib
 import inspect
 import json
@@ -10,11 +11,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
-from typing import Annotated, AsyncIterator, Union
+from pathlib import Path
+from typing import Annotated, Any, AsyncIterator, Union
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
 from nl2sql_service import (
     answer_generator,
@@ -87,9 +89,27 @@ from nl2sql_service.sql_generator import (
     review_sql,
 )
 from nl2sql_service.log_config import configure_logging, set_request_id
+from nl2sql_service.observability.context import (
+    bind_context,
+    get_observability_context,
+    set_current_trace_recorder,
+)
+from nl2sql_service.observability.logger import AsyncObservabilityPipeline
+from nl2sql_service.observability.metrics import render_metrics
+from nl2sql_service.observability.middleware import install_request_middleware
+from nl2sql_service.observability.sanitization import sanitize_sql, sanitize_value, stable_hash, summarize_text
+from nl2sql_service.observability.schemas import ExecutionTraceEvent, FailureAnalysis
+from nl2sql_service.observability.tracing import get_span_ids, setup_tracing, start_span
 
-configure_logging()
+configure_logging(
+    enable_file_logging=settings.observability_file_logging_enabled,
+    log_dir=settings.observability_log_dir_path(),
+    log_filename=settings.observability_log_file_basename,
+    retention_days=settings.observability_log_retention_days,
+)
 logger = logging.getLogger(__name__)
+
+_LOG_DAY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _resolve_request_id(candidate: str | None) -> str:
@@ -98,8 +118,140 @@ def _resolve_request_id(candidate: str | None) -> str:
     return uuid.uuid4().hex
 
 
+def _bind_request_context(
+    *,
+    request_id: str,
+    endpoint: str,
+) -> dict[str, str]:
+    context = bind_context(request_id=request_id, workflow_id=request_id, endpoint=endpoint)
+    return {
+        "request_id": context.request_id,
+        "trace_id": context.trace_id,
+        "workflow_id": context.workflow_id,
+    }
+
+
+def _context_metadata() -> dict[str, str | None]:
+    context = get_observability_context()
+    return {
+        "request_id": context.request_id,
+        "trace_id": context.trace_id or None,
+        "correlation_id": context.correlation_id or None,
+        "session_id": context.session_id or None,
+        "workflow_id": context.workflow_id or None,
+    }
+
+
+def _enrich_response_with_context(response: GenerateSqlResponse | AskResponse) -> GenerateSqlResponse | AskResponse:
+    return response.model_copy(update=_context_metadata())
+
+
 def _elapsed_ms(start: float) -> int:
     return max(0, int((time.monotonic() - start) * 1000))
+
+
+def _observability_log_dir() -> Path:
+    return settings.observability_log_dir_path()
+
+
+def _active_log_path() -> Path:
+    return _observability_log_dir() / settings.observability_log_file_basename
+
+
+def _serialize_log_file(path: Path, *, day: str) -> dict[str, object]:
+    stat = path.stat()
+    return {
+        "day": day,
+        "file": path.name,
+        "path": str(path),
+        "size_bytes": stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        "is_active": path == _active_log_path(),
+    }
+
+
+def _resolve_log_file(day: str | None) -> tuple[str, Path]:
+    normalized = (day or "current").strip().lower()
+    if normalized == "current":
+        path = _active_log_path()
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Active log file does not exist yet.")
+        return "current", path
+    if not _LOG_DAY_PATTERN.fullmatch(normalized):
+        raise HTTPException(status_code=422, detail="day must be 'current' or YYYY-MM-DD.")
+    path = _observability_log_dir() / f"{settings.observability_log_file_basename}.{normalized}"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"No log file found for day {normalized}.")
+    return normalized, path
+
+
+def _list_log_files() -> list[dict[str, object]]:
+    log_dir = _observability_log_dir()
+    files: list[tuple[str, Path]] = []
+    active_path = _active_log_path()
+    if active_path.exists():
+        files.append(("current", active_path))
+    prefix = f"{settings.observability_log_file_basename}."
+    if log_dir.exists():
+        for path in sorted(log_dir.glob(f"{settings.observability_log_file_basename}.*"), reverse=True):
+            suffix = path.name.removeprefix(prefix)
+            if _LOG_DAY_PATTERN.fullmatch(suffix):
+                files.append((suffix, path))
+    return [_serialize_log_file(path, day=day) for day, path in files]
+
+
+def _tail_log_lines(path: Path, *, lines: int) -> list[str]:
+    if lines < 1:
+        raise HTTPException(status_code=422, detail="lines must be at least 1.")
+    buffer: deque[str] = deque(maxlen=min(lines, 5000))
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            text = line.rstrip("\n")
+            if text:
+                buffer.append(text)
+    return list(buffer)
+
+
+async def _stream_log_lines(
+    *,
+    path: Path,
+    day: str,
+    backlog: int,
+    follow: bool,
+    poll_interval_ms: int,
+) -> AsyncIterator[str]:
+    if backlog < 0:
+        raise HTTPException(status_code=422, detail="backlog must be zero or greater.")
+    if poll_interval_ms < 200:
+        raise HTTPException(status_code=422, detail="poll_interval_ms must be at least 200.")
+
+    if backlog:
+        for line in _tail_log_lines(path, lines=backlog):
+            yield _json_event("log_line", day=day, file=path.name, line=line)
+
+    if not follow:
+        yield _json_event("complete", day=day, file=path.name)
+        return
+
+    active_path = _active_log_path()
+    cursor = path.stat().st_size if path.exists() else 0
+    while True:
+        current_path = active_path if day == "current" else path
+        if not current_path.exists():
+            await asyncio.sleep(poll_interval_ms / 1000)
+            continue
+        current_size = current_path.stat().st_size
+        if cursor > current_size:
+            cursor = 0
+        if current_size > cursor:
+            with current_path.open(encoding="utf-8", errors="replace") as handle:
+                handle.seek(cursor)
+                for raw_line in handle:
+                    line = raw_line.rstrip("\n")
+                    if line:
+                        yield _json_event("log_line", day=day, file=current_path.name, line=line)
+                cursor = handle.tell()
+        await asyncio.sleep(poll_interval_ms / 1000)
 
 
 def _derive_error_source(warnings: list[SqlWarning]) -> str | None:
@@ -205,8 +357,13 @@ async def _log_request_event(pool: asyncpg.Pool, **kwargs: object) -> None:
         warning_codes = [str(code) for code in kwargs.get("warning_codes", []) or []]
         metadata = dict(kwargs.get("metadata", {}) or {})
         metadata["review_failed"] = WarningCode.REVIEW_FAILED.value in warning_codes
+        metadata.update({key: value for key, value in _context_metadata().items() if value})
         kwargs["warning_codes"] = warning_codes
         kwargs["metadata"] = metadata
+        kwargs.setdefault("trace_id", get_observability_context().trace_id or None)
+        kwargs.setdefault("correlation_id", get_observability_context().correlation_id or None)
+        kwargs.setdefault("session_id", get_observability_context().session_id or None)
+        kwargs.setdefault("workflow_id", get_observability_context().workflow_id or None)
         await db.insert_request_event(pool, **kwargs)
     except Exception:  # noqa: BLE001
         logger.exception("Failed to write request telemetry")
@@ -244,17 +401,31 @@ async def _log_failure_event(
             tables_used=tables_attempted,
             sql_preview=sql_preview,
         )
+        failure_analysis = FailureAnalysis(
+            failure_type=error_source or "unknown",
+            failed_step=endpoint,
+            root_cause="; ".join(warning_codes) if warning_codes else "unknown",
+            latency_breakdown={"total_ms": latency_ms},
+            recommended_fix="Inspect the trace for provider, retrieval, and validation spans.",
+        ).to_dict()
         await db.insert_failure_log(
             pool,
             request_id=request_id,
+            trace_id=get_observability_context().trace_id or None,
+            correlation_id=get_observability_context().correlation_id or None,
+            session_id=get_observability_context().session_id or None,
+            workflow_id=get_observability_context().workflow_id or None,
             endpoint=endpoint,
             query_text=query_text,
             warning_codes=warning_codes,
             error_source=error_source,
+            failure_type=error_source,
+            root_cause=failure_analysis["root_cause"],
             sql_preview=sql_preview,
             tables_attempted=tables_attempted,
             latency_ms=latency_ms,
             suggest_teach=suggestion,
+            failure_details=failure_analysis,
         )
         if trace_emit is not None:
             await trace_emit(
@@ -406,16 +577,20 @@ class TraceRecorder:
         request_id: str,
         layer: str = "nl2sql-service",
         stream_queue: asyncio.Queue[dict[str, object]] | None = None,
+        pipeline: AsyncObservabilityPipeline | None = None,
     ) -> None:
         self.pool = pool
         self.request_id = request_id
         self.layer = layer
         self.stream_queue = stream_queue
+        self.pipeline = pipeline
         self.seq = 0
+        self._stage_started_at: dict[str, str] = {}
 
     async def emit(
         self,
         *,
+        event: str | None = None,
         stage: str,
         status: str,
         message: str,
@@ -423,25 +598,63 @@ class TraceRecorder:
         warning_codes: list[str] | None = None,
         error_source: str | None = None,
         details: dict[str, object] | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        retry_count: int = 0,
+        reasoning_summary: str | None = None,
+        input_summary: dict[str, object] | None = None,
+        output_summary: dict[str, object] | None = None,
+        token_usage: dict[str, object] | None = None,
+        errors: list[str] | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> None:
         self.seq += 1
-        event = {
-            "request_id": self.request_id,
-            "seq": self.seq,
-            "layer": self.layer,
-            "stage": stage,
-            "status": status,
-            "message": message,
-            "duration_ms": duration_ms,
-            "warning_codes": warning_codes or [],
-            "error_source": error_source,
-            "details": details or {},
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        logger.info("NL2SQL TRACE | %s", json.dumps(event, default=str, separators=(",", ":")))
-        await _persist_trace_event(self.pool, event)
+        context = get_observability_context()
+        trace_id, span_id = get_span_ids()
+        now = datetime.now(timezone.utc).isoformat()
+        if status == "started":
+            self._stage_started_at[stage] = now
+        event_payload = ExecutionTraceEvent(
+            request_id=self.request_id,
+            trace_id=trace_id or context.trace_id,
+            correlation_id=context.correlation_id,
+            session_id=context.session_id,
+            workflow_id=context.workflow_id,
+            layer=self.layer,
+            stage=stage,
+            status=status,
+            message=message,
+            seq=self.seq,
+            event=event or stage,
+            span_id=span_id,
+            duration_ms=duration_ms,
+            provider=provider,
+            model=model,
+            retry_count=retry_count,
+            reasoning_summary=summarize_text(reasoning_summary),
+            input_summary=sanitize_value(input_summary or {}) or {},
+            output_summary=sanitize_value(output_summary or {}) or {},
+            warning_codes=[str(code) for code in (warning_codes or [])],
+            error_source=error_source,
+            errors=[str(error) for error in (errors or [])],
+            token_usage=sanitize_value(token_usage or {}) or {},
+            metadata=sanitize_value(
+                {
+                    **(metadata or {}),
+                    "details": details or {},
+                }
+            )
+            or {},
+            started_at=self._stage_started_at.get(stage) if status != "started" else now,
+            ended_at=None if status == "started" else now,
+            service=settings.observability_service_name,
+        ).to_dict()
+        if self.pipeline is not None:
+            await self.pipeline.publish(event_payload)
+        else:
+            await _persist_trace_event(self.pool, event_payload)
         if self.stream_queue is not None:
-            await self.stream_queue.put(event)
+            await self.stream_queue.put(event_payload)
 
 
 async def _persist_trace_event(pool: asyncpg.Pool, event: dict[str, object]) -> None:
@@ -451,19 +664,38 @@ async def _persist_trace_event(pool: asyncpg.Pool, event: dict[str, object]) -> 
         await db.insert_trace_event(
             pool,
             request_id=str(event["request_id"]),
+            trace_id=str(event.get("trace_id") or "") or None,
+            correlation_id=str(event.get("correlation_id") or "") or None,
+            session_id=str(event.get("session_id") or "") or None,
+            workflow_id=str(event.get("workflow_id") or "") or None,
             seq=int(event["seq"]),
+            event=str(event.get("event") or ""),
             layer=str(event["layer"]),
             stage=str(event["stage"]),
             status=str(event["status"]),
             message=str(event["message"]),
+            span_id=str(event.get("span_id") or "") or None,
+            parent_span_id=str(event.get("parent_span_id") or "") or None,
             duration_ms=event.get("duration_ms") if isinstance(event.get("duration_ms"), int) else None,
+            provider=str(event.get("provider") or "") or None,
+            model=str(event.get("model") or "") or None,
+            retry_count=int(event.get("retry_count") or 0),
+            reasoning_summary=str(event.get("reasoning_summary") or "") or None,
+            input_summary=event.get("input_summary") if isinstance(event.get("input_summary"), dict) else {},
+            output_summary=event.get("output_summary") if isinstance(event.get("output_summary"), dict) else {},
             warning_codes=[
                 str(code)
                 for code in (event.get("warning_codes") or [])
                 if code
             ],
             error_source=event.get("error_source") if isinstance(event.get("error_source"), str) else None,
-            details=event.get("details") if isinstance(event.get("details"), dict) else {},
+            token_usage=event.get("token_usage") if isinstance(event.get("token_usage"), dict) else {},
+            errors=[str(error) for error in (event.get("errors") or []) if error],
+            details=event.get("metadata", {}).get("details", {}) if isinstance(event.get("metadata"), dict) else {},
+            metadata=event.get("metadata") if isinstance(event.get("metadata"), dict) else {},
+            started_at=str(event.get("started_at") or "") or None,
+            ended_at=str(event.get("ended_at") or "") or None,
+            schema_version=str(event.get("schema_version") or "") or None,
         )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to write trace event")
@@ -515,6 +747,14 @@ async def lifespan(app: FastAPI):
         await db.bootstrap(pool)
         await ingest.ensure_hnsw_index(pool)
         app.state.pool = pool
+        app.state.observability_pipeline = AsyncObservabilityPipeline(
+            pool=pool,
+            persist_event=_persist_trace_event,
+            queue_size=settings.observability_queue_size,
+            batch_size=settings.observability_batch_size,
+            flush_interval_seconds=settings.observability_flush_interval_seconds,
+        )
+        await app.state.observability_pipeline.start()
         logger.info(
             "Service ready (embedding_dim=%d, top_k=%d)",
             settings.embedding_dimension,
@@ -522,6 +762,7 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:  # noqa: BLE001
         app.state.pool = None
+        app.state.observability_pipeline = None
         logger.error(
             "Database unavailable at startup (%s: %s). "
             "Endpoints will return 503 until the DB is reachable. "
@@ -531,6 +772,9 @@ async def lifespan(app: FastAPI):
         )
     yield
     # Shutdown
+    observability_pipeline = getattr(app.state, "observability_pipeline", None)
+    if observability_pipeline is not None:
+        await observability_pipeline.stop()
     await embed.close_client()
     await db.close_pool()
     logger.info("Service stopped")
@@ -545,6 +789,8 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+setup_tracing(app, settings)
+install_request_middleware(app)
 
 
 @app.get("/cache/stats", tags=["ops"])
@@ -569,6 +815,58 @@ async def cache_clear_endpoint(request: Request) -> dict[str, int]:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to clear DB query cache")
     return cleared
+
+
+@app.get("/metrics/prometheus", tags=["ops"])
+async def prometheus_metrics_endpoint() -> Response:
+    return Response(content=render_metrics(), media_type="text/plain; version=0.0.4")
+
+
+@app.get("/logs/days", tags=["ops"])
+async def list_log_days_endpoint() -> dict[str, object]:
+    """List available repo-local daily log files."""
+    return {
+        "log_dir": str(_observability_log_dir()),
+        "results": _list_log_files(),
+    }
+
+
+@app.get("/logs/recent", tags=["ops"])
+async def recent_logs_endpoint(
+    day: str = "current",
+    lines: int = 200,
+) -> dict[str, object]:
+    """Return the most recent lines from the selected repo-local log file."""
+    resolved_day, path = _resolve_log_file(day)
+    recent_lines = _tail_log_lines(path, lines=lines)
+    return {
+        "day": resolved_day,
+        "file": path.name,
+        "path": str(path),
+        "lines": recent_lines,
+        "total_lines_returned": len(recent_lines),
+    }
+
+
+@app.get("/logs/stream", tags=["ops"])
+async def stream_logs_endpoint(
+    day: str = "current",
+    backlog: int = 100,
+    follow: bool = True,
+    poll_interval_ms: int = 1000,
+) -> StreamingResponse:
+    """Stream repo-local log lines as NDJSON."""
+    resolved_day, path = _resolve_log_file(day)
+    return StreamingResponse(
+        _stream_log_lines(
+            path=path,
+            day=resolved_day,
+            backlog=backlog,
+            follow=follow and resolved_day == "current",
+            poll_interval_ms=poll_interval_ms,
+        ),
+        media_type="application/x-ndjson",
+    )
 
 
 @app.get("/governance/rules", tags=["ops"])
@@ -1715,14 +2013,20 @@ async def generate_sql_endpoint(
     pool = await _require_pool(http_request)
     top_k = request.top_k if request.top_k else settings.top_k
     request_id = _resolve_request_id(request.request_id)
-    set_request_id(request_id)
+    _bind_request_context(request_id=request_id, endpoint="/generate-sql")
     started = time.monotonic()
-    trace_recorder = TraceRecorder(pool=pool, request_id=request_id)
+    trace_recorder = TraceRecorder(
+        pool=pool,
+        request_id=request_id,
+        pipeline=getattr(http_request.app.state, "observability_pipeline", None),
+    )
+    set_current_trace_recorder(trace_recorder)
     await trace_recorder.emit(
         stage="request_received",
         status="started",
         message="Received SQL preview request.",
         details={"endpoint": "/generate-sql", "top_k": top_k},
+        input_summary={"query_preview": summarize_text(request.query), "top_k": top_k},
     )
     result = await generate_sql(
         request.query,
@@ -1732,6 +2036,7 @@ async def generate_sql_endpoint(
         trace_callback=trace_recorder.emit,
     )
     result = _attach_review_prompt(result, request.query)
+    result = _enrich_response_with_context(result)
     await trace_recorder.emit(
         stage="complete",
         status=result.status,
@@ -1739,7 +2044,8 @@ async def generate_sql_endpoint(
         duration_ms=_elapsed_ms(started),
         warning_codes=[warning.code.value for warning in getattr(result, "warnings", [])],
         error_source=_derive_error_source(getattr(result, "warnings", [])),
-        details=_generation_metadata(result),
+        output_summary=sanitize_value(result.model_dump(mode="json")) or {},
+        metadata=_generation_metadata(result),
     )
     asyncio.create_task(
         _log_request_event(
@@ -1768,14 +2074,20 @@ async def ask_endpoint(
     pool = await _require_pool(http_request)
     top_k = request.top_k if request.top_k else settings.top_k
     request_id = _resolve_request_id(request.request_id)
-    set_request_id(request_id)
+    _bind_request_context(request_id=request_id, endpoint="/ask")
     started = time.monotonic()
-    trace_recorder = TraceRecorder(pool=pool, request_id=request_id)
+    trace_recorder = TraceRecorder(
+        pool=pool,
+        request_id=request_id,
+        pipeline=getattr(http_request.app.state, "observability_pipeline", None),
+    )
+    set_current_trace_recorder(trace_recorder)
     await trace_recorder.emit(
         stage="request_received",
         status="started",
         message="Received ask request.",
         details={"endpoint": "/ask", "top_k": top_k},
+        input_summary={"query_preview": summarize_text(request.query), "top_k": top_k},
     )
     cache_epoch: int | None = None
     query_embedding: list[float] | None = None
@@ -1801,7 +2113,7 @@ async def ask_endpoint(
                 message="Ask request completed from cache.",
                 duration_ms=_elapsed_ms(started),
             )
-            return response
+            return _enrich_response_with_context(response)
 
     # --- Ask cache: semantic match -----------------------------------------------
     if settings.ask_cache_enabled and not deterministic_candidate:
@@ -1831,7 +2143,7 @@ async def ask_endpoint(
                     message="Ask request completed from cache.",
                     duration_ms=_elapsed_ms(started),
                 )
-                return response
+                return _enrich_response_with_context(response)
         except Exception:
             pass  # semantic lookup is best-effort
 
@@ -1890,12 +2202,12 @@ async def ask_endpoint(
                         message="Ask request completed from cache.",
                         duration_ms=_elapsed_ms(started),
                     )
-                    return response
+                    return _enrich_response_with_context(response)
         except Exception:
             logger.exception("Failed DB ask cache lookup")
 
     try:
-        return await asyncio.wait_for(
+        response = await asyncio.wait_for(
             _run_ask_workflow(
                 request=request,
                 pool=pool,
@@ -1908,6 +2220,7 @@ async def ask_endpoint(
             ),
             timeout=settings.ask_timeout,
         )
+        return _enrich_response_with_context(response)
     except asyncio.TimeoutError:
         response = AskRejected(
             sql=None,
@@ -1964,7 +2277,7 @@ async def ask_endpoint(
             warning_codes=warning_codes_list,
             error_source=error_src,
         )
-        return response
+        return _enrich_response_with_context(response)
 
 
 async def _run_ask_workflow(
@@ -2028,7 +2341,7 @@ async def _run_ask_workflow(
                     "stage_latencies_ms": _merged_sql_latencies,
                 },
             )
-        return response
+        return _enrich_response_with_context(response)
     if sql_result.status == "rejected":
         response = AskRejected(
             sql=None,
@@ -2409,9 +2722,11 @@ async def _run_ask_workflow(
     return response
 
 
-def _json_event(event: str, **payload: object) -> str:
+def _json_event(event_name: str, **payload: object) -> str:
+    base_payload = {key: value for key, value in _context_metadata().items() if value}
+    payload.pop("event", None)
     return json.dumps(
-        {"event": event, **payload},
+        {**base_payload, **payload, "event": event_name},
         default=str,
         separators=(",", ":"),
     ) + "\n"
@@ -2436,7 +2751,8 @@ def _ask_stream_timeout_warning(stage: str, timeout_seconds: float) -> SqlWarnin
 
 
 def _response_payload(response: AskResponse) -> dict:
-    return response.model_dump(mode="json")
+    enriched = _enrich_response_with_context(response)
+    return enriched.model_dump(mode="json")
 
 
 @app.post("/ask/stream", tags=["generation"])
@@ -2447,14 +2763,16 @@ async def ask_stream_endpoint(
     pool = await _require_pool(http_request)
     top_k = request.top_k if request.top_k else settings.top_k
     request_id = _resolve_request_id(request.request_id)
-    set_request_id(request_id)
+    _bind_request_context(request_id=request_id, endpoint="/ask/stream")
     started = time.monotonic()
     trace_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
     trace_recorder = TraceRecorder(
         pool=pool,
         request_id=request_id,
         stream_queue=trace_queue,
+        pipeline=getattr(http_request.app.state, "observability_pipeline", None),
     )
+    set_current_trace_recorder(trace_recorder)
 
     async def event_stream() -> AsyncIterator[str]:
         stage_latencies_ms: dict[str, int] = {}
@@ -2463,6 +2781,7 @@ async def ask_stream_endpoint(
             status="started",
             message="Received streaming ask request.",
             details={"endpoint": "/ask/stream", "top_k": top_k},
+            input_summary={"query_preview": summarize_text(request.query), "top_k": top_k},
         )
         yield _json_event(
             "started",

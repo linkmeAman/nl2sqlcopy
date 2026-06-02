@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import httpx
@@ -13,6 +14,8 @@ from tenacity import (
 
 from nl2sql_service.config import settings
 from nl2sql_service.llm.factory import LLMFactory
+from nl2sql_service.observability.context import emit_current_trace_event
+from nl2sql_service.observability.sanitization import summarize_text
 
 if TYPE_CHECKING:
     pass
@@ -96,6 +99,7 @@ async def _call_custom_embed_api(texts: list[str]) -> list[list[float]]:
     Validates the response shape and vector dimensions.
     """
     client = _get_client()
+    started = time.monotonic()
     try:
         response = await client.post(
             settings.embedding_api_url,
@@ -136,6 +140,17 @@ async def _call_custom_embed_api(texts: list[str]) -> list[list[float]]:
         )
 
     _validate_embeddings(texts, embeddings)
+    await emit_current_trace_event(
+        event="embedding_provider_completed",
+        stage="retrieval_embedding_provider",
+        status="completed",
+        message="Embedding provider request completed.",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        provider=settings.embedding_provider,
+        model=settings.embedding_model,
+        input_summary={"batch_size": len(texts), "first_input_preview": summarize_text(texts[0] if texts else None)},
+        output_summary={"embedding_count": len(embeddings)},
+    )
     return embeddings
 
 
@@ -161,6 +176,7 @@ async def _call_embed_api(texts: list[str]) -> list[list[float]]:
     if _is_custom_provider():
         return await _call_custom_embed_api(texts)
 
+    started = time.monotonic()
     try:
         provider = LLMFactory.create_embedding_provider(settings)
         embeddings = await provider.embeddings(texts)
@@ -172,6 +188,17 @@ async def _call_embed_api(texts: list[str]) -> list[list[float]]:
         ) from exc
 
     _validate_embeddings(texts, embeddings)
+    await emit_current_trace_event(
+        event="embedding_provider_completed",
+        stage="retrieval_embedding_provider",
+        status="completed",
+        message="Embedding provider request completed.",
+        duration_ms=int((time.monotonic() - started) * 1000),
+        provider=settings.embedding_provider,
+        model=settings.embedding_model,
+        input_summary={"batch_size": len(texts), "first_input_preview": summarize_text(texts[0] if texts else None)},
+        output_summary={"embedding_count": len(embeddings)},
+    )
     return embeddings
 
 

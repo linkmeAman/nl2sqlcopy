@@ -282,6 +282,9 @@ class HumanReviewPrompt(BaseModel):
 
 class GenerateSqlSuccess(BaseModel):
     status: Literal["ok"] = "ok"
+    request_id: str | None = None
+    trace_id: str | None = None
+    workflow_id: str | None = None
     sql: str
     warnings: list[SqlWarning] = []
     tables_used: list[str]
@@ -296,6 +299,9 @@ class GenerateSqlSuccess(BaseModel):
 
 class GenerateSqlRejected(BaseModel):
     status: Literal["rejected"] = "rejected"
+    request_id: str | None = None
+    trace_id: str | None = None
+    workflow_id: str | None = None
     sql: None = None
     warnings: list[SqlWarning]
     attempt_count: int
@@ -307,6 +313,9 @@ class GenerateSqlRejected(BaseModel):
 
 class GenerateSqlClarification(BaseModel):
     status: Literal["clarification_needed"] = "clarification_needed"
+    request_id: str | None = None
+    trace_id: str | None = None
+    workflow_id: str | None = None
     question: str
     suggestions: list[str]
     original_query: str
@@ -331,6 +340,9 @@ class AskRequest(BaseModel):
 
 class AskSuccess(BaseModel):
     status: Literal["ok"] = "ok"
+    request_id: str | None = None
+    trace_id: str | None = None
+    workflow_id: str | None = None
     answer: str
     sql: str
     warnings: list[SqlWarning] = []
@@ -348,6 +360,9 @@ class AskSuccess(BaseModel):
 
 class AskRejected(BaseModel):
     status: Literal["rejected"] = "rejected"
+    request_id: str | None = None
+    trace_id: str | None = None
+    workflow_id: str | None = None
     answer: None = None
     sql: str | None = None
     warnings: list[SqlWarning]
@@ -366,15 +381,34 @@ AskResponse = Annotated[
 
 class TraceEvent(BaseModel):
     request_id: str
+    trace_id: str | None = None
+    correlation_id: str | None = None
+    session_id: str | None = None
+    workflow_id: str | None = None
     seq: int
+    event: str | None = None
     layer: str
     stage: str
     status: str
     message: str
+    span_id: str | None = None
+    parent_span_id: str | None = None
     duration_ms: int | None = None
+    provider: str | None = None
+    model: str | None = None
+    retry_count: int = 0
+    reasoning_summary: str | None = None
+    input_summary: dict[str, Any] = Field(default_factory=dict)
+    output_summary: dict[str, Any] = Field(default_factory=dict)
     warning_codes: list[str] = Field(default_factory=list)
     error_source: str | None = None
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    started_at: str | None = None
+    ended_at: str | None = None
+    schema_version: str | None = None
     created_at: str | None = None
 
 

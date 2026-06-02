@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Any, Awaitable, Callable
 
 import asyncpg
@@ -26,6 +27,8 @@ from nl2sql_service.models import (
     SqlWarning,
     WarningCode,
 )
+from nl2sql_service.observability.context import emit_current_trace_event
+from nl2sql_service.observability.sanitization import sanitize_sql, stable_hash, summarize_text
 from nl2sql_service.rulebook import build_governance_block, get_config
 
 logger = logging.getLogger(__name__)
@@ -43,6 +46,7 @@ async def _emit_trace(
     warning_codes: list[str] | None = None,
     error_source: str | None = None,
     details: dict[str, Any] | None = None,
+    **extra: Any,
 ) -> None:
     if trace_callback is None:
         return
@@ -54,6 +58,7 @@ async def _emit_trace(
         warning_codes=warning_codes,
         error_source=error_source,
         details=details or {},
+        **extra,
     )
 
 _FENCED_SQL_RE = re.compile(r"```(?:sql)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
@@ -569,6 +574,20 @@ async def call_ollama(
         default_timeout=settings.llm_timeout,
         role="sql",
     )
+    await emit_current_trace_event(
+        event="prompt_construction",
+        stage="prompt_construction",
+        status="completed",
+        message="SQL prompt constructed.",
+        provider=client.provider_name,
+        model=client.model_name,
+        input_summary={
+            "prompt_hash": stable_hash(prompt),
+            "prompt_chars": len(prompt),
+            "prompt_preview": summarize_text(prompt, limit=min(settings.observability_prompt_char_limit, 500)),
+        },
+        metadata={"prompt_version": "sql_generator.v1"},
+    )
     response = await client.generate(
         prompt=prompt,
         temperature=0.0,
@@ -590,6 +609,21 @@ async def call_ollama(
             )
         ]
 
+    await emit_current_trace_event(
+        event="sql_generated",
+        stage="sql_generation",
+        status="completed",
+        message="SQL text returned by model.",
+        provider=response.provider or client.provider_name,
+        model=response.model_name or client.model_name,
+        duration_ms=response.latency_ms,
+        token_usage={
+            "total_tokens": response.tokens_used,
+            "prompt_tokens": response.prompt_tokens,
+            "completion_tokens": response.completion_tokens,
+        },
+        output_summary={"raw_sql_preview": sanitize_sql(response.text, limit=settings.observability_sql_char_limit)},
+    )
     return response.text, []
 
 
