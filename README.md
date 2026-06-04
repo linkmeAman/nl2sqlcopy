@@ -92,7 +92,9 @@ Secrets are never hardcoded. Config values can be raw env values, `env:NAME`,
 or `file:/path/to/secret` for Docker/Kubernetes secret mounts.
 
 Runtime routing is separate from the env file. Use `/config/model-routing` to
-inspect or patch the active process routing at runtime.
+inspect or patch the full active process routing at runtime, or
+`/config/ask-model` when you only want to change the model used for `/ask`
+answer generation.
 
 ## Key Runtime Paths
 
@@ -104,6 +106,9 @@ inspect or patch the active process routing at runtime.
 - `GET /config/model-routing`, `PATCH /config/model-routing`
   - inspect and patch the live task-to-model routing used by SQL, reasoning,
     query rewrite, answer, embedding, and fallback selection
+- `GET /config/ask-model`, `PATCH /config/ask-model`
+  - inspect and patch only the model used by `/ask` and `/ask/stream` answer
+    generation
 - `GET /metrics/llm`, `GET /metrics/teach`, `GET /metrics/prometheus`
   - surface provider usage metrics, teach-confirmation operational drift, and Prometheus-formatted backend observability metrics
 - `GET /logs/days`, `GET /logs/recent`, `GET /logs/stream`
@@ -152,6 +157,27 @@ inspect or patch the active process routing at runtime.
 - `POST /ingest`, `POST /ingest/groups`, `POST /ingest/knowledge`, `POST /ingest/patterns`, `POST /ingest/instructions`
   - ingest free text, schema groups, enriched knowledge, learned patterns, and user instructions
 
+## Current ReAct Planner
+
+The current ReAct planner is no longer a single repeated retrieval loop.
+
+It now uses:
+
+- `RETRIEVE_PAST_CORRECTIONS` on the first iteration to pull similar teach corrections
+- `RETRIEVE_SCHEMA_FOR_TABLES` for targeted schema retrieval
+- `RETRIEVE_JOIN_PATHS` when multiple tables need relation evidence
+- `RETRIEVE_SAMPLE_QUERIES` when ambiguity remains high
+- a duplicate-action guard keyed by `(action, target)` and retrieved tables
+- a `context_confidence_score` to decide when retrieval is sufficient
+
+Important runtime behavior:
+
+- past corrections are injected into learned instructions before SQL planning
+- duplicate retrieval of the same table/action is blocked within a request
+- retrieval/setup actions do not consume the same retry budget as SQL-generation attempts
+- ReAct trace `details` include `context_confidence_score` and `context_confidence_details`
+- planner logic remains schema-driven and does not hardcode database-specific table names
+
 ## Streaming Ask
 
 Example:
@@ -174,6 +200,12 @@ The stream has explicit service timeout handling. If SQL generation, MySQL
 execution, or answer generation exceeds the Ask budget, the service emits a
 `timeout` event followed by a `final` rejected response with
 `REQUEST_TIMEOUT`.
+
+Deterministic recent-list queries, such as "show me the 5 most recent contacts
+with name", bypass the answer LLM and return a direct fallback answer. For this
+class of query, the goal is to stay well under a 10 second budget. If the query
+is not deterministic, the final answer step still uses the configured answer
+model and can be slower.
 
 ## Trace Events
 

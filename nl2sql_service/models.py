@@ -125,6 +125,19 @@ class ModelRoutingPatchRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
 
+class AskModelPatchRequest(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    fallback_provider: str | None = None
+    fallback_model: str | None = None
+    fallback_api_key: str | None = None
+    fallback_base_url: str | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class ModelRoutingSnapshot(BaseModel):
     llm: dict[str, Any]
     sql: dict[str, Any]
@@ -134,6 +147,17 @@ class ModelRoutingSnapshot(BaseModel):
     embedding: dict[str, Any]
     startup_enforcement_mode: str
     provider_readiness: dict[str, Any]
+
+
+class AskModelSnapshot(BaseModel):
+    provider: str | None
+    model: str | None
+    base_url: str | None
+    api_key_configured: bool
+    fallback_provider: str | None
+    fallback_model: str | None
+    fallback_base_url: str | None
+    fallback_api_key_configured: bool
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +272,11 @@ class CacheSource(str, Enum):
 
 
 class ReActAction(str, Enum):
+    RETRIEVE_PAST_CORRECTIONS = "RETRIEVE_PAST_CORRECTIONS"
+    RETRIEVE_SCHEMA_FOR_TABLES = "RETRIEVE_SCHEMA_FOR_TABLES"
+    RETRIEVE_JOIN_PATHS = "RETRIEVE_JOIN_PATHS"
+    RETRIEVE_SAMPLE_QUERIES = "RETRIEVE_SAMPLE_QUERIES"
+    REQUEST_CLARIFICATION = "REQUEST_CLARIFICATION"
     RETRIEVE_MORE_CONTEXT = "RETRIEVE_MORE_CONTEXT"
     FETCH_SCHEMA = "FETCH_SCHEMA"
     GENERATE_SQL = "GENERATE_SQL"

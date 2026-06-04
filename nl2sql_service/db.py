@@ -19,6 +19,50 @@ _pool: asyncpg.Pool | None = None
 _FIXED_COLUMNS = {"text", "source", "chunk_index", "token_count", "embedding_model"}
 
 
+def _parse_json_value(value: object) -> object:
+    """Best-effort parse for legacy stringified JSON payloads."""
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if not text:
+        return value
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _coerce_str_list(value: object) -> list[str]:
+    parsed = _parse_json_value(value)
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    if parsed is None:
+        return []
+    if isinstance(parsed, str):
+        text = parsed.strip()
+        return [text] if text else []
+    return [str(parsed).strip()] if str(parsed).strip() else []
+
+
+def _coerce_dict(value: object) -> dict[str, object]:
+    parsed = _parse_json_value(value)
+    if isinstance(parsed, dict):
+        return parsed
+    return {}
+
+
+def _normalize_failure_log_row(row: dict) -> dict:
+    normalized = dict(row)
+    normalized["warning_codes"] = _coerce_str_list(normalized.get("warning_codes"))
+    normalized["tables_attempted"] = _coerce_str_list(normalized.get("tables_attempted"))
+    normalized["suggest_teach"] = _coerce_dict(normalized.get("suggest_teach"))
+    if "failure_details" in normalized:
+        normalized["failure_details"] = _coerce_dict(normalized.get("failure_details"))
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Pool lifecycle
 # ---------------------------------------------------------------------------
@@ -101,6 +145,7 @@ CREATE TABLE IF NOT EXISTS nl2sql_user_instructions (
     instruction_type  VARCHAR(50) NOT NULL,
     content           TEXT NOT NULL,
     embedding_source  TEXT NOT NULL,
+    instruction_embedding vector({settings.embedding_dimension}),
     tables_affected   TEXT[] NOT NULL DEFAULT '{{}}',
     confidence_score  FLOAT NOT NULL DEFAULT 0.7,
     is_verified       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -115,6 +160,13 @@ CREATE TABLE IF NOT EXISTS nl2sql_user_instructions (
     created_at        TIMESTAMP DEFAULT NOW(),
     updated_at        TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE nl2sql_user_instructions
+    ADD COLUMN IF NOT EXISTS instruction_embedding vector({settings.embedding_dimension});
+
+CREATE INDEX IF NOT EXISTS nl2sql_user_instructions_embedding_hnsw_idx
+    ON nl2sql_user_instructions
+    USING hnsw (instruction_embedding vector_cosine_ops);
 
 CREATE TABLE IF NOT EXISTS nl2sql_pending_teach_confirmations (
     token             TEXT PRIMARY KEY,
@@ -671,7 +723,7 @@ async def list_failure_logs(
                 """,
                 safe_limit,
             )
-    return [dict(row) for row in rows]
+    return [_normalize_failure_log_row(dict(row)) for row in rows]
 
 
 async def list_trace_events(

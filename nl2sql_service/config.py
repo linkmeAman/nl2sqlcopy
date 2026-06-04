@@ -105,6 +105,17 @@ class Settings(BaseSettings):
     reasoning_temperature: float = 0.6
     reasoning_timeout: int = 45
     react_max_iterations: int = 4
+    react_confidence_threshold: float = 0.75
+    react_confidence_tables_weight: float = 0.35
+    react_confidence_join_paths_weight: float = 0.2
+    react_confidence_group_weight: float = 0.15
+    react_confidence_example_weight: float = 0.2
+    react_confidence_iteration_penalty: float = 0.08
+    react_past_corrections_limit: int = 3
+    react_past_corrections_similarity: float = 0.75
+    react_join_path_limit: int = 5
+    react_relation_retrieval_top_k: int = 8
+    react_sample_query_limit: int = 3
     sql_generation_timeout: int = 90
     sql_dialect: str = "mysql"
 

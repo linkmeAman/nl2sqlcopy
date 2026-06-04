@@ -70,6 +70,8 @@ from nl2sql_service.models import (
     IngestResponse,
     IngestSchemaRequest,
     IngestTextRequest,
+    AskModelPatchRequest,
+    AskModelSnapshot,
     ModelRoutingPatchRequest,
     ModelRoutingSnapshot,
     LearningStatus,
@@ -1121,6 +1123,19 @@ def _routing_section(
     }
 
 
+def _answer_model_section() -> dict[str, object]:
+    return _routing_section(
+        provider=settings.answer_model_provider or settings.reasoning_model_provider or settings.llm_provider,
+        model=settings.answer_model or settings.reasoning_model or settings.llm_model,
+        api_key=settings.answer_model_api_key or settings.reasoning_model_api_key or settings.llm_api_key,
+        base_url=settings.answer_model_base_url or settings.reasoning_model_base_url or settings.llm_base_url,
+        fallback_provider=settings.answer_fallback_provider or settings.llm_fallback_provider,
+        fallback_model=settings.answer_fallback_model or settings.llm_fallback_model,
+        fallback_api_key=settings.answer_fallback_api_key or settings.llm_fallback_api_key,
+        fallback_base_url=settings.answer_fallback_base_url or settings.llm_fallback_base_url,
+    )
+
+
 def _model_routing_snapshot() -> ModelRoutingSnapshot:
     return ModelRoutingSnapshot(
         llm=_routing_section(
@@ -1163,16 +1178,7 @@ def _model_routing_snapshot() -> ModelRoutingSnapshot:
             fallback_api_key=settings.query_rewrite_fallback_api_key or settings.llm_fallback_api_key,
             fallback_base_url=settings.query_rewrite_fallback_base_url or settings.llm_fallback_base_url,
         ),
-        answer=_routing_section(
-            provider=settings.answer_model_provider or settings.reasoning_model_provider or settings.llm_provider,
-            model=settings.answer_model or settings.reasoning_model or settings.llm_model,
-            api_key=settings.answer_model_api_key or settings.reasoning_model_api_key or settings.llm_api_key,
-            base_url=settings.answer_model_base_url or settings.reasoning_model_base_url or settings.llm_base_url,
-            fallback_provider=settings.answer_fallback_provider or settings.llm_fallback_provider,
-            fallback_model=settings.answer_fallback_model or settings.llm_fallback_model,
-            fallback_api_key=settings.answer_fallback_api_key or settings.llm_fallback_api_key,
-            fallback_base_url=settings.answer_fallback_base_url or settings.llm_fallback_base_url,
-        ),
+        answer=_answer_model_section(),
         embedding=_routing_section(
             provider=settings.embedding_provider,
             model=settings.embedding_model,
@@ -1218,6 +1224,46 @@ def _apply_model_routing_patch(patch: ModelRoutingPatchRequest) -> ModelRoutingS
         )
 
     return _model_routing_snapshot()
+
+
+def _ask_model_snapshot() -> AskModelSnapshot:
+    return AskModelSnapshot(**_answer_model_section())
+
+
+def _apply_ask_model_patch(patch: AskModelPatchRequest) -> AskModelSnapshot:
+    updates = patch.model_dump(exclude_unset=True)
+    if not updates:
+        return _ask_model_snapshot()
+
+    field_map = {
+        "provider": "answer_model_provider",
+        "model": "answer_model",
+        "api_key": "answer_model_api_key",
+        "base_url": "answer_model_base_url",
+        "fallback_provider": "answer_fallback_provider",
+        "fallback_model": "answer_fallback_model",
+        "fallback_api_key": "answer_fallback_api_key",
+        "fallback_base_url": "answer_fallback_base_url",
+    }
+    snapshot: dict[str, object] = {}
+    for key, value in updates.items():
+        settings_key = field_map[key]
+        snapshot[settings_key] = getattr(settings, settings_key, None)
+        setattr(settings, settings_key, value)
+
+    report = settings.provider_readiness_report()
+    if report["issues"]:
+        for key, value in snapshot.items():
+            setattr(settings, key, value)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Invalid ask model configuration",
+                "issues": report["issues"],
+            },
+        )
+
+    return _ask_model_snapshot()
 
 
 async def _runtime_readiness_report() -> dict[str, object]:
@@ -1380,6 +1426,16 @@ async def get_model_routing() -> ModelRoutingSnapshot:
 @app.patch("/config/model-routing", tags=["ops"])
 async def patch_model_routing(body: ModelRoutingPatchRequest) -> ModelRoutingSnapshot:
     return _apply_model_routing_patch(body)
+
+
+@app.get("/config/ask-model", tags=["ops"])
+async def get_ask_model() -> AskModelSnapshot:
+    return _ask_model_snapshot()
+
+
+@app.patch("/config/ask-model", tags=["ops"])
+async def patch_ask_model(body: AskModelPatchRequest) -> AskModelSnapshot:
+    return _apply_ask_model_patch(body)
 
 
 @app.get("/health/vector", tags=["ops"])
@@ -2503,7 +2559,7 @@ async def _run_ask_workflow(
             message="Generating final answer from result rows.",
             details={"row_count": len(rows), "columns": columns},
         )
-    if any(group.startswith("deterministic_") for group in sql_result.matched_groups):
+    if _should_use_deterministic_fallback(sql_result.matched_groups):
         answer_text = answer_generator.build_fallback_answer(
             query=request.query,
             columns=columns,
@@ -2748,6 +2804,10 @@ def _ask_stream_timeout_warning(stage: str, timeout_seconds: float) -> SqlWarnin
             f"of {timeout_seconds}s during {stage}."
         ),
     )
+
+
+def _should_use_deterministic_fallback(matched_groups: list[str]) -> bool:
+    return any(group.startswith("deterministic_") for group in matched_groups)
 
 
 def _response_payload(response: AskResponse) -> dict:
@@ -3206,119 +3266,128 @@ async def ask_stream_endpoint(
         for event in await _drain_trace_queue(trace_queue):
             yield _json_event("trace", **event)
         answer_started = time.monotonic()
-        answer_task = asyncio.create_task(
-            answer_generator.generate_answer(
+        if _should_use_deterministic_fallback(sql_result.matched_groups):
+            answer_text = answer_generator.build_fallback_answer(
                 query=request.query,
-                sql=capped_sql,
                 columns=columns,
                 rows=rows,
                 row_count=len(rows),
-                sql_warnings=[*sql_result.warnings, *execution_warnings],
-                settings=settings,
             )
-        )
-        last_answer_notice = time.monotonic()
-        while True:
-            done, _ = await asyncio.wait(
-                {answer_task},
-                timeout=min(1, _remaining_timeout_seconds(started, settings.ask_timeout)),
-            )
-            for event in await _drain_trace_queue(trace_queue):
-                yield _json_event("trace", **event)
-            if done:
-                break
-            if time.monotonic() - started >= settings.ask_timeout:
-                answer_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await answer_task
-                stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
-                timeout_warning = _ask_stream_timeout_warning(
-                    "answer generation",
-                    settings.ask_timeout,
-                )
-                response = AskRejected(
+            answer_warnings = []
+        else:
+            answer_task = asyncio.create_task(
+                answer_generator.generate_answer(
+                    query=request.query,
                     sql=capped_sql,
-                    warnings=[*sql_result.warnings, timeout_warning],
-                    attempt_count=sql_result.attempt_count,
-                    react_trace=sql_result.react_trace,
-                    stage_latencies_ms={
-                        **(sql_result.stage_latencies_ms or {}),
-                        **stage_latencies_ms,
-                    },
+                    columns=columns,
+                    rows=rows,
+                    row_count=len(rows),
+                    sql_warnings=[*sql_result.warnings, *execution_warnings],
+                    settings=settings,
                 )
-                elapsed = _elapsed_ms(started)
-                asyncio.create_task(
-                    _log_request_event(
-                        pool,
-                        request_id=request_id,
-                        endpoint="/ask/stream",
-                        query_text=request.query,
-                        top_k=top_k,
-                        status=response.status,
-                        attempt_count=response.attempt_count,
-                        latency_ms=elapsed,
-                        stage_latencies_ms=stage_latencies_ms,
-                        warning_codes=[warning.code.value for warning in response.warnings],
-                        error_source="service_timeout",
-                        metadata={
-                            "failed_stage": "answer_generation",
-                            "sql_present": response.sql is not None,
-                            "row_count": len(rows),
-                            "tables_used": sql_result.tables_used,
-                            "matched_groups": sql_result.matched_groups,
-                        },
-                    )
-                )
-                asyncio.create_task(
-                    _log_failure_event(
-                        pool,
-                        request_id=request_id,
-                        endpoint="/ask/stream",
-                        query_text=request.query,
-                        warning_codes=[warning.code.value for warning in response.warnings],
-                        error_source="service_timeout",
-                        sql_preview=capped_sql,
-                        tables_attempted=sql_result.tables_used,
-                        latency_ms=elapsed,
-                        trace_emit=trace_recorder.emit,
-                    )
-                )
-                yield _json_event(
-                    "timeout",
-                    message=timeout_warning.message,
-                    warnings=_warning_payload([timeout_warning]),
-                )
-                await trace_recorder.emit(
-                    stage="answer_generation",
-                    status="failed",
-                    message=timeout_warning.message,
-                    duration_ms=stage_latencies_ms["answer_generation"],
-                    warning_codes=[timeout_warning.code.value],
-                    error_source="service_timeout",
-                )
-                await trace_recorder.emit(
-                    stage="complete",
-                    status=response.status,
-                    message=timeout_warning.message,
-                    duration_ms=elapsed,
-                    warning_codes=[warning.code.value for warning in response.warnings],
-                    error_source="service_timeout",
-                    details={
-                        "failed_stage": "answer_generation",
-                        "stage_latencies_ms": response.stage_latencies_ms or {},
-                    },
+            )
+            last_answer_notice = time.monotonic()
+            while True:
+                done, _ = await asyncio.wait(
+                    {answer_task},
+                    timeout=min(1, _remaining_timeout_seconds(started, settings.ask_timeout)),
                 )
                 for event in await _drain_trace_queue(trace_queue):
                     yield _json_event("trace", **event)
-                yield _json_event("final", response=_response_payload(response))
-                return
-            if time.monotonic() - last_answer_notice >= 10:
-                yield _json_event(
-                    "answer_generation_running",
-                    message="Still generating final answer.",
-                )
-                last_answer_notice = time.monotonic()
-        answer_text, answer_warnings = await answer_task
+                if done:
+                    break
+                if time.monotonic() - started >= settings.ask_timeout:
+                    answer_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await answer_task
+                    stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
+                    timeout_warning = _ask_stream_timeout_warning(
+                        "answer generation",
+                        settings.ask_timeout,
+                    )
+                    response = AskRejected(
+                        sql=capped_sql,
+                        warnings=[*sql_result.warnings, timeout_warning],
+                        attempt_count=sql_result.attempt_count,
+                        react_trace=sql_result.react_trace,
+                        stage_latencies_ms={
+                            **(sql_result.stage_latencies_ms or {}),
+                            **stage_latencies_ms,
+                        },
+                    )
+                    elapsed = _elapsed_ms(started)
+                    asyncio.create_task(
+                        _log_request_event(
+                            pool,
+                            request_id=request_id,
+                            endpoint="/ask/stream",
+                            query_text=request.query,
+                            top_k=top_k,
+                            status=response.status,
+                            attempt_count=response.attempt_count,
+                            latency_ms=elapsed,
+                            stage_latencies_ms=stage_latencies_ms,
+                            warning_codes=[warning.code.value for warning in response.warnings],
+                            error_source="service_timeout",
+                            metadata={
+                                "failed_stage": "answer_generation",
+                                "sql_present": response.sql is not None,
+                                "row_count": len(rows),
+                                "tables_used": sql_result.tables_used,
+                                "matched_groups": sql_result.matched_groups,
+                            },
+                        )
+                    )
+                    asyncio.create_task(
+                        _log_failure_event(
+                            pool,
+                            request_id=request_id,
+                            endpoint="/ask/stream",
+                            query_text=request.query,
+                            warning_codes=[warning.code.value for warning in response.warnings],
+                            error_source="service_timeout",
+                            sql_preview=capped_sql,
+                            tables_attempted=sql_result.tables_used,
+                            latency_ms=elapsed,
+                            trace_emit=trace_recorder.emit,
+                        )
+                    )
+                    yield _json_event(
+                        "timeout",
+                        message=timeout_warning.message,
+                        warnings=_warning_payload([timeout_warning]),
+                    )
+                    await trace_recorder.emit(
+                        stage="answer_generation",
+                        status="failed",
+                        message=timeout_warning.message,
+                        duration_ms=stage_latencies_ms["answer_generation"],
+                        warning_codes=[timeout_warning.code.value],
+                        error_source="service_timeout",
+                    )
+                    await trace_recorder.emit(
+                        stage="complete",
+                        status=response.status,
+                        message=timeout_warning.message,
+                        duration_ms=elapsed,
+                        warning_codes=[warning.code.value for warning in response.warnings],
+                        error_source="service_timeout",
+                        details={
+                            "failed_stage": "answer_generation",
+                            "stage_latencies_ms": response.stage_latencies_ms or {},
+                        },
+                    )
+                    for event in await _drain_trace_queue(trace_queue):
+                        yield _json_event("trace", **event)
+                    yield _json_event("final", response=_response_payload(response))
+                    return
+                if time.monotonic() - last_answer_notice >= 10:
+                    yield _json_event(
+                        "answer_generation_running",
+                        message="Still generating final answer.",
+                    )
+                    last_answer_notice = time.monotonic()
+            answer_text, answer_warnings = await answer_task
         stage_latencies_ms["answer_generation"] = _elapsed_ms(answer_started)
         await trace_recorder.emit(
             stage="answer_generation",

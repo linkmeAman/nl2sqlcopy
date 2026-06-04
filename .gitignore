@@ -7,3 +7,8 @@ __pycache__/
 
 
 rag_schema/
+
+
+logs/
+
+*.log

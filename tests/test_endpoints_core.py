@@ -131,6 +131,15 @@ async def test_get_model_routing_endpoint(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_ask_model_endpoint(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/config/ask-model")
+    data = _ok(resp)
+    assert "provider" in data
+    assert "model" in data
+    assert "api_key_configured" in data
+
+
+@pytest.mark.asyncio
 async def test_patch_model_routing_endpoint_updates_runtime_config(client: httpx.AsyncClient) -> None:
     from nl2sql_service.config import settings
 
@@ -154,22 +163,88 @@ async def test_patch_model_routing_endpoint_updates_runtime_config(client: httpx
     finally:
         for key, value in previous.items():
             setattr(settings, key, value)
-        if hasattr(client.app.state, "provider_config_report"):
-            client.app.state.provider_config_report = settings.provider_readiness_report()
+
+
+@pytest.mark.asyncio
+async def test_patch_ask_model_endpoint_updates_runtime_config(client: httpx.AsyncClient) -> None:
+    from nl2sql_service.config import settings
+
+    previous = {
+        "answer_model_provider": settings.answer_model_provider,
+        "answer_model": settings.answer_model,
+        "answer_model_base_url": settings.answer_model_base_url,
+    }
+    try:
+        resp = await client.patch(
+            "/config/ask-model",
+            json={
+                "provider": "ollama",
+                "model": "qwen3:4b",
+                "base_url": "http://localhost:11434",
+            },
+        )
+        data = _ok(resp)
+        assert data["provider"] == "ollama"
+        assert data["model"] == "qwen3:4b"
+    finally:
+        for key, value in previous.items():
+            setattr(settings, key, value)
 
 
 @pytest.mark.asyncio
 async def test_patch_model_routing_rejects_invalid_config(client: httpx.AsyncClient) -> None:
-    resp = await client.patch(
-        "/config/model-routing",
-        json={
-            "sql_model_provider": "openai",
-            "sql_model": "gpt-4.1-mini",
-        },
-    )
+    from nl2sql_service.config import settings
+
+    previous = {
+        "llm_base_url": settings.llm_base_url,
+        "sql_model_base_url": settings.sql_model_base_url,
+        "reasoning_model_base_url": settings.reasoning_model_base_url,
+    }
+    try:
+        settings.llm_base_url = None
+        settings.sql_model_base_url = None
+        settings.reasoning_model_base_url = None
+        resp = await client.patch(
+            "/config/model-routing",
+            json={
+                "sql_model_provider": "ollama",
+                "sql_model": "qwen2.5-coder:7b",
+            },
+        )
+    finally:
+        for key, value in previous.items():
+            setattr(settings, key, value)
     assert resp.status_code == 422
     body = resp.json()
     assert body["detail"]["message"] == "Invalid model routing configuration"
+
+
+@pytest.mark.asyncio
+async def test_patch_ask_model_rejects_invalid_config(client: httpx.AsyncClient) -> None:
+    from nl2sql_service.config import settings
+
+    previous = {
+        "llm_base_url": settings.llm_base_url,
+        "answer_model_base_url": settings.answer_model_base_url,
+        "reasoning_model_base_url": settings.reasoning_model_base_url,
+    }
+    try:
+        settings.llm_base_url = None
+        settings.answer_model_base_url = None
+        settings.reasoning_model_base_url = None
+        resp = await client.patch(
+            "/config/ask-model",
+            json={
+                "provider": "ollama",
+                "model": "qwen3:4b",
+            },
+        )
+    finally:
+        for key, value in previous.items():
+            setattr(settings, key, value)
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["detail"]["message"] == "Invalid ask model configuration"
 
 
 @pytest.mark.asyncio

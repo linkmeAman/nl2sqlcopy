@@ -385,6 +385,51 @@ async def test_ask_stream_success_emits_progress_and_final(
 
 
 @pytest.mark.asyncio
+async def test_ask_stream_deterministic_inquiry_uses_fallback_answer(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_embed,
+):
+    from nl2sql_service import answer_generator, main, mysql_executor
+
+    mock_generate_sql = AsyncMock(
+        return_value=GenerateSqlSuccess(
+            sql="SELECT id, contact_id, created_at FROM inquiry ORDER BY created_at DESC LIMIT 5",
+            warnings=[],
+            tables_used=["inquiry"],
+            matched_groups=["deterministic_inquiry"],
+            attempt_count=0,
+            react_trace=None,
+        )
+    )
+    mock_execute_sql = AsyncMock(
+        return_value=(
+            ["id", "contact_id", "created_at"],
+            [(10, 200, "2026-05-01"), (9, 199, "2026-04-30")],
+            [],
+        )
+    )
+    mock_generate_answer = AsyncMock(return_value=("unused", []))
+
+    monkeypatch.setattr(main, "generate_sql", mock_generate_sql)
+    monkeypatch.setattr(mysql_executor, "execute_sql", mock_execute_sql)
+    monkeypatch.setattr(answer_generator, "generate_answer", mock_generate_answer)
+
+    response = await client.post(
+        "/ask/stream",
+        json={"query": "show me the 5 most recent inquiries", "top_k": 5},
+    )
+
+    assert response.status_code == 200
+    events = [json.loads(line) for line in response.text.splitlines()]
+    visible_events = [event for event in events if event["event"] != "trace"]
+    assert visible_events[-1]["response"]["status"] == "ok"
+    assert visible_events[-1]["response"]["answer"].startswith("Found 2 rows.")
+    assert mock_generate_answer.await_count == 0
+    assert mock_embed.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_ask_stream_rejected_sql_generation_returns_final_event(
     client,
     monkeypatch: pytest.MonkeyPatch,

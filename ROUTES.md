@@ -33,6 +33,10 @@ Base URL examples assume `http://localhost:8080`.
 - `GET /health/runtime`
 - `GET /health/llm`
 - `GET /health/vector`
+- `GET /config/model-routing`
+- `PATCH /config/model-routing`
+- `GET /config/ask-model`
+- `PATCH /config/ask-model`
 - `GET /metrics/llm`
 - `GET /metrics/teach`
 - `GET /logs/days`
@@ -154,11 +158,47 @@ Response fields include:
 - `startup_enforcement_mode`
 - `provider_readiness`
 
+## GET /config/ask-model
+
+Returns the live model assignment used by `/ask` and `/ask/stream` for final answer generation.
+
+Response fields include:
+
+- `provider`
+- `model`
+- `base_url`
+- `api_key_configured`
+- `fallback_provider`
+- `fallback_model`
+- `fallback_base_url`
+- `fallback_api_key_configured`
+
 ## PATCH /config/model-routing
 
 Patches live task-to-model routing in the current process.
 
 Request body fields are optional and mirror the runtime routing settings.
+
+Behavior:
+
+- invalid provider combinations are rejected with HTTP `422`
+- successful updates apply immediately to the current process
+- changes are not persisted across process restarts
+
+## PATCH /config/ask-model
+
+Patches only the live model assignment used by `/ask` and `/ask/stream`.
+
+Request body fields:
+
+- `provider`
+- `model`
+- `api_key`
+- `base_url`
+- `fallback_provider`
+- `fallback_model`
+- `fallback_api_key`
+- `fallback_base_url`
 
 Behavior:
 
@@ -828,6 +868,10 @@ Important notes:
 - execution is capped to 50 rows
 - successful `status="ok"` answers are cached even when `row_count = 0`
 - learned pattern saving remains restricted to successful non-empty result sets
+- deterministic recent-list queries bypass the answer model and return a
+  direct fallback answer
+- non-deterministic queries still use the configured answer model for the
+  final natural-language response
 
 ## POST /ask/stream
 
@@ -853,6 +897,13 @@ Event names:
 - `answer_generation_finished`
 - `answer_generation_failed`
 - `final`
+
+Operational note:
+
+- deterministic recent-list queries skip the answer LLM and usually complete
+  much faster than non-deterministic asks
+- if answer generation is still slow, inspect `/config/ask-model` and the
+  frontend proxy timeout
 
 ## Example Cache-Aware Success
 

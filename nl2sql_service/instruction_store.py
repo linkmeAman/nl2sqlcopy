@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 
+from nl2sql_service import embed
 from nl2sql_service.models import (
     InstructionType,
     LearningStatus,
@@ -54,6 +55,19 @@ def build_embedding_source(
     }
     template = templates.get(instruction_type, "Instruction: {content}\nTables: {tables}")
     return template.format(content=content.strip(), tables=tables)
+
+
+def build_retrieval_source(
+    instruction_type: str,
+    content: str,
+    tables_affected: list[str],
+    source_query: str | None,
+) -> str:
+    parts: list[str] = []
+    if source_query:
+        parts.append(f"Query: {source_query.strip()}")
+    parts.append(build_embedding_source(instruction_type, content, tables_affected))
+    return "\n".join(part for part in parts if part).strip()
 
 
 async def find_similar_instructions(
@@ -174,19 +188,27 @@ async def save_instruction(
             content,
             tables_affected,
         )
+        retrieval_source = build_retrieval_source(
+            instruction_type,
+            content,
+            tables_affected,
+            source_query,
+        )
+        instruction_embedding = await _embed_instruction(retrieval_source)
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 INSERT INTO nl2sql_user_instructions
-                    (instruction_type, content, embedding_source,
+                    (instruction_type, content, embedding_source, instruction_embedding,
                      tables_affected, confidence_score, is_verified,
                      source_query, conflict_group)
-                VALUES ($1, $2, $3, $4::text[], $5, $6, $7, $8)
+                VALUES ($1, $2, $3, $4, $5::text[], $6, $7, $8, $9)
                 RETURNING id
                 """,
                 instruction_type,
                 content,
                 embedding_source,
+                instruction_embedding,
                 tables_affected,
                 confidence_score,
                 is_verified,
@@ -199,6 +221,69 @@ async def save_instruction(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to save instruction: %s", exc)
         return -1
+
+
+async def retrieve_similar_corrections(
+    query: str,
+    pool: asyncpg.Pool,
+    *,
+    limit: int = 3,
+    min_similarity: float = 0.75,
+) -> list[dict]:
+    if not query.strip():
+        return []
+
+    query_embedding = await _embed_instruction(query)
+    if query_embedding is None:
+        return []
+
+    max_distance = max(0.0, 1.0 - min_similarity)
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    instruction_type,
+                    content,
+                    embedding_source,
+                    tables_affected,
+                    confidence_score,
+                    is_verified,
+                    is_active,
+                    conflict_group,
+                    source_query,
+                    use_count,
+                    success_count,
+                    failure_count,
+                    last_used_at,
+                    created_at,
+                    updated_at,
+                    1 - (instruction_embedding <=> $3) AS similarity
+                FROM nl2sql_user_instructions
+                WHERE is_active = TRUE
+                  AND instruction_type = $1
+                  AND instruction_embedding IS NOT NULL
+                  AND (instruction_embedding <=> $3) <= $2
+                ORDER BY instruction_embedding <=> $3 ASC, confidence_score DESC, use_count DESC
+                LIMIT $4
+                """,
+                InstructionType.CORRECTION.value,
+                max_distance,
+                query_embedding,
+                limit,
+            )
+            results: list[dict] = []
+            for row in rows:
+                item = _instruction_row_to_dict(row)
+                item["similarity"] = float(row["similarity"])
+                source_query = str(item.get("source_query") or "").strip()
+                item["failed_sql"] = await _load_latest_failed_sql(conn, source_query)
+                results.append(item)
+            return results
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to retrieve similar corrections: %s", exc)
+        return []
 
 
 async def process_teach_request(
@@ -635,7 +720,7 @@ async def record_instruction_outcome(
     success: bool,
     pool: asyncpg.Pool,
 ) -> None:
-    if not tables_used:
+    if not tables_used or not hasattr(pool, "acquire"):
         return
 
     try:
@@ -816,6 +901,46 @@ def _instruction_row_to_dict(row: Any) -> dict:
     elif not isinstance(data["tables_affected"], list):
         data["tables_affected"] = list(data["tables_affected"])
     return data
+
+
+async def _embed_instruction(text: str) -> list[float] | None:
+    try:
+        vectors = await embed.embed_texts([text])
+    except RuntimeError as exc:
+        if "not initialised" in str(exc).lower():
+            logger.debug("Skipping instruction embedding because the embedding client is not initialised.")
+            return None
+        logger.warning("Failed to embed instruction text: %s", exc)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to embed instruction text: %s", exc)
+        return None
+
+    if not vectors:
+        return None
+    return vectors[0]
+
+
+async def _load_latest_failed_sql(
+    conn: asyncpg.Connection,
+    source_query: str,
+) -> str | None:
+    if not source_query:
+        return None
+
+    row = await conn.fetchrow(
+        """
+        SELECT sql_preview
+        FROM nl2sql_failure_log
+        WHERE query_text = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        source_query,
+    )
+    if row is None:
+        return None
+    return str(row["sql_preview"]) if row["sql_preview"] else None
 
 
 def _is_structural_conflict(
