@@ -6,6 +6,10 @@ import os
 import re
 from pathlib import Path
 
+from nl2sql_service.column_loader import load_column_catalog
+from nl2sql_service.config import Settings
+from nl2sql_service.synonym_map import aliases_for_column_introspection
+
 
 def _rag_schema_dir() -> Path:
     configured = os.getenv("RAG_SCHEMA_DIR")
@@ -209,6 +213,67 @@ def load_column_catalog_chunks(limit: int | None = None) -> list[dict]:
 
             if limit is not None and len(chunks) >= limit:
                 return chunks
+
+    return chunks
+
+
+async def load_live_column_catalog_chunks(
+    settings: Settings,
+    limit: int | None = None,
+) -> list[dict]:
+    records = await load_column_catalog(settings, tables=None)
+    chunks: list[dict] = []
+
+    for record in records:
+        table_name = str(record.get("table_name") or "").strip().lower()
+        column_name = str(record.get("column_name") or "").strip().lower()
+        if not table_name or not column_name:
+            continue
+
+        aliases = aliases_for_column_introspection(column_name)
+        search_terms = [column_name.replace("_", " "), *aliases]
+        data_type = str(record.get("data_type") or "").strip().lower()
+        payload = {
+            "table_name": table_name,
+            "column_name": column_name,
+            "data_type": data_type,
+            "ordinal_position": int(record.get("ordinal_position") or 0),
+            "aliases": aliases,
+        }
+        text_lines = [
+            f"Table: {table_name}",
+            f"Column: {column_name}",
+            f"Semantic aliases: {', '.join(aliases)}" if aliases else "Semantic aliases: none",
+            f"Data type: {data_type}" if data_type else "Data type: unknown",
+            f"Search terms: {', '.join(search_terms)}",
+        ]
+
+        chunks.append(
+            {
+                "text": "\n".join(text_lines),
+                "source": f"column_catalog::{table_name}::{column_name}",
+                "chunk_index": 0,
+                "schema_version": hashlib.md5(
+                    json.dumps(payload, sort_keys=True).encode("utf-8")
+                ).hexdigest()[:8],
+                "type": "column_catalog",
+                "record_id": f"{table_name}.{column_name}",
+                "title": f"{table_name}.{column_name} column",
+                "tags": ["columns", table_name],
+                "object_type": "column",
+                "database": "",
+                "object_name": table_name,
+                "table_name": table_name,
+                "column_name": column_name,
+                "column_aliases": aliases,
+                "data_type": data_type,
+                "full_object_name": f"{table_name}.{column_name}",
+                "source_kind": "mysql_introspection",
+            }
+        )
+
+        if limit is not None and len(chunks) >= limit:
+            return chunks
 
     return chunks
 

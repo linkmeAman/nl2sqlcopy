@@ -247,7 +247,7 @@ class LLMFactory:
 
 def get_model_client(
     settings: Settings,
-    model: str,
+    model: str | None,
     default_timeout: int,
     role: str = "default",
 ) -> LLMProvider:
@@ -299,6 +299,8 @@ def resolve_role_configs(
         provider = settings.reasoning_model_provider or provider
 
     role_model = model or getattr(settings, f"{role}_model", None) or settings.llm_model
+    if role == "query_rewrite":
+        role_model = model or settings.effective_query_rewrite_model
     api_key = getattr(settings, f"{role}_model_api_key", None) or settings.llm_api_key
     role_base_url = getattr(settings, f"{role}_model_base_url", None)
     base_url = role_base_url if role_base_url else None

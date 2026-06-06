@@ -196,7 +196,9 @@ async def test_rewrite_timeout_falls_back_to_original(
         settings=settings,
     )
 
-    assert result == "show counselor contact today"
+    assert result.startswith("show counselor contact today")
+    assert "email" in result
+    assert "phone" in result
 
 
 @pytest.mark.asyncio
@@ -219,6 +221,34 @@ async def test_rewrite_skips_short_queries(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_rewrite_expands_synonym_hints_from_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "query_rewrite_enabled", True)
+    monkeypatch.setattr(
+        query_rewriter,
+        "build_rewrite_hints",
+        AsyncMock(return_value=["counselor -> employee"]),
+    )
+    monkeypatch.setattr(
+        query_rewriter,
+        "_call_rewrite_model",
+        AsyncMock(return_value="find contact name for aman"),
+    )
+
+    result = await query_rewriter.rewrite_search_query(
+        "find contact name for aman",
+        pool=object(),
+        settings=settings,
+    )
+
+    assert "first name" in result
+    assert "last name" in result
+    assert "email" in result
+    assert "phone" in result
+
+
+@pytest.mark.asyncio
 async def test_react_agent_rewrites_once_and_reuses_expansion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -234,15 +264,11 @@ async def test_react_agent_rewrites_once_and_reuses_expansion(
     monkeypatch.setattr(settings, "query_rewrite_enabled", True)
     monkeypatch.setattr(react_agent.query_rewriter, "rewrite_search_query", rewrite_mock)
     monkeypatch.setattr(react_agent, "retrieve_groups", retrieve_mock)
+    monkeypatch.setattr(react_agent, "retrieve_past_corrections", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         react_agent,
-        "load_columns_for_tables",
-        AsyncMock(
-            return_value={
-                "invoice": ["id", "employee_id", "status"],
-                "employee": ["id", "contact_id"],
-            }
-        ),
+        "retrieve_column_catalog",
+        AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
         react_agent,

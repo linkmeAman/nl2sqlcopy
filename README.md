@@ -70,6 +70,7 @@ REASONING_MODEL_API_KEY=env:OPENAI_API_KEY
 
 QUERY_REWRITE_MODEL_PROVIDER=groq
 QUERY_REWRITE_MODEL=llama-3.3-70b-versatile
+QUERY_REWRITE_FAST_MODEL=
 QUERY_REWRITE_MODEL_API_KEY=env:GROQ_API_KEY
 
 ANSWER_MODEL_PROVIDER=openrouter
@@ -94,7 +95,8 @@ or `file:/path/to/secret` for Docker/Kubernetes secret mounts.
 Runtime routing is separate from the env file. Use `/config/model-routing` to
 inspect or patch the full active process routing at runtime, or
 `/config/ask-model` when you only want to change the model used for `/ask`
-answer generation.
+answer generation. Runtime route changes are not persisted across restart; edit
+`.env` when you want new startup defaults.
 
 ## Key Runtime Paths
 
@@ -386,7 +388,9 @@ EMBEDDING_MODEL=bge-large-en-v1.5
 EMBEDDING_DIMENSION=1024
 
 VECTOR_PROVIDER=pgvector
+VECTOR_HNSW_EF_SEARCH=40
 TOP_K=5
+REACT_MAX_ITERATIONS=2
 SQL_GENERATION_TIMEOUT=90
 ASK_TIMEOUT=105
 EMBED_CACHE_TTL_SECONDS=3600
@@ -394,7 +398,7 @@ SQL_CACHE_TTL_SECONDS=3600
 ASK_CACHE_TTL_SECONDS=300
 SQL_CACHE_ENABLED=true
 ASK_CACHE_ENABLED=true
-ASK_CACHE_SEMANTIC_THRESHOLD=0.97
+CACHE_SEMANTIC_THRESHOLD_ASK=0.92
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
 OBSERVABILITY_LOG_DIR=logs
 OBSERVABILITY_LOG_RETENTION_DAYS=30
@@ -407,6 +411,9 @@ hidden dev defaults.
 
 - `LLM_BASE_URL` is required whenever the resolved provider for a generation role is `ollama`.
 - `EMBEDDING_API_URL` is required only when `EMBEDDING_PROVIDER=custom`.
+- `EMBEDDING_DIMENSION` must match the configured embedding model. The default
+  `bge-large-en-v1.5` uses `1024`; `bge-small-en-v1.5` uses `384` and can reduce
+  embedding latency by roughly 3x with a modest quality tradeoff.
 - Cloud providers such as `openai`, `groq`, `anthropic`, `gemini`, and `voyageai`
   require a resolved API key. `env:NAME` and `file:/path` references are checked
   during settings validation, not just at request time.
@@ -481,6 +488,12 @@ curl -s 'http://localhost:8080/health/llm?role=sql' | python -m json.tool
 curl -s 'http://localhost:8080/health/vector' | python -m json.tool
 curl -s 'http://localhost:8080/metrics/llm' | python -m json.tool
 ```
+
+Interpret `GET /health/llm` like this:
+
+- `provider_config.status="ok"` means the selected provider/model settings are valid.
+- top-level `status="ok"` means the short live probe succeeded for that role.
+- top-level `status="unavailable"` means the role's live probe failed, timed out, or returned an upstream error even though the config itself parsed correctly.
 
 Inspect repo-local daily logs:
 

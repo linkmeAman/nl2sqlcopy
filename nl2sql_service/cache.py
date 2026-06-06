@@ -107,10 +107,11 @@ class SemanticSqlCache:
         self,
         query_embedding: list[float],
         top_k: int,
-        threshold: float = 0.96,
+        threshold: float | None = None,
     ) -> dict[str, Any] | None:
         """Return the best cached result whose stored embedding has cosine
         similarity >= *threshold* with *query_embedding* and the same top_k."""
+        threshold = settings.sql_cache_semantic_threshold if threshold is None else threshold
         now = time.time()
         best_score = -1.0
         best_result: dict[str, Any] | None = None
@@ -190,10 +191,11 @@ class AskCache:
         self,
         query_embedding: list[float],
         top_k: int,
-        threshold: float = 0.97,
+        threshold: float | None = None,
     ) -> dict[str, Any] | None:
         """Return the best cached ask result whose stored embedding has cosine
         similarity >= *threshold* with *query_embedding* and the same top_k."""
+        threshold = settings.ask_cache_semantic_threshold if threshold is None else threshold
         best_score = -1.0
         best_result: dict[str, Any] | None = None
         stale_keys: list[str] = []

@@ -10,7 +10,6 @@ import asyncpg
 
 from nl2sql_service import pattern_store
 from nl2sql_service import query_rewriter
-from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.config import Settings, settings as default_settings
 from nl2sql_service.instruction_store import (
     record_instruction_outcome,
@@ -30,7 +29,7 @@ from nl2sql_service.models import (
 )
 from nl2sql_service.observability.sanitization import summarize_text
 from nl2sql_service.rulebook import build_governance_block, get_config
-from nl2sql_service.retrieve import retrieve, retrieve_groups
+from nl2sql_service.retrieve import retrieve, retrieve_column_catalog, retrieve_groups
 from nl2sql_service.sql_generator import (
     build_refinement_prompt,
     build_sql_prompt,
@@ -114,6 +113,22 @@ def _merge_ordered_strings(existing: list[str], incoming: list[str]) -> list[str
         normalized = str(item).strip()
         if normalized and normalized not in merged:
             merged.append(normalized)
+    return merged
+
+
+def _merge_allowed_columns(
+    existing: dict[str, list[str]],
+    incoming: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    merged = {str(table): list(columns) for table, columns in existing.items()}
+    for table, columns in incoming.items():
+        table_key = _normalize_table_name(str(table))
+        if not table_key:
+            continue
+        merged[table_key] = _merge_ordered_strings(
+            merged.get(table_key, []),
+            [str(column).strip() for column in columns if str(column).strip()],
+        )
     return merged
 
 
@@ -360,11 +375,11 @@ def _extract_columns_from_results(
         object_name = _normalize_table_name(str(metadata.get("object_name") or metadata.get("table_name") or ""))
         if object_name in normalized_targets and content:
             _, _, columns_text = content.partition(":")
-            candidate_columns = [
-                column.strip().strip("`\"[]")
-                for column in columns_text.split(",")
-                if column.strip()
-            ]
+            candidate_columns = []
+            for column in columns_text.split(","):
+                stripped = re.split(r"\s*[\[(]", column, maxsplit=1)[0].strip().strip("`\"[]")
+                if stripped:
+                    candidate_columns.append(stripped)
             if candidate_columns:
                 parsed[object_name] = candidate_columns
 
@@ -378,11 +393,32 @@ def _extract_columns_from_results(
             column_block = match.group(2).strip()
             if not column_block or column_block.startswith("("):
                 continue
-            parsed[table_name] = [
-                column.strip().strip("`\"[]")
-                for column in column_block.split(",")
-                if column.strip()
-            ]
+            parsed[table_name] = []
+            for column in column_block.split(","):
+                stripped = re.split(r"\s*[\[(]", column, maxsplit=1)[0].strip().strip("`\"[]")
+                if stripped:
+                    parsed[table_name].append(stripped)
+    return parsed
+
+
+def _extract_columns_from_column_results(results: list[Any]) -> dict[str, list[str]]:
+    parsed: dict[str, list[str]] = {}
+    for result in results:
+        metadata = getattr(result, "metadata", {}) or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = {}
+        metadata = dict(metadata)
+
+        table_name = _normalize_table_name(
+            str(metadata.get("table_name") or metadata.get("object_name") or "")
+        )
+        column_name = str(metadata.get("column_name") or "").strip().strip("`\"[]")
+        if not table_name or not column_name:
+            continue
+        parsed[table_name] = _merge_ordered_strings(parsed.get(table_name, []), [column_name])
     return parsed
 
 
@@ -963,21 +999,48 @@ async def execute_action(
             _normalize_table_name(table)
             for table in state["tables_in_scope"]
         ]
+        column_results = await retrieve_column_catalog(
+            query=refined_query,
+            tables=target_tables or tables_in_scope,
+            top_k=max(8, state["top_k"] * 4),
+            pool=pool,
+            search_query=search_query,
+        )
         parsed_columns = _extract_columns_from_results(
             list(_result_value(result, "results")),
             target_tables or tables_in_scope,
         )
-        state["retrieved_schema"].update(parsed_columns)
-        state["allowed_columns"].update(parsed_columns)
+        parsed_columns = _merge_allowed_columns(
+            parsed_columns,
+            _extract_columns_from_column_results(column_results),
+        )
+        state["retrieved_schema"] = _merge_allowed_columns(
+            state.get("retrieved_schema") or {},
+            parsed_columns,
+        )
+        state["allowed_columns"] = _merge_allowed_columns(
+            state.get("allowed_columns") or {},
+            parsed_columns,
+        )
         state["retrieved_tables"].update(target_tables or {
             _normalize_table_name(table)
             for table in tables_in_scope
         })
+        if parsed_columns:
+            state["context"] = _merge_context_block(
+                state["context"],
+                "RETRIEVED COLUMNS:\n"
+                + "\n".join(
+                    f"- {table}: {', '.join(columns)}"
+                    for table, columns in parsed_columns.items()
+                ),
+            )
         observation = (
             f"Retrieved schema for {len(target_tables or tables_in_scope)} table(s): "
             f"{', '.join(target_tables or tables_in_scope)}. "
+            f"tables_in_scope={', '.join(state['tables_in_scope']) or '(none)'}. "
             f"Matched groups: {', '.join(state['matched_groups']) or '(none)'}. "
-            f"Columns found for {len(parsed_columns)} table(s)."
+            f"Columns refreshed via column-level retrieval for {len(parsed_columns)} table(s)."
         )
         return observation, []
 
@@ -1045,6 +1108,7 @@ async def execute_action(
                 previous_sql=state["current_sql"],
                 validation_errors=state["last_validation_errors"],
                 attempt=generation_count,
+                allowed_columns=state["allowed_columns"],
                 planner_instruction=action_input,
                 settings=settings,
             )
@@ -1364,7 +1428,14 @@ async def run(
                 "Previous SQL failed validation; regenerate SQL to fix validation errors."
             )
 
-        if action in {
+        parallel_iteration_one_retrieval = (
+            iteration == 1
+            and action == ReActAction.RETRIEVE_PAST_CORRECTIONS
+            and not state.get("past_corrections_checked")
+        )
+        parallel_schema_input = ""
+
+        if parallel_iteration_one_retrieval or action in {
             ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
             ReActAction.RETRIEVE_JOIN_PATHS,
             ReActAction.RETRIEVE_MORE_CONTEXT,
@@ -1378,21 +1449,39 @@ async def run(
                 message=f"Iteration {iteration} started schema retrieval.",
                 details={
                     "iteration": iteration,
-                    "action": action.value,
+                    "action": (
+                        ReActAction.RETRIEVE_SCHEMA_FOR_TABLES.value
+                        if parallel_iteration_one_retrieval
+                        else action.value
+                    ),
                     "top_k": top_k or settings.top_k,
+                    "parallel_with": (
+                        ReActAction.RETRIEVE_PAST_CORRECTIONS.value
+                        if parallel_iteration_one_retrieval
+                        else None
+                    ),
                 },
             )
         else:
             schema_started = None
 
-        observation, action_warnings = await execute_action(
-            action=action,
-            action_input=action_input,
-            query=query,
-            pool=pool,
-            settings=settings,
-            state=state,
-        )
+        if parallel_iteration_one_retrieval:
+            observation, action_warnings = await _execute_iteration_one_parallel_retrieval(
+                action_input=action_input,
+                query=query,
+                pool=pool,
+                settings=settings,
+                state=state,
+            )
+        else:
+            observation, action_warnings = await execute_action(
+                action=action,
+                action_input=action_input,
+                query=query,
+                pool=pool,
+                settings=settings,
+                state=state,
+            )
         if schema_started is not None:
             schema_duration = int((time.monotonic() - schema_started) * 1000)
             stage_latencies_ms["schema_retrieval"] = schema_duration
@@ -1404,15 +1493,50 @@ async def run(
                 duration_ms=schema_duration,
                 details={
                     "iteration": iteration,
-                    "action": action.value,
+                    "action": (
+                        ReActAction.RETRIEVE_SCHEMA_FOR_TABLES.value
+                        if parallel_iteration_one_retrieval
+                        else action.value
+                    ),
                     "tables_in_scope": state.get("tables_in_scope", []),
                     "retrieved_tables": sorted(state.get("retrieved_tables", set())),
                     "context_confidence_score": state.get("context_confidence_score"),
+                    "parallel_with": (
+                        ReActAction.RETRIEVE_PAST_CORRECTIONS.value
+                        if parallel_iteration_one_retrieval
+                        else None
+                    ),
                 },
             )
-        completed_action = action
+        completed_action = (
+            ReActAction.RETRIEVE_SCHEMA_FOR_TABLES
+            if parallel_iteration_one_retrieval
+            else action
+        )
 
-        state["actions_taken"].append((action.value, _action_target(action, action_input, state)))
+        if parallel_iteration_one_retrieval:
+            state["actions_taken"].append(
+                (
+                    ReActAction.RETRIEVE_PAST_CORRECTIONS.value,
+                    _action_target(
+                        ReActAction.RETRIEVE_PAST_CORRECTIONS,
+                        action_input,
+                        state,
+                    ),
+                )
+            )
+            state["actions_taken"].append(
+                (
+                    ReActAction.RETRIEVE_SCHEMA_FOR_TABLES.value,
+                    _action_target(
+                        ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
+                        parallel_schema_input,
+                        state,
+                    ),
+                )
+            )
+        else:
+            state["actions_taken"].append((action.value, _action_target(action, action_input, state)))
 
         blocking_action_warnings = _blocking_warnings(action_warnings)
         if action == ReActAction.GENERATE_SQL and not blocking_action_warnings:
@@ -1448,6 +1572,8 @@ async def run(
                 "sql_preview": (state.get("current_sql") or "")[:500],
                 "tables_in_scope": state.get("tables_in_scope", []),
                 "tables_used": state.get("tables_used", []),
+                "matched_groups": state.get("matched_groups", []),
+                "past_corrections_count": len(state.get("past_corrections") or []),
                 "context_confidence_score": state.get("context_confidence_score"),
                 "context_confidence_details": state.get("context_confidence_details", {}),
             },
@@ -1687,3 +1813,43 @@ def _result_value(result: Any, field: str) -> Any:
     if isinstance(result, dict):
         return result[field]
     return getattr(result, field)
+
+
+async def _execute_iteration_one_parallel_retrieval(
+    *,
+    action_input: str,
+    query: str,
+    pool: asyncpg.Pool,
+    settings: Settings,
+    state: dict[str, Any],
+) -> tuple[str, list[SqlWarning]]:
+    """
+    Bootstrap iteration 1 by loading correction memory and initial schema
+    context concurrently. Both actions mutate the same planner state before
+    iteration 2 is allowed to plan.
+    """
+    past_result, schema_result = await asyncio.gather(
+        execute_action(
+            action=ReActAction.RETRIEVE_PAST_CORRECTIONS,
+            action_input=action_input,
+            query=query,
+            pool=pool,
+            settings=settings,
+            state=state,
+        ),
+        execute_action(
+            action=ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
+            action_input="",
+            query=query,
+            pool=pool,
+            settings=settings,
+            state=state,
+        ),
+    )
+    past_observation, past_warnings = past_result
+    schema_observation, schema_warnings = schema_result
+    observation = (
+        f"Past corrections: {past_observation}\n"
+        f"Schema retrieval: {schema_observation}"
+    )
+    return observation, [*past_warnings, *schema_warnings]

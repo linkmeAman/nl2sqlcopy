@@ -29,6 +29,22 @@ LIMIT $2
 """
 
 
+async def _fetch_vector_rows(
+    conn: asyncpg.Connection,
+    sql: str,
+    query_vec: list[float],
+    top_k: int,
+    *extra_params: object,
+) -> list[asyncpg.Record]:
+    ef_search = max(1, int(settings.vector_hnsw_ef_search))
+    transaction = getattr(conn, "transaction", None)
+    if transaction is None:
+        return await conn.fetch(sql, query_vec, top_k, *extra_params)
+    async with transaction():
+        await conn.execute(f"SET LOCAL hnsw.ef_search = {ef_search}")
+        return await conn.fetch(sql, query_vec, top_k, *extra_params)
+
+
 async def _embed_for_retrieval(text: str) -> list[float]:
     await emit_current_trace_event(
         event="embedding_generation_started",
@@ -90,7 +106,7 @@ async def retrieve(
     )
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(_QUERY_SQL, query_vec, top_k)
+        rows = await _fetch_vector_rows(conn, _QUERY_SQL, query_vec, top_k)
 
     results: list[QueryResult] = []
     for row in rows:
@@ -148,6 +164,23 @@ LIMIT $2
 """
 
 
+_COLUMN_QUERY_SQL = """
+SELECT
+    content,
+    1 - (embedding <=> $1) AS similarity,
+    source,
+    chunk_index,
+    token_count,
+    embedding_model,
+    metadata
+FROM nl2sql_embeddings
+WHERE metadata->>'type' = 'column_catalog'
+  AND COALESCE(metadata->>'table_name', metadata->>'object_name') = ANY($3::text[])
+ORDER BY embedding <=> $1
+LIMIT $2
+"""
+
+
 async def retrieve_groups(
     query: str,
     top_k: int,
@@ -175,7 +208,7 @@ async def retrieve_groups(
     )
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(_GROUP_QUERY_SQL, query_vec, top_k)
+        rows = await _fetch_vector_rows(conn, _GROUP_QUERY_SQL, query_vec, top_k)
 
     results: list[QueryResult] = []
     matched_groups: list[str] = []
@@ -277,3 +310,78 @@ async def retrieve_groups(
         context=context,
         results=results,
     )
+
+
+async def retrieve_column_catalog(
+    *,
+    query: str,
+    tables: list[str],
+    top_k: int,
+    pool: asyncpg.Pool,
+    search_query: str | None = None,
+) -> list[QueryResult]:
+    normalized_tables = [
+        str(table).strip().lower()
+        for table in tables
+        if str(table).strip()
+    ]
+    if not normalized_tables:
+        return []
+
+    retrieval_started = time.monotonic()
+    query_vec = await _embed_for_retrieval(search_query or query)
+    await emit_current_trace_event(
+        event="vector_search_started",
+        stage="column_retrieval",
+        status="started",
+        message="Column-catalog vector search started.",
+        metadata={
+            "top_k": top_k,
+            "tables": normalized_tables,
+            "search_query_preview": summarize_text(search_query or query),
+        },
+    )
+
+    async with pool.acquire() as conn:
+        rows = await _fetch_vector_rows(
+            conn,
+            _COLUMN_QUERY_SQL,
+            query_vec,
+            top_k,
+            normalized_tables,
+        )
+
+    results: list[QueryResult] = []
+    for row in rows:
+        raw = row["metadata"]
+        if not raw:
+            metadata = {}
+        elif isinstance(raw, str):
+            metadata = json.loads(raw)
+        else:
+            metadata = dict(raw)
+        metadata["source"] = row["source"]
+        metadata["chunk_index"] = row["chunk_index"]
+        metadata["token_count"] = row["token_count"]
+        metadata["embedding_model"] = row["embedding_model"]
+        results.append(
+            QueryResult(
+                content=row["content"],
+                similarity=float(row["similarity"]),
+                metadata=metadata,
+            )
+        )
+
+    await emit_current_trace_event(
+        event="vector_search_completed",
+        stage="column_retrieval",
+        status="completed",
+        message="Column-catalog vector search completed.",
+        duration_ms=int((time.monotonic() - retrieval_started) * 1000),
+        output_summary={
+            "tables": normalized_tables,
+            "retrieved_chunks": len(results),
+            "similarity_scores": [round(result.similarity, 4) for result in results],
+        },
+    )
+    return results

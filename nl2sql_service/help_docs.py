@@ -116,7 +116,7 @@ ROUTE_DOCS: tuple[RouteDoc, ...] = (
         description="Use this page to inspect the active provider/model assignment for the natural-language answer step used by /ask and /ask/stream.",
         response_example={
             "provider": "ollama",
-            "model": "qwen3:4b",
+            "model": "deepseek-coder:6.7b",
             "api_key_configured": False,
         },
         error_cases=("GET should always succeed while the service is running.",),
@@ -129,11 +129,11 @@ ROUTE_DOCS: tuple[RouteDoc, ...] = (
         slug="patch-config-ask-model",
         title="Ask Model Patch",
         summary="Patch the model used by /ask answer generation.",
-        description="Use this route when you only want to change the provider/model used for the final answer step in /ask and /ask/stream.",
-        request_example={"provider": "ollama", "model": "qwen3:4b"},
+        description="Use this route when you only want to change the provider/model used for the final answer step in /ask and /ask/stream. Changes apply immediately to the running process and do not persist across restart.",
+        request_example={"provider": "ollama", "model": "deepseek-coder:6.7b"},
         response_example={
             "provider": "ollama",
-            "model": "qwen3:4b",
+            "model": "deepseek-coder:6.7b",
             "api_key_configured": False,
         },
         error_cases=("HTTP 422 when the resulting ask-model configuration is invalid.",),

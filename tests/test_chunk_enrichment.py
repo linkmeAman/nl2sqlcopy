@@ -62,6 +62,39 @@ async def test_business_aliases_in_chunk_text(
 
 
 @pytest.mark.asyncio
+async def test_column_aliases_are_embedded_from_synonym_map(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    entity = {
+        "entity_id": "contacts",
+        "chunk_group_name": "Contacts",
+        "root_table": "contact",
+        "root_table_ref": "contact",
+        "included_tables": [],
+        "summarized_tables": [],
+        "referenced_tables": [],
+        "excluded_tables": [],
+        "relation_ids": [],
+        "chunking_rules": [],
+        "rationale": "Contact directory",
+        "table_ref_map": {},
+        "secondary_memberships": [],
+    }
+
+    async def _columns(*args, **kwargs):
+        return {"contact": ["fname", "mobile"]}
+
+    monkeypatch.setattr(schema_loader, "get_entity", lambda _group: entity)
+    monkeypatch.setattr(schema_loader, "get_schema_version", lambda _group: "abcd1234")
+    monkeypatch.setattr(chunker, "load_columns_for_tables", _columns)
+
+    chunk = await chunker.chunk_schema_group("contacts", settings)
+
+    assert "first name" in chunk["text"]
+    assert "mobile number" in chunk["text"]
+
+
+@pytest.mark.asyncio
 async def test_no_alias_section_when_missing(
     monkeypatch: pytest.MonkeyPatch,
     mock_load_columns_for_ingest: AsyncMock,
@@ -217,3 +250,29 @@ async def test_schema_version_unchanged_when_only_mysql_changes(
     v2 = schema_loader.get_schema_version("billing")
 
     assert v1 == v2
+
+
+@pytest.mark.asyncio
+async def test_live_column_catalog_chunks_include_semantic_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        schema_loader,
+        "load_column_catalog",
+        AsyncMock(
+            return_value=[
+                {
+                    "table_name": "contact",
+                    "column_name": "fname",
+                    "data_type": "varchar",
+                    "ordinal_position": 1,
+                }
+            ]
+        ),
+    )
+
+    chunks = await schema_loader.load_live_column_catalog_chunks(settings)
+
+    assert len(chunks) == 1
+    assert chunks[0]["column_aliases"]
+    assert "first name" in chunks[0]["text"]

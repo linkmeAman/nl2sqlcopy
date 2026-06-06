@@ -58,8 +58,6 @@ async def ensure_hnsw_index(pool: asyncpg.Pool) -> None:
     parameter and is safer for mixed chunk populations and growing row counts.
     """
     sql = """
-    DROP INDEX IF EXISTS nl2sql_embed_idx;
-        DROP INDEX IF EXISTS nl2sql_embeddings_hnsw_idx;
     CREATE INDEX IF NOT EXISTS nl2sql_embed_hnsw_idx
       ON nl2sql_embeddings
       USING hnsw (embedding vector_cosine_ops)
@@ -330,7 +328,12 @@ async def ingest_enriched_knowledge(
     chunks: list[dict] = []
 
     if include_column_catalog:
-        column_chunks = schema_loader.load_column_catalog_chunks(limit=column_limit)
+        column_chunks = await schema_loader.load_live_column_catalog_chunks(
+            chunker.settings,
+            limit=column_limit,
+        )
+        if not column_chunks:
+            column_chunks = schema_loader.load_column_catalog_chunks(limit=column_limit)
         for chunk in column_chunks:
             chunk["token_count"] = chunker.count_tokens(chunk["text"])
             chunk["embedding_model"] = chunker.settings.embedding_model

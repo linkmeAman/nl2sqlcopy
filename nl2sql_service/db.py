@@ -125,7 +125,8 @@ CREATE TABLE IF NOT EXISTS nl2sql_embeddings (
 
 CREATE INDEX IF NOT EXISTS nl2sql_embed_hnsw_idx
     ON nl2sql_embeddings
-    USING hnsw (embedding vector_cosine_ops);
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m=16, ef_construction=64);
 
 CREATE TABLE IF NOT EXISTS nl2sql_learned_patterns (
     id              SERIAL PRIMARY KEY,

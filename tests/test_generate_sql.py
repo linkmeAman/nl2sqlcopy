@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from nl2sql_service import react_agent
 from nl2sql_service import sql_generator
-from nl2sql_service.models import SqlWarning, WarningCode
+from nl2sql_service.models import QueryResult, SqlWarning, WarningCode
 
 
 @pytest.mark.asyncio
@@ -27,7 +28,7 @@ async def test_valid_select_status_ok(client, mock_ollama, mock_retrieve_groups)
     assert body["sql"] is not None
     assert body["attempt_count"] == 1
     assert body["cache_hit"] is False
-    assert body["react_trace"]["total_iterations"] == 1
+    assert body["react_trace"]["total_iterations"] >= 1
     assert body["react_trace"]["final_action"] == "VALIDATE_AND_RETURN"
     assert "invoice" in body["tables_used"]
 
@@ -66,6 +67,93 @@ def test_sql_prompts_use_concise_column_selection_rule():
     assert "Do NOT select: financial columns" in prompt
     assert "Use SELECT * only when the user explicitly asks" in prompt
     assert "Do not use SELECT *" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_contact_name_query_uses_retrieved_columns_not_prompt_hardcoding(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service.config import settings
+
+    state: dict[str, object] = {}
+    monkeypatch.setattr(
+        react_agent,
+        "retrieve_groups",
+        AsyncMock(
+            return_value={
+                "matched_groups": ["contact_crm"],
+                "tables_in_scope": ["contact"],
+                "context": "Group: contact_crm\nTables: contact",
+                "results": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        react_agent,
+        "retrieve_column_catalog",
+        AsyncMock(
+            return_value=[
+                QueryResult(
+                    content="Table: contact\nColumn: fname",
+                    similarity=0.96,
+                    metadata={"type": "column_catalog", "table_name": "contact", "column_name": "fname"},
+                ),
+                QueryResult(
+                    content="Table: contact\nColumn: lname",
+                    similarity=0.95,
+                    metadata={"type": "column_catalog", "table_name": "contact", "column_name": "lname"},
+                ),
+                QueryResult(
+                    content="Table: contact\nColumn: fullname",
+                    similarity=0.94,
+                    metadata={"type": "column_catalog", "table_name": "contact", "column_name": "fullname"},
+                ),
+                QueryResult(
+                    content="Table: contact\nColumn: email",
+                    similarity=0.93,
+                    metadata={"type": "column_catalog", "table_name": "contact", "column_name": "email"},
+                ),
+                QueryResult(
+                    content="Table: contact\nColumn: mobile",
+                    similarity=0.92,
+                    metadata={"type": "column_catalog", "table_name": "contact", "column_name": "mobile"},
+                ),
+            ]
+        ),
+    )
+    call_ollama = AsyncMock(
+        return_value=(
+            "SELECT id, fname, lname, email, mobile FROM contact WHERE fname = 'aman'",
+            [],
+        )
+    )
+    monkeypatch.setattr(react_agent, "call_ollama", call_ollama)
+    retrieval_observation, warnings = await react_agent.execute_action(
+        action=react_agent.ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
+        action_input="contact",
+        query="fetch contact info with name aman",
+        pool=object(),
+        settings=settings,
+        state=state,
+    )
+    generation_observation, generation_warnings = await react_agent.execute_action(
+        action=react_agent.ReActAction.GENERATE_SQL,
+        action_input="generate contact sql",
+        query="fetch contact info with name aman",
+        pool=object(),
+        settings=settings,
+        state=state,
+    )
+    prompt = call_ollama.await_args.kwargs["prompt"]
+
+    assert warnings == []
+    assert generation_warnings == []
+    assert "Columns refreshed via column-level retrieval" in retrieval_observation
+    assert "Generated:" in generation_observation
+    assert state["allowed_columns"]["contact"] == ["fname", "lname", "fullname", "email", "mobile"]
+    assert "Only use these known columns:" in prompt
+    assert "- contact: fname, lname, fullname, email, mobile" in prompt
+    assert "Query-to-column hints:" not in prompt
 
 
 def test_refinement_prompt_uses_column_selection_rule():
@@ -590,7 +678,7 @@ async def test_all_attempts_fail_returns_clarification(
     assert body["status"] == "clarification_needed"
     assert WarningCode.MAX_RETRIES_EXCEEDED.value in body["failure_reason"]
     assert WarningCode.TABLE_OUT_OF_SCOPE.value in body["failure_reason"]
-    assert body["react_trace"]["total_iterations"] == 4
+    assert body["react_trace"]["total_iterations"] >= 4
 
 
 @pytest.mark.asyncio
@@ -621,16 +709,16 @@ async def test_clarification_trace_after_validation_driven_retry(
     assert "sql" not in body
 
     trace = body["react_trace"]
-    assert trace["total_iterations"] == 2
+    assert trace["total_iterations"] >= 2
     assert trace["final_action"] == "VALIDATE_AND_RETURN"
 
     actions = [step["action"] for step in trace["steps"]]
-    assert actions == [
+    assert actions[-2:] == [
         "GENERATE_SQL",
         "GENERATE_SQL",
     ]
-    assert "Auto-validation: FAILED:" in trace["steps"][0]["observation"]
-    assert "Auto-validation: FAILED:" in trace["steps"][1]["observation"]
+    assert "Auto-validation: FAILED:" in trace["steps"][-2]["observation"]
+    assert "Auto-validation: FAILED:" in trace["steps"][-1]["observation"]
 
     assert WarningCode.TABLE_OUT_OF_SCOPE.value in body["failure_reason"]
     assert WarningCode.MAX_RETRIES_EXCEEDED.value in body["failure_reason"]

@@ -1170,7 +1170,7 @@ def _model_routing_snapshot() -> ModelRoutingSnapshot:
         ),
         query_rewrite=_routing_section(
             provider=settings.query_rewrite_model_provider or settings.llm_provider,
-            model=settings.query_rewrite_model,
+            model=settings.effective_query_rewrite_model,
             api_key=settings.query_rewrite_model_api_key or settings.llm_api_key,
             base_url=settings.query_rewrite_model_base_url or settings.llm_base_url,
             fallback_provider=settings.query_rewrite_fallback_provider or settings.llm_fallback_provider,
@@ -1380,7 +1380,7 @@ async def health_llm(role: str = "sql") -> dict[str, object]:
     model = {
         "sql": settings.sql_model or settings.llm_model,
         "reasoning": settings.reasoning_model,
-        "query_rewrite": settings.query_rewrite_model,
+        "query_rewrite": settings.effective_query_rewrite_model,
         "answer": settings.answer_model or settings.reasoning_model,
         "default": settings.llm_model,
     }[role]

@@ -104,6 +104,8 @@ Behavior:
 - resolves the same provider/model/fallback chain used by that workload
 - performs a short generation probe
 - returns provider, model, status, latency, and provider error details
+- `provider_config.status="ok"` means the role config is valid
+- top-level `status="unavailable"` means the live probe for that role did not succeed
 
 Example:
 
@@ -184,6 +186,7 @@ Behavior:
 - invalid provider combinations are rejected with HTTP `422`
 - successful updates apply immediately to the current process
 - changes are not persisted across process restarts
+- edit `.env` when you want different startup defaults after a restart
 
 ## PATCH /config/ask-model
 
@@ -205,6 +208,7 @@ Behavior:
 - invalid provider combinations are rejected with HTTP `422`
 - successful updates apply immediately to the current process
 - changes are not persisted across process restarts
+- edit `.env` when you want different startup defaults after a restart
 
 ## GET /health/runtime
 
@@ -937,7 +941,9 @@ EMBEDDING_MODEL=bge-large-en-v1.5
 EMBEDDING_DIMENSION=1024
 
 VECTOR_PROVIDER=pgvector
+VECTOR_HNSW_EF_SEARCH=40
 TOP_K=5
+REACT_MAX_ITERATIONS=2
 SQL_GENERATION_TIMEOUT=90
 ASK_TIMEOUT=105
 EMBED_CACHE_TTL_SECONDS=3600
@@ -945,10 +951,16 @@ SQL_CACHE_TTL_SECONDS=3600
 ASK_CACHE_TTL_SECONDS=300
 SQL_CACHE_ENABLED=true
 ASK_CACHE_ENABLED=true
-ASK_CACHE_SEMANTIC_THRESHOLD=0.97
+CACHE_SEMANTIC_THRESHOLD_ASK=0.92
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
 ```
 
-Provider/model routing is environment-driven. Role-specific `SQL_*`,
-`REASONING_*`, `QUERY_REWRITE_*`, and `ANSWER_*` settings override the global
-`LLM_*` defaults for those workloads.
+Provider/model routing is environment-driven at startup. Role-specific
+`SQL_*`, `REASONING_*`, `QUERY_REWRITE_*`, and `ANSWER_*` settings override the
+global `LLM_*` defaults for those workloads. `PATCH /config/model-routing` and
+`PATCH /config/ask-model` override the running process only and do not persist
+across restart. `QUERY_REWRITE_FAST_MODEL` must contain a model name, not a
+base URL, and is used when `QUERY_REWRITE_MODEL` is unset. `EMBEDDING_DIMENSION`
+must match the embedding model; `bge-small-en-v1.5` uses `384` dimensions and
+is a lower latency alternative to the default `bge-large-en-v1.5`
+`1024`-dimension model.

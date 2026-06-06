@@ -9,6 +9,7 @@ from nl2sql_service.models import SchemaTable
 from nl2sql_service import schema_loader
 from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service.config import Settings
+from nl2sql_service.synonym_map import aliases_for_column_introspection
 
 Chunk = dict[str, Any]
 
@@ -143,7 +144,14 @@ async def chunk_schema_group(
     for table in tables:
         cols = allowed_columns.get(table.lower(), []) if allowed_columns else []
         if cols:
-            lines.append(f"  {table}: {', '.join(cols)}")
+            enriched_columns = []
+            for column in cols:
+                aliases = aliases_for_column_introspection(column)
+                if aliases:
+                    enriched_columns.append(f"{column} ({'; '.join(aliases[:3])})")
+                else:
+                    enriched_columns.append(column)
+            lines.append(f"  {table}: {', '.join(enriched_columns)}")
         else:
             lines.append(f"  {table}: (columns unavailable)")
 

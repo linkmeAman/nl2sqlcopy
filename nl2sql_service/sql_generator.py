@@ -498,6 +498,7 @@ def build_refinement_prompt(
     previous_sql: str,
     validation_errors: list[SqlWarning],
     attempt: int,
+    allowed_columns: dict[str, list[str]] | None = None,
     planner_instruction: str = "",
     settings: Settings | None = None,
 ) -> str:

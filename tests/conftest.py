@@ -176,17 +176,9 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
             ),
         ]
     )
-    load_columns_mock: AsyncMock = AsyncMock(
-        return_value={
-            "invoice": ["id", "amount", "total", "member_id", "status"],
-            "member": ["id", "name", "status"],
-            "payment": ["id", "invoice_id", "amount", "method"],
-        }
-    )
     monkeypatch.setattr(sql_generator, "call_ollama", async_mock)
     monkeypatch.setattr(react_agent, "call_ollama", async_mock)
     monkeypatch.setattr(react_agent, "call_reasoning_model", reasoning_mock)
-    monkeypatch.setattr(react_agent, "load_columns_for_tables", load_columns_mock)
     monkeypatch.setattr(react_agent, "run_explain", AsyncMock(return_value=[]))
     return async_mock
 
@@ -206,6 +198,7 @@ def mock_retrieve_groups(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     )
     monkeypatch.setattr(retrieve, "retrieve_groups", async_mock)
     monkeypatch.setattr(react_agent, "retrieve_groups", async_mock)
+    monkeypatch.setattr(react_agent, "retrieve_column_catalog", AsyncMock(return_value=[]))
     return async_mock
 
 
@@ -412,6 +405,7 @@ def mock_react_retrieve(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         }
     )
     monkeypatch.setattr(react_agent, "retrieve_groups", async_mock)
+    monkeypatch.setattr(react_agent, "retrieve_column_catalog", AsyncMock(return_value=[]))
     return async_mock
 
 

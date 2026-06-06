@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from functools import lru_cache
 
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _OPENAI_COMPATIBLE = {"openai", "groq", "openrouter", "together", "togetherai"}
@@ -60,7 +60,8 @@ class Settings(BaseSettings):
     database_url: str
 
     # Embedding service. The default "custom" provider preserves the existing
-    # external bge-large FastAPI/TEI endpoint contract.
+    # external bge-large FastAPI/TEI endpoint contract. For lower latency,
+    # bge-small-en-v1.5 can be used with EMBEDDING_DIMENSION=384.
     embedding_api_url: str | None = None
     embedding_provider: str = "custom"
     embedding_api_key: str | None = None
@@ -104,7 +105,7 @@ class Settings(BaseSettings):
     reasoning_fallback_base_url: str | None = None
     reasoning_temperature: float = 0.6
     reasoning_timeout: int = 45
-    react_max_iterations: int = 4
+    react_max_iterations: int = 2
     react_confidence_threshold: float = 0.75
     react_confidence_tables_weight: float = 0.35
     react_confidence_join_paths_weight: float = 0.2
@@ -128,6 +129,7 @@ class Settings(BaseSettings):
     vector_provider: str = "pgvector"
     vector_base_url: str | None = None
     vector_api_key: str | None = None
+    vector_hnsw_ef_search: int = 40
     top_k: int = 5
     embed_cache_ttl_seconds: int = 3600
     sql_cache_ttl_seconds: int = 3600
@@ -135,13 +137,21 @@ class Settings(BaseSettings):
     embed_cache_enabled: bool = True
     ask_cache_ttl_seconds: int = 300
     ask_cache_enabled: bool = True
-    ask_cache_semantic_threshold: float = 0.97
+    ask_cache_semantic_threshold: float = Field(
+        default=0.92,
+        validation_alias=AliasChoices(
+            "CACHE_SEMANTIC_THRESHOLD_ASK",
+            "ASK_CACHE_SEMANTIC_THRESHOLD",
+            "ask_cache_semantic_threshold",
+        ),
+    )
     sql_cache_semantic_threshold: float = 0.96
     min_pattern_use_count: int = 2
     min_instruction_confidence: float = 0.5
     query_rewrite_enabled: bool = True
     query_rewrite_model_provider: str | None = None
-    query_rewrite_model: str = "deepseek-coder:6.7b"
+    query_rewrite_model: str | None = None
+    query_rewrite_fast_model: str | None = None
     query_rewrite_model_api_key: str | None = None
     query_rewrite_model_base_url: str | None = None
     query_rewrite_fallback_provider: str | None = None
@@ -151,6 +161,9 @@ class Settings(BaseSettings):
     query_rewrite_timeout: int = 8
     query_rewrite_max_tokens: int = 120
     query_rewrite_hints: str = "counselor,counsellor,counsellors -> employee"
+    query_rewrite_synonym_map: str = str(
+        Path(__file__).resolve().parent / "data" / "synonyms.json"
+    )
 
     # App DB for live schema introspection (optional for enrichment)
     db_host: str = "localhost"
@@ -299,6 +312,8 @@ class Settings(BaseSettings):
                 provider = self.reasoning_model_provider or provider
 
             role_model = getattr(self, f"{role}_model", None) or self.llm_model
+            if role == "query_rewrite":
+                role_model = self.effective_query_rewrite_model
             if role == "answer" and not self.answer_model_provider and not self.answer_model:
                 role_model = self.reasoning_model or role_model
 
@@ -356,6 +371,14 @@ class Settings(BaseSettings):
             "issues": issues,
             "targets": targets,
         }
+
+    @property
+    def effective_query_rewrite_model(self) -> str:
+        return (
+            (self.query_rewrite_model or "").strip()
+            or (self.query_rewrite_fast_model or "").strip()
+            or self.llm_model
+        )
 
     def observability_log_dir_path(self) -> Path:
         configured = (self.observability_log_dir or "").strip() or "logs"

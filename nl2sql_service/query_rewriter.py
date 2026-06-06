@@ -9,6 +9,7 @@ import asyncpg
 from nl2sql_service import instruction_store
 from nl2sql_service.config import Settings
 from nl2sql_service.llm import get_model_client
+from nl2sql_service.synonym_map import expand_query_with_synonyms
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ async def _call_rewrite_model(
 ) -> str | None:
     client = get_model_client(
         settings=settings,
-        model=settings.query_rewrite_model,
+        model=settings.effective_query_rewrite_model,
         default_timeout=settings.query_rewrite_timeout,
         role="query_rewrite",
     )
@@ -174,19 +175,21 @@ async def rewrite_search_query(
 ) -> str:
     """Return the embedding search text, falling back to *query* on any failure."""
     original = " ".join(query.split())
-    if not settings.query_rewrite_enabled or not original:
+    if not original:
+        return query
+    if not settings.query_rewrite_enabled:
         return query
     if len(original.split()) <= 2:
         logger.info("Skipping rewrite for short query: '%s'", original)
-        return query
+        return expand_query_with_synonyms(query, settings)
 
     try:
         hints = await build_rewrite_hints(pool, settings)
         rewritten = await _call_rewrite_model(original, hints, settings)
     except Exception as exc:  # noqa: BLE001
         logger.info("Query rewrite failed; using original query: %s", exc)
-        return query
+        return expand_query_with_synonyms(query, settings)
 
     if not rewritten:
-        return query
-    return rewritten
+        return expand_query_with_synonyms(query, settings)
+    return expand_query_with_synonyms(rewritten, settings)
