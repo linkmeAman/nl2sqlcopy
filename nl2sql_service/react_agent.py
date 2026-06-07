@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 import asyncpg
 
+from nl2sql_service.column_loader import load_columns_for_tables
 from nl2sql_service import pattern_store
 from nl2sql_service import query_rewriter
 from nl2sql_service.config import Settings, settings as default_settings
@@ -28,9 +29,13 @@ from nl2sql_service.models import (
     WarningCode,
 )
 from nl2sql_service.observability.sanitization import summarize_text
+from nl2sql_service.roles import LLMRole
 from nl2sql_service.rulebook import build_governance_block, get_config
 from nl2sql_service.retrieve import retrieve, retrieve_column_catalog, retrieve_groups
 from nl2sql_service.sql_generator import (
+    PgVectorStore,
+    VectorStore,
+    _load_query_embedding,
     build_refinement_prompt,
     build_sql_prompt,
     call_ollama,
@@ -105,6 +110,9 @@ def _ensure_state_defaults(state: dict[str, Any]) -> None:
     state.setdefault("join_paths", [])
     state.setdefault("context_confidence_score", 0.0)
     state.setdefault("context_confidence_details", {})
+    state.setdefault("columns_refreshed_tables", set())
+    state.setdefault("generation_tables_in_scope", [])
+    state.setdefault("query_embedding", None)
 
 
 def _merge_ordered_strings(existing: list[str], incoming: list[str]) -> list[str]:
@@ -142,6 +150,107 @@ def _merge_context_block(current: str, new_block: str) -> str:
     if stripped_new in stripped_current:
         return stripped_current
     return f"{stripped_current}\n\n{stripped_new}"
+
+
+def _generation_tables_in_scope(state: dict[str, Any]) -> list[str]:
+    focused = [
+        _normalize_table_name(table)
+        for table in state.get("generation_tables_in_scope", [])
+        if str(table).strip()
+    ]
+    if focused:
+        return focused
+    return [
+        _normalize_table_name(table)
+        for table in state.get("tables_in_scope", [])
+        if str(table).strip()
+    ]
+
+
+def _generation_allowed_columns(state: dict[str, Any]) -> dict[str, list[str]]:
+    generation_tables = set(_generation_tables_in_scope(state))
+    allowed_columns = state.get("allowed_columns") or {}
+    if not generation_tables:
+        return allowed_columns
+    return {
+        _normalize_table_name(table): list(columns)
+        for table, columns in allowed_columns.items()
+        if _normalize_table_name(str(table)) in generation_tables
+    }
+
+
+async def _ensure_query_embedding(
+    *,
+    query: str,
+    state: dict[str, Any],
+) -> list[float] | None:
+    embedding = state.get("query_embedding")
+    if embedding is not None:
+        return embedding
+    try:
+        embedding = await _load_query_embedding(query)
+    except Exception:  # noqa: BLE001
+        embedding = None
+    state["query_embedding"] = embedding
+    return embedding
+
+
+async def _focused_tables_for_generation(
+    tables_in_scope: list[str],
+    query_embedding: list[float],
+    vector_store: VectorStore,
+    max_tables: int,
+) -> tuple[list[str], int]:
+    """
+    Focus SQL generation on the most relevant in-scope tables using column-level
+    similarity hits from the query embedding.
+    """
+    normalized_tables = []
+    seen_tables: set[str] = set()
+    for table in tables_in_scope:
+        normalized = _normalize_table_name(table)
+        if normalized and normalized not in seen_tables:
+            normalized_tables.append(normalized)
+            seen_tables.add(normalized)
+    if not normalized_tables or len(normalized_tables) <= max_tables:
+        return normalized_tables, 0
+
+    search_limit = max(max_tables * 8, len(normalized_tables) * 4)
+    hits = await vector_store.search_columns(
+        embedding=query_embedding,
+        top_k=search_limit,
+    )
+
+    table_scores: dict[str, float] = {}
+    first_hit_order: dict[str, int] = {}
+    column_hits_used = 0
+    for index, hit in enumerate(hits):
+        table_name = _normalize_table_name(hit.table_name)
+        if table_name not in seen_tables:
+            continue
+        column_hits_used += 1
+        first_hit_order.setdefault(table_name, index)
+        table_scores[table_name] = max(
+            float(hit.similarity),
+            table_scores.get(table_name, float("-inf")),
+        )
+
+    if not table_scores:
+        return normalized_tables[:max_tables], 0
+
+    original_order = {table: index for index, table in enumerate(normalized_tables)}
+    focused_tables = [
+        table_name
+        for table_name, _score in sorted(
+            table_scores.items(),
+            key=lambda item: (
+                -item[1],
+                first_hit_order[item[0]],
+                original_order[item[0]],
+            ),
+        )
+    ]
+    return focused_tables[:max_tables], column_hits_used
 
 
 def _action_target(action: ReActAction, action_input: str, state: dict[str, Any]) -> str:
@@ -585,11 +694,11 @@ async def call_reasoning_model(
         settings=settings,
         model=settings.reasoning_model,
         default_timeout=settings.reasoning_timeout,
-        role="reasoning",
+        role=LLMRole.REASONING.value,
     )
     response = await client.generate(
         prompt=prompt,
-        max_tokens=800,
+        max_tokens=settings.react_reasoning_max_tokens,
         temperature=settings.reasoning_temperature,
         enable_thinking=True,
         timeout=settings.reasoning_timeout,
@@ -983,6 +1092,10 @@ async def execute_action(
             refined_query,
             str(state.get("search_query") or query),
         )
+        state["query_embedding"] = await _ensure_query_embedding(
+            query=search_query,
+            state=state,
+        )
         result = await retrieve_groups(
             query=refined_query,
             top_k=state["top_k"],
@@ -1002,7 +1115,10 @@ async def execute_action(
         column_results = await retrieve_column_catalog(
             query=refined_query,
             tables=target_tables or tables_in_scope,
-            top_k=max(8, state["top_k"] * 4),
+            top_k=max(
+                settings.react_top_k_floor,
+                state["top_k"] * settings.react_top_k_multiplier,
+            ),
             pool=pool,
             search_query=search_query,
         )
@@ -1022,6 +1138,7 @@ async def execute_action(
             state.get("allowed_columns") or {},
             parsed_columns,
         )
+        state["columns_refreshed_tables"].update(parsed_columns)
         state["retrieved_tables"].update(target_tables or {
             _normalize_table_name(table)
             for table in tables_in_scope
@@ -1099,16 +1216,18 @@ async def execute_action(
 
     if action == ReActAction.GENERATE_SQL:
         generation_count = state["sql_generation_count"]
+        generation_tables = _generation_tables_in_scope(state)
+        generation_columns = _generation_allowed_columns(state)
         if state["current_sql"] and state["last_validation_errors"]:
             prompt = build_refinement_prompt(
                 query=query,
                 context=state["context"],
-                tables_in_scope=state["tables_in_scope"],
+                tables_in_scope=generation_tables,
                 dialect=settings.sql_dialect,
                 previous_sql=state["current_sql"],
                 validation_errors=state["last_validation_errors"],
                 attempt=generation_count,
-                allowed_columns=state["allowed_columns"],
+                allowed_columns=generation_columns,
                 planner_instruction=action_input,
                 settings=settings,
             )
@@ -1116,8 +1235,8 @@ async def execute_action(
             prompt = build_sql_prompt(
                 query=query,
                 context=state["context"],
-                tables_in_scope=state["tables_in_scope"],
-                allowed_columns=state["allowed_columns"],
+                tables_in_scope=generation_tables,
+                allowed_columns=generation_columns,
                 dialect=settings.sql_dialect,
                 planner_instruction=action_input,
                 settings=settings,
@@ -1131,7 +1250,7 @@ async def execute_action(
 
         sql = narrow_select_star(
             extract_sql(raw or ""),
-            state["allowed_columns"],
+            generation_columns,
             query,
         )
         state["current_sql"] = sql
@@ -1158,13 +1277,15 @@ async def execute_action(
         warnings.extend(safety_warnings)
 
         if not safety_warnings:
+            generation_tables = _generation_tables_in_scope(state)
+            generation_columns = _generation_allowed_columns(state)
             tables_used, table_warnings = validate_tables_used(
                 sql,
-                state["tables_in_scope"],
+                generation_tables,
             )
             state["tables_used"] = tables_used
             warnings.extend(table_warnings)
-            warnings.extend(validate_columns_used(sql, state["allowed_columns"]))
+            warnings.extend(validate_columns_used(sql, generation_columns))
 
             static_blocking = _blocking_warnings(warnings)
             if not static_blocking:
@@ -1238,11 +1359,11 @@ SUGGESTION_3: <optional third suggestion>
             settings=settings,
             model=settings.reasoning_model,
             default_timeout=settings.reasoning_timeout,
-            role="reasoning",
+            role=LLMRole.REASONING.value,
         )
         response = await client.generate(
             prompt=prompt,
-            max_tokens=300,
+            max_tokens=settings.react_planner_max_tokens,
             temperature=0.3,
             enable_thinking=False,
             timeout=settings.reasoning_timeout,
@@ -1314,6 +1435,9 @@ async def run(
         "join_paths": [],
         "context_confidence_score": 0.0,
         "context_confidence_details": {},
+        "columns_refreshed_tables": set(),
+        "generation_tables_in_scope": [],
+        "query_embedding": None,
     }
 
     steps: list[ReActStep] = []
@@ -1427,6 +1551,49 @@ async def run(
             action_input = (
                 "Previous SQL failed validation; regenerate SQL to fix validation errors."
             )
+
+        if action == ReActAction.GENERATE_SQL:
+            tables_before_focus = [
+                _normalize_table_name(table)
+                for table in state.get("tables_in_scope", [])
+                if str(table).strip()
+            ]
+            focused_tables = list(tables_before_focus)
+            column_hits_used = 0
+            query_embedding = await _ensure_query_embedding(
+                query=str(state.get("search_query") or query),
+                state=state,
+            )
+            if query_embedding is not None and tables_before_focus:
+                focused_tables, column_hits_used = await _focused_tables_for_generation(
+                    tables_in_scope=tables_before_focus,
+                    query_embedding=query_embedding,
+                    vector_store=PgVectorStore(pool),
+                    max_tables=settings.sql_generation_max_tables,
+                )
+            elif tables_before_focus:
+                focused_tables = tables_before_focus[: settings.sql_generation_max_tables]
+            state["generation_tables_in_scope"] = focused_tables
+            await _emit_trace(
+                trace_callback,
+                stage="sql_context_focus",
+                status="completed",
+                message="Focused SQL generation context to the most relevant tables.",
+                details={
+                    "tables_before_focus": len(tables_before_focus),
+                    "tables_after_focus": focused_tables,
+                    "column_hits_used": column_hits_used,
+                },
+            )
+            if (
+                len(tables_before_focus) > settings.sql_generation_max_tables
+                and not state.get("columns_refreshed_tables")
+                and focused_tables
+            ):
+                action = ReActAction.RETRIEVE_SCHEMA_FOR_TABLES
+                action_input = ",".join(focused_tables)
+        else:
+            state["generation_tables_in_scope"] = []
 
         parallel_iteration_one_retrieval = (
             iteration == 1

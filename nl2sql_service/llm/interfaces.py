@@ -5,6 +5,8 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from nl2sql_service.config import settings as default_settings
+
 
 @dataclass(frozen=True)
 class ProviderConfig:
@@ -121,9 +123,12 @@ class LLMProvider(ABC):
     async def health(self) -> dict[str, object]:
         response = await self.generate(
             "Return exactly: OK",
-            max_tokens=64,
+            max_tokens=default_settings.health_probe_max_tokens,
             temperature=0.0,
-            timeout=min(float(self.default_timeout), 10.0),
+            timeout=min(
+                float(self.default_timeout),
+                default_settings.health_probe_timeout_clamp,
+            ),
         )
         return {
             "provider": self.provider_name,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
+from uuid import UUID
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -158,6 +160,111 @@ class AskModelSnapshot(BaseModel):
     fallback_model: str | None
     fallback_base_url: str | None
     fallback_api_key_configured: bool
+
+
+# ---------------------------------------------------------------------------
+# Provider management
+# ---------------------------------------------------------------------------
+
+
+class CreateProviderRequest(BaseModel):
+    provider_name: str
+    display_name: str
+    base_url: str | None = None
+    org_id: str | None = None
+    is_local: bool = False
+    extra_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateProviderRequest(BaseModel):
+    display_name: str | None = None
+    base_url: str | None = None
+    org_id: str | None = None
+    is_active: bool | None = None
+    is_local: bool | None = None
+    extra_config: dict[str, Any] | None = None
+
+
+class ProviderConfig(BaseModel):
+    id: UUID
+    provider_name: str
+    display_name: str
+    base_url: str | None = None
+    org_id: str | None = None
+    is_active: bool
+    is_local: bool
+    extra_config: dict[str, Any] = Field(default_factory=dict)
+    key_count: int
+    model_count: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class AddApiKeyRequest(BaseModel):
+    key_label: str
+    api_key: str
+
+
+class ApiKeyRecord(BaseModel):
+    id: UUID
+    provider_id: UUID
+    key_label: str
+    key_prefix: str
+    is_active: bool
+    created_at: datetime
+
+
+class RegisterModelRequest(BaseModel):
+    provider_id: UUID
+    api_key_id: UUID | None = None
+    model_name: str
+    display_name: str | None = None
+    role: str = "general"
+    context_window: int | None = None
+    supports_tools: bool = False
+    supports_stream: bool = True
+    is_default: bool = False
+    extra_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class UpdateModelRequest(BaseModel):
+    display_name: str | None = None
+    api_key_id: UUID | None = None
+    context_window: int | None = None
+    supports_tools: bool | None = None
+    supports_stream: bool | None = None
+    is_default: bool | None = None
+    is_active: bool | None = None
+    extra_config: dict[str, Any] | None = None
+
+
+class ModelRecord(BaseModel):
+    id: UUID
+    provider_id: UUID
+    provider_name: str
+    model_name: str
+    display_name: str | None = None
+    role: str
+    is_default: bool
+    is_active: bool
+    supports_tools: bool
+    supports_stream: bool
+    context_window: int | None = None
+    api_key_id: UUID | None = None
+    extra_config: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class ActiveModelPatchRequest(BaseModel):
+    model_id: UUID
+
+
+class ProviderTestResult(BaseModel):
+    status: Literal["ok", "unreachable", "auth_failed", "timeout"]
+    latency_ms: int | None = None
+    available_models: list[str] = Field(default_factory=list)
+    error_message: str | None = None
 
 
 # ---------------------------------------------------------------------------

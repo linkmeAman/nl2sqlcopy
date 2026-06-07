@@ -77,7 +77,10 @@ async def create_pool() -> asyncpg.Pool:
     global _pool
     # Install the extension on a plain connection first so the `vector` type
     # exists before the pool's _init_conn callback tries to look up its OID.
-    raw = await asyncpg.connect(settings.database_url, timeout=10)
+    raw = await asyncpg.connect(
+        settings.database_url,
+        timeout=settings.db_connect_timeout,
+    )
     try:
         await raw.execute("CREATE EXTENSION IF NOT EXISTS vector")
     finally:
@@ -86,10 +89,10 @@ async def create_pool() -> asyncpg.Pool:
     _pool = await asyncpg.create_pool(
         settings.database_url,
         init=_init_conn,
-        max_size=10,
+        max_size=settings.db_pool_max_size,
         max_inactive_connection_lifetime=300,
-        command_timeout=30,
-        timeout=10,
+        command_timeout=settings.db_pool_command_timeout,
+        timeout=settings.db_connect_timeout,
     )
     logger.info("asyncpg pool created")
     return _pool
@@ -731,7 +734,7 @@ async def list_trace_events(
     pool: asyncpg.Pool,
     *,
     request_id: str,
-    limit: int = 500,
+    limit: int = settings.db_trace_events_limit_default,
 ) -> list[dict]:
     """Return ordered trace events for a single request id."""
     safe_limit = max(1, min(limit, 1000))
@@ -783,7 +786,7 @@ async def list_trace_events(
 async def list_recent_request_events(
     pool: asyncpg.Pool,
     *,
-    limit: int = 50,
+    limit: int = settings.db_recent_request_events_limit_default,
     endpoint: str | None = None,
 ) -> list[dict]:
     """Return recent request telemetry rows for operational inspection."""

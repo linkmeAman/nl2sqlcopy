@@ -84,6 +84,16 @@ class Settings(BaseSettings):
     llm_fallback_model: str | None = None
     llm_fallback_api_key: str | None = None
     llm_fallback_base_url: str | None = None
+    provider_key_encryption_secret: str | None = None
+    ollama_default_base_url: str = "http://localhost:11434"
+    anthropic_default_base_url: str = "https://api.anthropic.com/v1"
+    gemini_default_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    voyage_default_base_url: str = "https://api.voyageai.com/v1"
+    openai_default_base_url: str = "https://api.openai.com/v1"
+    health_probe_model_anthropic: str = "claude-3-5-haiku-latest"
+    health_probe_timeout_seconds: float = 10.0
+    health_probe_timeout_clamp: float = 10.0
+    health_probe_max_tokens: int = 64
 
     # Role-specific model routing. Any unset value falls back to LLM_*.
     sql_model_provider: str | None = None
@@ -117,7 +127,16 @@ class Settings(BaseSettings):
     react_join_path_limit: int = 5
     react_relation_retrieval_top_k: int = 8
     react_sample_query_limit: int = 3
+    react_reasoning_max_tokens: int = 800
+    react_planner_max_tokens: int = 300
+    react_top_k_multiplier: int = 4
+    react_top_k_floor: int = 8
     sql_generation_timeout: int = 90
+    sql_generation_max_tables: int = Field(
+        default=5,
+        description="Max tables passed to SQL generation context.",
+    )
+    sql_subcall_max_tokens: int = 150
     sql_dialect: str = "mysql"
 
     # HTTP client behaviour
@@ -173,6 +192,11 @@ class Settings(BaseSettings):
     db_name: str | None = None
     db_central: str | None = None
     db_reconnect_min_interval: float = 5.0
+    db_pool_max_size: int = 10
+    db_pool_command_timeout: int = 30
+    db_connect_timeout: int = 10
+    db_trace_events_limit_default: int = 500
+    db_recent_request_events_limit_default: int = 50
 
     # Answer generation settings for /ask
     answer_model_provider: str | None = None
@@ -190,6 +214,7 @@ class Settings(BaseSettings):
     answer_allow_reasoning: bool = False
     answer_strict_concise: bool = True
     ask_timeout: int = 105
+    ask_timeout_clamp_seconds: float = 1.0
 
     # Backend observability
     observability_service_name: str = "nl2sql-api"
@@ -220,6 +245,12 @@ class Settings(BaseSettings):
     governance_inject_react: bool = True
     governance_inject_sql: bool = True
     governance_inject_answer: bool = True
+    instruction_min_similarity: float = 0.75
+    instruction_min_confidence: float = 0.5
+    instruction_retrieval_limit: int = 5
+    row_cap_default: int = 50
+    telemetry_recent_limit_default: int = 50
+    telemetry_trace_limit_default: int = 500
 
     def provider_readiness_report(self) -> dict[str, object]:
         issues: list[dict[str, str]] = []

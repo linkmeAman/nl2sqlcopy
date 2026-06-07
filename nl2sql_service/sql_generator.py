@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import json
 import logging
 import re
 import time
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Protocol
 
 import asyncpg
 import sqlparse
@@ -29,11 +31,100 @@ from nl2sql_service.models import (
 )
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.sanitization import sanitize_sql, stable_hash, summarize_text
+from nl2sql_service.roles import LLMRole
 from nl2sql_service.rulebook import build_governance_block, get_config
 
 logger = logging.getLogger(__name__)
 
 TraceCallback = Callable[..., Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class ColumnSearchHit:
+    table_name: str
+    column_name: str
+    similarity: float = 0.0
+
+
+class VectorStore(Protocol):
+    async def search_columns(
+        self,
+        *,
+        embedding: list[float],
+        top_k: int,
+    ) -> list[ColumnSearchHit]:
+        ...
+
+
+# TODO: Move concrete vector-store calls up to the route/service layer and pass
+# list[ColumnSearchHit] into this module so SQL generation depends only on data,
+# not the pgvector adapter.
+_COLUMN_SIMILARITY_SQL = """
+SELECT
+    1 - (embedding <=> $1) AS similarity,
+    metadata
+FROM nl2sql_embeddings
+WHERE metadata->>'type' = 'column_catalog'
+ORDER BY embedding <=> $1
+LIMIT $2
+"""
+
+
+class PgVectorStore:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
+
+    async def search_columns(
+        self,
+        *,
+        embedding: list[float],
+        top_k: int,
+    ) -> list[ColumnSearchHit]:
+        async with self._pool.acquire() as conn:
+            rows = await retrieve._fetch_vector_rows(
+                conn,
+                _COLUMN_SIMILARITY_SQL,
+                embedding,
+                top_k,
+            )
+
+        hits: list[ColumnSearchHit] = []
+        for row in rows:
+            raw = row["metadata"]
+            if not raw:
+                metadata: dict[str, Any] = {}
+            elif isinstance(raw, str):
+                metadata = json.loads(raw)
+            else:
+                metadata = dict(raw)
+            table_name = _normalize_table_name(
+                str(metadata.get("table_name") or metadata.get("object_name") or "")
+            ).lower()
+            column_name = _normalize_table_name(str(metadata.get("column_name") or ""))
+            if not table_name or not column_name:
+                continue
+            hits.append(
+                ColumnSearchHit(
+                    table_name=table_name,
+                    column_name=column_name,
+                    similarity=float(row["similarity"]),
+                )
+            )
+        return hits
+
+
+class _StaticColumnSearchVectorStore:
+    def __init__(self, hits: list[ColumnSearchHit]):
+        self._hits = hits
+
+    async def search_columns(
+        self,
+        *,
+        embedding: list[float],
+        top_k: int,
+    ) -> list[ColumnSearchHit]:
+        del embedding
+        return self._hits[:top_k]
 
 
 async def _emit_trace(
@@ -152,16 +243,6 @@ _COLUMN_NAME_SKIP_KEYWORDS = {
 }
 _RECENT_QUERY_TERMS = ("recent", "latest", "newest", "last")
 _COUNT_RE = re.compile(r"\b(\d{1,3})\b")
-_RECENT_LIST_QUERY_RE = re.compile(
-    r"\b(?:show|list|get|fetch|display|find)\b.*\b(?:recent|latest|newest|last)\b"
-    r"|\b(?:recent|latest|newest|last)\b.*\b(?:show|list|get|fetch|display|find)\b"
-    r"|\b(?:recent|latest|newest|last)\b",
-    re.IGNORECASE,
-)
-_COMPLEX_QUERY_RE = re.compile(
-    r"\b(?:count|sum|average|avg|total|revenue|group by|per|by status|by month)\b",
-    re.IGNORECASE,
-)
 _FINANCIAL_QUERY_TERMS = (
     "amount",
     "balance",
@@ -200,8 +281,122 @@ def _quote_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
 
 
-def is_deterministic_generation_candidate(query: str) -> bool:
-    return bool(_RECENT_LIST_QUERY_RE.search(query)) and not _COMPLEX_QUERY_RE.search(query)
+async def _schema_is_self_contained(
+    query_embedding: list[float],
+    candidate_table: str,
+    retrieved_columns: list[str],
+    known_schema_tables: list[str],
+    matched_groups: list[str],
+    top_k: int,
+    vector_store: VectorStore,
+) -> bool:
+    del retrieved_columns
+    top_columns = await vector_store.search_columns(
+        embedding=query_embedding,
+        top_k=top_k,
+    )
+    candidate = _normalize_table_name(candidate_table).lower()
+    known_tables = {
+        _normalize_table_name(table).lower()
+        for table in known_schema_tables
+        if _normalize_table_name(table)
+    }
+    known_groups = {
+        _normalize_table_name(group).lower()
+        for group in matched_groups
+        if _normalize_table_name(group)
+    }
+    if candidate not in known_tables and candidate not in known_groups:
+        await emit_current_trace_event(
+            stage="deterministic_candidate_check",
+            status="warning",
+            message="Candidate table was not confirmed by retrieved schema context",
+            details={
+                "candidate_table": candidate,
+                "known_schema_tables": sorted(known_tables),
+                "matched_groups": sorted(known_groups),
+            },
+        )
+        return False
+
+    foreign_table_hits = [
+        column
+        for column in top_columns
+        if _normalize_table_name(column.table_name).lower() != candidate
+    ]
+    return len(foreign_table_hits) == 0
+
+
+async def is_deterministic_generation_candidate(
+    query: str,
+    query_embedding: list[float],
+    settings: Settings,
+    vector_store: VectorStore,
+    known_schema_tables: list[str],
+    matched_groups: list[str] | None = None,
+) -> bool:
+    del query
+    top_k = max(1, settings.top_k)
+    top_columns = await vector_store.search_columns(
+        embedding=query_embedding,
+        top_k=top_k,
+    )
+    if not top_columns:
+        await emit_current_trace_event(
+            stage="deterministic_candidate_check",
+            status="skipped",
+            message="No column similarity signals available",
+            details={"foreign_table_hits": []},
+        )
+        return False
+
+    candidate_table = _normalize_table_name(top_columns[0].table_name).lower()
+    retrieved_columns = [
+        _normalize_table_name(column.column_name)
+        for column in top_columns
+        if _normalize_table_name(column.table_name).lower() == candidate_table
+    ]
+    foreign_table_hits = sorted(
+        {
+            _normalize_table_name(column.table_name).lower()
+            for column in top_columns
+            if _normalize_table_name(column.table_name).lower() != candidate_table
+        }
+    )
+    self_contained = await _schema_is_self_contained(
+        query_embedding=query_embedding,
+        candidate_table=candidate_table,
+        retrieved_columns=retrieved_columns,
+        known_schema_tables=known_schema_tables,
+        matched_groups=matched_groups or [],
+        top_k=top_k,
+        vector_store=_StaticColumnSearchVectorStore(top_columns),
+    )
+    if not self_contained:
+        await emit_current_trace_event(
+            stage="deterministic_candidate_check",
+            status="skipped",
+            message="Column similarity signals cross-table join requirement",
+            details={"foreign_table_hits": foreign_table_hits},
+        )
+        return False
+
+    await emit_current_trace_event(
+        stage="deterministic_candidate_check",
+        status="passed",
+        message="Column similarity signals are self-contained",
+        details={
+            "candidate_table": candidate_table,
+            "retrieved_columns": retrieved_columns,
+            "known_schema_tables": [
+                _normalize_table_name(table).lower()
+                for table in known_schema_tables
+                if _normalize_table_name(table)
+            ],
+            "foreign_table_hits": [],
+        },
+    )
+    return True
 
 
 def _deterministic_limit(query: str, top_k: int, target_table: str | None = None) -> int:
@@ -396,9 +591,6 @@ def build_deterministic_sql(
     top_k: int,
 ) -> tuple[str, list[str]] | None:
     """Return validated-template SQL for high-confidence simple intents."""
-    if not is_deterministic_generation_candidate(query):
-        return None
-
     tables = list(allowed_columns)
     target_table = _choose_explicit_table(query, tables)
     if target_table is None:
@@ -573,7 +765,7 @@ async def call_ollama(
         settings=settings,
         model=settings.sql_model or settings.llm_model,
         default_timeout=settings.llm_timeout,
-        role="sql",
+        role=LLMRole.SQL.value,
     )
     await emit_current_trace_event(
         event="prompt_construction",
@@ -1058,11 +1250,11 @@ REASON: <one sentence explaining the verdict>
         settings=settings,
         model=settings.reasoning_model,
         default_timeout=15,
-        role="reasoning",
+        role=LLMRole.REASONING.value,
     )
     response = await client.generate(
         prompt=prompt,
-        max_tokens=150,
+        max_tokens=settings.sql_subcall_max_tokens,
         temperature=0.0,
         enable_thinking=False,
         timeout=15,
@@ -1197,12 +1389,44 @@ async def generate_sql(
                 _with_cache_metadata(cached, CacheSource.MEMORY_EXACT)
             )
 
-    # Semantic SQL cache: embed the query and look for a near-duplicate hit.
-    deterministic_candidate = is_deterministic_generation_candidate(query)
+    try:
+        query_embedding = await _load_query_embedding(query)
+    except Exception:
+        query_embedding = None
+
+    vector_store = PgVectorStore(pool)
+    deterministic_candidate = False
+    deterministic_retrieved: Any | None = None
+    deterministic_tables_in_scope: list[str] = []
+    deterministic_matched_groups: list[str] = []
+    if query_embedding is not None:
+        try:
+            search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+            deterministic_retrieved = await retrieve.retrieve_groups(
+                query=query,
+                top_k=effective_top_k,
+                pool=pool,
+                search_query=search_query,
+            )
+            deterministic_tables_in_scope = list(
+                _result_value(deterministic_retrieved, "tables_in_scope") or []
+            )
+            deterministic_matched_groups = list(
+                _result_value(deterministic_retrieved, "matched_groups") or []
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Deterministic schema context retrieval failed for query %r: %s", query[:80], exc)
+        deterministic_candidate = await is_deterministic_generation_candidate(
+            query=query,
+            query_embedding=query_embedding,
+            settings=settings,
+            vector_store=vector_store,
+            known_schema_tables=deterministic_tables_in_scope,
+            matched_groups=deterministic_matched_groups,
+        )
 
     if settings.sql_cache_enabled and not deterministic_candidate:
         try:
-            query_embedding = await _load_query_embedding(query)
             if query_embedding is None:
                 raise ValueError("query embedding unavailable")
             sem_cached = semantic_sql_cache.get_semantic(
@@ -1291,6 +1515,10 @@ async def generate_sql(
         pool=pool,
         settings=settings,
         top_k=effective_top_k,
+        query_embedding=query_embedding,
+        vector_store=vector_store,
+        deterministic_candidate=deterministic_candidate,
+        retrieved=deterministic_retrieved,
     )
     if deterministic_result is not None:
         await _emit_trace(
@@ -1437,18 +1665,24 @@ async def _try_deterministic_generation(
     pool: asyncpg.Pool,
     settings: Settings,
     top_k: int,
+    query_embedding: list[float] | None,
+    vector_store: VectorStore,
+    deterministic_candidate: bool,
+    retrieved: Any | None,
 ) -> GenerateSqlSuccess | None:
-    if not is_deterministic_generation_candidate(query):
+    del query_embedding, vector_store
+    if not deterministic_candidate:
         return None
 
     try:
-        search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
-        retrieved = await retrieve.retrieve_groups(
-            query=query,
-            top_k=top_k,
-            pool=pool,
-            search_query=search_query,
-        )
+        if retrieved is None:
+            search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+            retrieved = await retrieve.retrieve_groups(
+                query=query,
+                top_k=top_k,
+                pool=pool,
+                search_query=search_query,
+            )
         tables_in_scope = _result_value(retrieved, "tables_in_scope")
     except Exception as exc:  # noqa: BLE001
         logger.info("Deterministic retrieval failed for query %r: %s", query[:80], exc)

@@ -6,7 +6,7 @@ from typing import Any
 
 import sqlparse
 
-from nl2sql_service.config import Settings
+from nl2sql_service.config import Settings, settings
 from nl2sql_service.models import SqlWarning, WarningCode
 
 _LIMIT_OFFSET_TRAILING_RE = re.compile(
@@ -19,7 +19,7 @@ _LIMIT_COMMA_TRAILING_RE = re.compile(
 )
 
 
-def apply_row_cap(sql: str, cap: int = 50) -> str:
+def apply_row_cap(sql: str, cap: int = settings.row_cap_default) -> str:
     """Apply a top-level row cap to SQL execution while keeping SQL guardrails untouched."""
     stripped = sql.strip()
     if not stripped:

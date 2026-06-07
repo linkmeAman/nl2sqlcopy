@@ -28,14 +28,17 @@ from nl2sql_service import (
     ingest,
     mysql_executor,
     pattern_store,
+    provider_store,
     query_rewriter,
     retrieve,
     schema_loader,
 )
 from nl2sql_service.cache import ask_cache
 from nl2sql_service.config import settings
+from nl2sql_service.key_vault import KeyVaultUnavailableError, decrypt_api_key, is_key_vault_configured
 from nl2sql_service.llm.factory import LLMFactory
 from nl2sql_service.llm import metrics as llm_metrics
+from nl2sql_service.provider_health import list_provider_models, test_provider_connection
 from nl2sql_service.embed import (
     EmbeddingClientError,
     EmbeddingDimensionError,
@@ -72,20 +75,32 @@ from nl2sql_service.models import (
     IngestTextRequest,
     AskModelPatchRequest,
     AskModelSnapshot,
+    ActiveModelPatchRequest,
+    AddApiKeyRequest,
+    ApiKeyRecord,
     ModelRoutingPatchRequest,
     ModelRoutingSnapshot,
+    ModelRecord,
     LearningStatus,
     PatternFeedbackRequest,
+    ProviderConfig as ProviderConfigResponse,
+    ProviderTestResult,
     QueryRequest,
     QueryResponse,
+    RegisterModelRequest,
     SqlWarning,
     TeachRequest,
     TeachResponse,
+    UpdateModelRequest,
+    UpdateProviderRequest,
     WarningCode,
+    CreateProviderRequest,
 )
 from nl2sql_service.column_loader import load_columns_for_tables
+from nl2sql_service.roles import ALL_ROLES, GENERATION_ROLES, LLMRole
 from nl2sql_service.rulebook import RULES, get_active_rules, get_config
 from nl2sql_service.sql_generator import (
+    PgVectorStore,
     generate_sql,
     is_deterministic_generation_candidate,
     review_sql,
@@ -150,6 +165,12 @@ def _enrich_response_with_context(response: GenerateSqlResponse | AskResponse) -
 
 def _elapsed_ms(start: float) -> int:
     return max(0, int((time.monotonic() - start) * 1000))
+
+
+def _result_value(result: Any, field: str) -> Any:
+    if isinstance(result, dict):
+        return result[field]
+    return getattr(result, field)
 
 
 def _observability_log_dir() -> Path:
@@ -1266,6 +1287,81 @@ def _apply_ask_model_patch(patch: AskModelPatchRequest) -> AskModelSnapshot:
     return _ask_model_snapshot()
 
 
+def _env_role_summary(role: str) -> dict[str, object]:
+    if role == LLMRole.SQL.value:
+        return {
+            "provider": settings.sql_model_provider or settings.llm_provider,
+            "model": settings.sql_model or settings.llm_model,
+        }
+    if role == LLMRole.REASONING.value:
+        return {
+            "provider": settings.reasoning_model_provider or settings.llm_provider,
+            "model": settings.reasoning_model,
+        }
+    if role == LLMRole.QUERY_REWRITE.value:
+        return {
+            "provider": settings.query_rewrite_model_provider or settings.llm_provider,
+            "model": settings.effective_query_rewrite_model,
+        }
+    if role == LLMRole.ANSWER.value:
+        answer_section = _answer_model_section()
+        return {
+            "provider": answer_section["provider"],
+            "model": answer_section["model"],
+        }
+    if role == LLMRole.EMBEDDING.value:
+        return {
+            "provider": settings.embedding_provider,
+            "model": settings.embedding_model,
+        }
+    raise ValueError(f"Unsupported role: {role}")
+
+
+def _trace_recorder_for_request(request: Request, request_id: str | None = None) -> TraceRecorder:
+    resolved_request_id = _resolve_request_id(request_id)
+    return TraceRecorder(
+        pool=request.app.state.pool,
+        request_id=resolved_request_id,
+        pipeline=getattr(request.app.state, "observability_pipeline", None),
+    )
+
+
+def _apply_live_role_routing(
+    *,
+    role: str,
+    provider_name: str,
+    model_name: str,
+    base_url: str | None,
+    api_key: str | None,
+) -> None:
+    provider_field = "llm_provider" if role == "general" else f"{role}_model_provider"
+    model_field = "llm_model" if role == "general" else f"{role}_model"
+    base_url_field = "llm_base_url" if role == "general" else f"{role}_model_base_url"
+    api_key_field = "llm_api_key" if role == "general" else f"{role}_model_api_key"
+    setattr(settings, provider_field, provider_name)
+    setattr(settings, model_field, model_name)
+    setattr(settings, base_url_field, base_url)
+    setattr(settings, api_key_field, api_key)
+
+
+async def _select_provider_api_key(
+    pool: asyncpg.Pool,
+    provider_id,
+) -> str | None:
+    key_records = await provider_store.list_api_keys(pool, provider_id)
+    active_key = next((record for record in key_records if record.is_active), None)
+    if active_key is None:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT api_key_enc FROM nl2sql_llm_api_keys WHERE id = $1",
+            active_key.id,
+        )
+    if row is None or not row.get("api_key_enc"):
+        return None
+    return decrypt_api_key(str(row["api_key_enc"]))
+
+
 async def _runtime_readiness_report() -> dict[str, object]:
     mysql_target = await mysql_executor.mysql_target_readiness(settings)
     schema_assets = schema_loader.loader_readiness()
@@ -1372,17 +1468,17 @@ async def health(request: Request) -> dict:
 
 
 @app.get("/health/llm", tags=["ops"])
-async def health_llm(role: str = "sql") -> dict[str, object]:
-    allowed_roles = {"sql", "reasoning", "query_rewrite", "answer", "default"}
+async def health_llm(role: str = LLMRole.SQL.value) -> dict[str, object]:
+    allowed_roles = set(ALL_ROLES) - {LLMRole.EMBEDDING.value}
     if role not in allowed_roles:
         raise HTTPException(status_code=422, detail=f"Unsupported LLM health role: {role}")
 
     model = {
-        "sql": settings.sql_model or settings.llm_model,
-        "reasoning": settings.reasoning_model,
-        "query_rewrite": settings.effective_query_rewrite_model,
-        "answer": settings.answer_model or settings.reasoning_model,
-        "default": settings.llm_model,
+        LLMRole.SQL.value: settings.sql_model or settings.llm_model,
+        LLMRole.REASONING.value: settings.reasoning_model,
+        LLMRole.QUERY_REWRITE.value: settings.effective_query_rewrite_model,
+        LLMRole.ANSWER.value: settings.answer_model or settings.reasoning_model,
+        LLMRole.DEFAULT.value: settings.llm_model,
     }[role]
     timeout = min(settings.llm_timeout, 10)
     provider = LLMFactory.create_for_role(
@@ -1436,6 +1532,267 @@ async def get_ask_model() -> AskModelSnapshot:
 @app.patch("/config/ask-model", tags=["ops"])
 async def patch_ask_model(body: AskModelPatchRequest) -> AskModelSnapshot:
     return _apply_ask_model_patch(body)
+
+
+@app.patch("/config/active-model/{role}", tags=["ops"])
+async def patch_active_model(
+    role: str,
+    body: ActiveModelPatchRequest,
+    request: Request,
+) -> dict[str, object]:
+    pool = await _require_pool(request)
+    trace_recorder = _trace_recorder_for_request(request)
+    await trace_recorder.emit(
+        stage="provider_management",
+        status="started",
+        message="Updating active model for role.",
+        details={"role": role, "model_id": str(body.model_id)},
+    )
+    model = await provider_store.get_model_by_id(pool, body.model_id)
+    if model is None:
+        raise HTTPException(status_code=404, detail="Model not found.")
+    if model.role != role:
+        raise HTTPException(status_code=422, detail="Model role does not match requested role.")
+    default_model = await provider_store.set_default_model(pool, body.model_id, role)
+    provider = await provider_store.get_provider(pool, default_model.provider_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    api_key = await _select_provider_api_key(pool, provider.id)
+    _apply_live_role_routing(
+        role=role,
+        provider_name=provider.provider_name,
+        model_name=default_model.model_name,
+        base_url=provider.base_url,
+        api_key=api_key,
+    )
+    await trace_recorder.emit(
+        stage="provider_management",
+        status="completed",
+        message="Active model updated for role.",
+        details={"role": role, "provider_name": provider.provider_name, "model_name": default_model.model_name},
+    )
+    return {
+        "role": role,
+        "default_model": default_model.model_dump(mode="json"),
+        "live_routing": _model_routing_snapshot().model_dump(mode="json"),
+    }
+
+
+@app.get("/providers", response_model=list[ProviderConfigResponse], tags=["ops"])
+async def providers_list(request: Request) -> list[ProviderConfigResponse]:
+    pool = await _require_pool(request)
+    trace_recorder = _trace_recorder_for_request(request)
+    await trace_recorder.emit(stage="provider_management", status="started", message="Listing providers.")
+    providers = await provider_store.list_providers(pool)
+    await trace_recorder.emit(
+        stage="provider_management",
+        status="completed",
+        message="Listed providers.",
+        details={"provider_count": len(providers)},
+    )
+    return providers
+
+
+@app.post("/providers", response_model=ProviderConfigResponse, tags=["ops"])
+async def providers_create(body: CreateProviderRequest, request: Request) -> ProviderConfigResponse:
+    pool = await _require_pool(request)
+    trace_recorder = _trace_recorder_for_request(request)
+    await trace_recorder.emit(
+        stage="provider_management",
+        status="started",
+        message="Creating provider.",
+        details={"provider_name": body.provider_name},
+    )
+    provider = await provider_store.create_provider(pool, body)
+    await trace_recorder.emit(
+        stage="provider_management",
+        status="completed",
+        message="Provider created.",
+        details={"provider_id": str(provider.id)},
+    )
+    return provider
+
+
+@app.get("/providers/{provider_id}", response_model=ProviderConfigResponse, tags=["ops"])
+async def providers_get(provider_id: uuid.UUID, request: Request) -> ProviderConfigResponse:
+    pool = await _require_pool(request)
+    provider = await provider_store.get_provider(pool, provider_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    return provider
+
+
+@app.patch("/providers/{provider_id}", response_model=ProviderConfigResponse, tags=["ops"])
+async def providers_patch(
+    provider_id: uuid.UUID,
+    body: UpdateProviderRequest,
+    request: Request,
+) -> ProviderConfigResponse:
+    pool = await _require_pool(request)
+    try:
+        return await provider_store.update_provider(pool, provider_id, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/providers/{provider_id}", tags=["ops"])
+async def providers_delete(provider_id: uuid.UUID, request: Request) -> dict[str, object]:
+    pool = await _require_pool(request)
+    deleted = await provider_store.deactivate_provider(pool, provider_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    return {"ok": True, "provider_id": str(provider_id)}
+
+
+@app.post("/providers/{provider_id}/test", response_model=ProviderTestResult, tags=["ops"])
+async def provider_test(provider_id: uuid.UUID, request: Request) -> ProviderTestResult:
+    pool = await _require_pool(request)
+    provider = await provider_store.get_provider(pool, provider_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    api_key = await _select_provider_api_key(pool, provider_id) or ""
+    models = await provider_store.list_models(pool, active_only=True)
+    model_name = next((item.model_name for item in models if item.provider_id == provider_id), "")
+    return await test_provider_connection(provider.model_dump(mode="json"), api_key, model_name)
+
+
+@app.get("/providers/{provider_id}/models", tags=["ops"])
+async def provider_models(provider_id: uuid.UUID, request: Request) -> dict[str, object]:
+    pool = await _require_pool(request)
+    provider = await provider_store.get_provider(pool, provider_id)
+    if provider is None:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    api_key = await _select_provider_api_key(pool, provider_id) or ""
+    probe = await list_provider_models(provider.model_dump(mode="json"), api_key)
+    return probe.model_dump(mode="json")
+
+
+@app.post("/providers/{provider_id}/keys", response_model=ApiKeyRecord, tags=["ops"])
+async def provider_add_key(
+    provider_id: uuid.UUID,
+    body: AddApiKeyRequest,
+    request: Request,
+) -> ApiKeyRecord:
+    if not is_key_vault_configured():
+        raise HTTPException(status_code=503, detail="PROVIDER_KEY_ENCRYPTION_SECRET is not configured.")
+    pool = await _require_pool(request)
+    try:
+        return await provider_store.add_api_key(pool, provider_id, body.key_label, body.api_key)
+    except KeyVaultUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/providers/{provider_id}/keys", response_model=list[ApiKeyRecord], tags=["ops"])
+async def provider_keys(provider_id: uuid.UUID, request: Request) -> list[ApiKeyRecord]:
+    pool = await _require_pool(request)
+    return await provider_store.list_api_keys(pool, provider_id)
+
+
+@app.delete("/providers/{provider_id}/keys/{key_id}", tags=["ops"])
+async def provider_delete_key(
+    provider_id: uuid.UUID,
+    key_id: uuid.UUID,
+    request: Request,
+) -> dict[str, object]:
+    del provider_id
+    pool = await _require_pool(request)
+    deleted = await provider_store.deactivate_api_key(pool, key_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Key not found.")
+    return {"ok": True, "key_id": str(key_id)}
+
+
+@app.get("/model-registry", response_model=list[ModelRecord], tags=["ops"])
+async def model_registry_list(
+    request: Request,
+    role: str | None = None,
+    active_only: bool = True,
+) -> list[ModelRecord]:
+    pool = await _require_pool(request)
+    return await provider_store.list_models(pool, role=role, active_only=active_only)
+
+
+@app.post("/model-registry", response_model=ModelRecord, tags=["ops"])
+async def model_registry_create(
+    body: RegisterModelRequest,
+    request: Request,
+) -> ModelRecord:
+    pool = await _require_pool(request)
+    return await provider_store.register_model(pool, body)
+
+
+@app.patch("/model-registry/{model_id}", response_model=ModelRecord, tags=["ops"])
+async def model_registry_patch(
+    model_id: uuid.UUID,
+    body: UpdateModelRequest,
+    request: Request,
+) -> ModelRecord:
+    pool = await _require_pool(request)
+    try:
+        return await provider_store.update_model(pool, model_id, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/model-registry/{model_id}", tags=["ops"])
+async def model_registry_delete(model_id: uuid.UUID, request: Request) -> dict[str, object]:
+    pool = await _require_pool(request)
+    deleted = await provider_store.deactivate_model(pool, model_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Model not found.")
+    return {"ok": True, "model_id": str(model_id)}
+
+
+@app.post("/model-registry/{model_id}/set-default", response_model=ModelRecord, tags=["ops"])
+async def model_registry_set_default(model_id: uuid.UUID, request: Request) -> ModelRecord:
+    pool = await _require_pool(request)
+    existing = await provider_store.get_model_by_id(pool, model_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Model not found.")
+    return await provider_store.set_default_model(pool, model_id, existing.role)
+
+
+@app.get("/model-registry/default", tags=["ops"])
+async def model_registry_defaults(request: Request) -> dict[str, object]:
+    pool = await _require_pool(request)
+    defaults: dict[str, object] = {}
+    default_roles = [
+        "general",
+        *(generation_role.value for generation_role in GENERATION_ROLES),
+        LLMRole.EMBEDDING.value,
+    ]
+    for role in default_roles:
+        model = await provider_store.get_default_model(pool, role)
+        defaults[role] = model.model_dump(mode="json") if model is not None else None
+    return defaults
+
+
+@app.get("/model-registry/active-summary", tags=["ops"])
+async def model_registry_active_summary(request: Request) -> dict[str, object]:
+    pool = await _require_pool(request)
+    roles: dict[str, object] = {}
+    summary_roles = [
+        *(generation_role.value for generation_role in GENERATION_ROLES),
+        LLMRole.EMBEDDING.value,
+    ]
+    for role in summary_roles:
+        model = await provider_store.get_default_model(pool, role)
+        if model is not None:
+            roles[role] = {
+                "provider": model.provider_name,
+                "model": model.model_name,
+                "source": "db_registry",
+                "model_id": str(model.id),
+            }
+            continue
+        env_summary = _env_role_summary(role)
+        roles[role] = {
+            "provider": env_summary["provider"],
+            "model": env_summary["model"],
+            "source": "env_config",
+            "model_id": None,
+        }
+    return {"roles": roles}
 
 
 @app.get("/health/vector", tags=["ops"])
@@ -1498,7 +1855,7 @@ async def teach_metrics_endpoint(request: Request) -> dict[str, object]:
 @app.get("/telemetry/recent", tags=["ops"])
 async def telemetry_recent_endpoint(
     request: Request,
-    limit: int = 50,
+    limit: int = settings.telemetry_recent_limit_default,
     endpoint: str | None = None,
 ) -> dict[str, object]:
     """Return recent request telemetry events for quick operational debugging."""
@@ -1529,7 +1886,7 @@ async def telemetry_summary_endpoint(
 async def telemetry_trace_endpoint(
     request: Request,
     request_id: str,
-    limit: int = 500,
+    limit: int = settings.telemetry_trace_limit_default,
 ) -> dict[str, object]:
     """Return ordered per-stage trace events for one request id."""
     pool = await _require_pool(request)
@@ -2147,7 +2504,7 @@ async def ask_endpoint(
     )
     cache_epoch: int | None = None
     query_embedding: list[float] | None = None
-    deterministic_candidate = is_deterministic_generation_candidate(request.query)
+    deterministic_candidate = False
 
     # --- Ask cache: exact match -------------------------------------------------
     if settings.ask_cache_enabled:
@@ -2171,10 +2528,42 @@ async def ask_endpoint(
             )
             return _enrich_response_with_context(response)
 
+    try:
+        query_embedding = await _load_query_embedding(request.query)
+    except Exception:
+        logger.exception("Failed to load ask cache embedding")
+        query_embedding = None
+    if query_embedding is not None:
+        deterministic_tables_in_scope: list[str] = []
+        deterministic_matched_groups: list[str] = []
+        try:
+            search_query = await query_rewriter.rewrite_search_query(request.query, pool, settings)
+            deterministic_retrieved = await retrieve.retrieve_groups(
+                query=request.query,
+                top_k=top_k,
+                pool=pool,
+                search_query=search_query,
+            )
+            deterministic_tables_in_scope = list(
+                _result_value(deterministic_retrieved, "tables_in_scope") or []
+            )
+            deterministic_matched_groups = list(
+                _result_value(deterministic_retrieved, "matched_groups") or []
+            )
+        except Exception:
+            logger.exception("Failed to load deterministic schema context")
+        deterministic_candidate = await is_deterministic_generation_candidate(
+            query=request.query,
+            query_embedding=query_embedding,
+            settings=settings,
+            vector_store=PgVectorStore(pool),
+            known_schema_tables=deterministic_tables_in_scope,
+            matched_groups=deterministic_matched_groups,
+        )
+
     # --- Ask cache: semantic match -----------------------------------------------
     if settings.ask_cache_enabled and not deterministic_candidate:
         try:
-            query_embedding = await _load_query_embedding(request.query)
             if query_embedding is None:
                 raise ValueError("query embedding unavailable")
             sem_ask = ask_cache.get_semantic(
@@ -2871,7 +3260,10 @@ async def ask_stream_endpoint(
         while True:
             done, _ = await asyncio.wait(
                 {sql_task},
-                timeout=min(1, _remaining_timeout_seconds(started, settings.ask_timeout)),
+                timeout=min(
+                    settings.ask_timeout_clamp_seconds,
+                    _remaining_timeout_seconds(started, settings.ask_timeout),
+                ),
             )
             for event in await _drain_trace_queue(trace_queue):
                 yield _json_event("trace", **event)
@@ -3290,7 +3682,10 @@ async def ask_stream_endpoint(
             while True:
                 done, _ = await asyncio.wait(
                     {answer_task},
-                    timeout=min(1, _remaining_timeout_seconds(started, settings.ask_timeout)),
+                    timeout=min(
+                        settings.ask_timeout_clamp_seconds,
+                        _remaining_timeout_seconds(started, settings.ask_timeout),
+                    ),
                 )
                 for event in await _drain_trace_queue(trace_queue):
                     yield _json_event("trace", **event)

@@ -37,6 +37,23 @@ Base URL examples assume `http://localhost:8080`.
 - `PATCH /config/model-routing`
 - `GET /config/ask-model`
 - `PATCH /config/ask-model`
+- `PATCH /config/active-model/{role}`
+- `GET /providers`
+- `POST /providers`
+- `GET /providers/{id}`
+- `PATCH /providers/{id}`
+- `DELETE /providers/{id}`
+- `POST /providers/{id}/test`
+- `GET /providers/{id}/models`
+- `POST /providers/{id}/keys`
+- `GET /providers/{id}/keys`
+- `DELETE /providers/{id}/keys/{key_id}`
+- `GET /model-registry`
+- `POST /model-registry`
+- `PATCH /model-registry/{id}`
+- `DELETE /model-registry/{id}`
+- `POST /model-registry/{id}/set-default`
+- `GET /model-registry/default`
 - `GET /metrics/llm`
 - `GET /metrics/teach`
 - `GET /logs/days`
@@ -209,6 +226,65 @@ Behavior:
 - successful updates apply immediately to the current process
 - changes are not persisted across process restarts
 - edit `.env` when you want different startup defaults after a restart
+
+## PATCH /config/active-model/{role}
+
+Persists the default model for a role in the DB-backed model registry and
+patches the live process routing to match immediately.
+
+Request body:
+
+- `model_id`
+
+Behavior:
+
+- validates that the selected model exists
+- validates that the selected model matches the path role
+- updates the DB default for that role
+- updates live `settings` so the current process uses that provider/model
+- persists across restart because the DB registry becomes the source of truth
+
+## Provider Management
+
+Provider records:
+
+- `GET /providers`
+- `POST /providers`
+- `GET /providers/{id}`
+- `PATCH /providers/{id}`
+- `DELETE /providers/{id}`
+
+Provider probe and discovery:
+
+- `POST /providers/{id}/test`
+- `GET /providers/{id}/models`
+
+Provider key management:
+
+- `POST /providers/{id}/keys`
+- `GET /providers/{id}/keys`
+- `DELETE /providers/{id}/keys/{key_id}`
+
+Security behavior:
+
+- raw API keys are encrypted with AES-256-GCM before storage
+- responses include only `key_label` plus `key_prefix`
+- if `PROVIDER_KEY_ENCRYPTION_SECRET` is unset, key creation returns HTTP `503`
+
+## Model Registry
+
+- `GET /model-registry`
+- `POST /model-registry`
+- `PATCH /model-registry/{id}`
+- `DELETE /model-registry/{id}`
+- `POST /model-registry/{id}/set-default`
+- `GET /model-registry/default`
+
+Behavior:
+
+- only one active default per role is allowed
+- setting a new default unsets the old default for that role
+- provider deactivation also deactivates its registered models
 
 ## GET /health/runtime
 
@@ -872,10 +948,16 @@ Important notes:
 - execution is capped to 50 rows
 - successful `status="ok"` answers are cached even when `row_count = 0`
 - learned pattern saving remains restricted to successful non-empty result sets
-- deterministic recent-list queries bypass the answer model and return a
-  direct fallback answer
+- deterministic single-table queries proven by column similarity and retrieved
+  schema context bypass the answer model and return a direct fallback answer
 - non-deterministic queries still use the configured answer model for the
   final natural-language response
+- ReAct SQL generation now focuses broad schema scope down to the top
+  `SQL_GENERATION_MAX_TABLES` tables by column similarity before calling the
+  SQL model
+- if scope exceeds that cap and no column-level schema has been refreshed yet,
+  the planner inserts a focused `RETRIEVE_SCHEMA_FOR_TABLES` step before
+  `GENERATE_SQL`
 
 ## POST /ask/stream
 
@@ -904,10 +986,35 @@ Event names:
 
 Operational note:
 
-- deterministic recent-list queries skip the answer LLM and usually complete
+- deterministic single-table queries skip the answer LLM and usually complete
   much faster than non-deterministic asks
 - if answer generation is still slow, inspect `/config/ask-model` and the
   frontend proxy timeout
+
+Deterministic candidate logic is schema-driven:
+
+- top column-similarity hits must all belong to the same table
+- any foreign-table hit forces the ReAct path
+- the candidate table from the top hit must also be confirmed by retrieved
+  schema context, or the service emits a warning trace event and skips the
+  deterministic fast path
+
+ReAct SQL generation focus is also schema-driven:
+
+- when `tables_in_scope` is broader than `SQL_GENERATION_MAX_TABLES`, the
+  planner ranks in-scope tables by column similarity against the query
+- before `GENERATE_SQL`, the planner emits a `sql_context_focus` trace event
+  with the table count before focus, the focused table list, and the number of
+  column hits used
+- if no column-level schema has been refreshed yet, the planner forces a
+  targeted schema refresh on those focused tables before allowing SQL
+  generation
+
+## Documentation Maintenance
+
+Whenever a major or important runtime change is made, update `README.md` and
+`ROUTES.md` in the same change. If the production/runtime contract changes,
+update the operator-facing architecture docs as well.
 
 ## Example Cache-Aware Success
 
@@ -944,6 +1051,7 @@ VECTOR_PROVIDER=pgvector
 VECTOR_HNSW_EF_SEARCH=40
 TOP_K=5
 REACT_MAX_ITERATIONS=2
+SQL_GENERATION_MAX_TABLES=5
 SQL_GENERATION_TIMEOUT=90
 ASK_TIMEOUT=105
 EMBED_CACHE_TTL_SECONDS=3600
@@ -953,13 +1061,16 @@ SQL_CACHE_ENABLED=true
 ASK_CACHE_ENABLED=true
 CACHE_SEMANTIC_THRESHOLD_ASK=0.92
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
+PROVIDER_KEY_ENCRYPTION_SECRET=<32+ char secret>
 ```
 
 Provider/model routing is environment-driven at startup. Role-specific
 `SQL_*`, `REASONING_*`, `QUERY_REWRITE_*`, and `ANSWER_*` settings override the
 global `LLM_*` defaults for those workloads. `PATCH /config/model-routing` and
 `PATCH /config/ask-model` override the running process only and do not persist
-across restart. `QUERY_REWRITE_FAST_MODEL` must contain a model name, not a
+across restart. `PATCH /config/active-model/{role}` persists the selected role
+default in the DB-backed model registry and also patches the live process.
+`QUERY_REWRITE_FAST_MODEL` must contain a model name, not a
 base URL, and is used when `QUERY_REWRITE_MODEL` is unset. `EMBEDDING_DIMENSION`
 must match the embedding model; `bge-small-en-v1.5` uses `384` dimensions and
 is a lower latency alternative to the default `bge-large-en-v1.5`

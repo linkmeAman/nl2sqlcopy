@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from nl2sql_service.config import settings as default_settings
 from nl2sql_service.llm.interfaces import LLMResponse, ProviderConfig
 from nl2sql_service.llm.providers.base import BaseHTTPProvider, classify_http_error
 
@@ -29,7 +30,7 @@ class AnthropicProvider(BaseHTTPProvider):
 
     @property
     def _base_url(self) -> str:
-        return (self.config.base_url or "https://api.anthropic.com/v1").rstrip("/")
+        return (self.config.base_url or default_settings.anthropic_default_base_url).rstrip("/")
 
     async def generate(
         self,

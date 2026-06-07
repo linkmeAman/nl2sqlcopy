@@ -10,6 +10,7 @@ from typing import Any
 import asyncpg
 
 from nl2sql_service import embed
+from nl2sql_service.config import settings
 from nl2sql_service.models import (
     InstructionType,
     LearningStatus,
@@ -228,7 +229,7 @@ async def retrieve_similar_corrections(
     pool: asyncpg.Pool,
     *,
     limit: int = 3,
-    min_similarity: float = 0.75,
+    min_similarity: float = settings.instruction_min_similarity,
 ) -> list[dict]:
     if not query.strip():
         return []
@@ -483,8 +484,8 @@ async def get_relevant_instructions(
     query: str,
     tables_in_scope: list[str],
     pool: asyncpg.Pool,
-    min_confidence: float = 0.5,
-    limit: int = 5,
+    min_confidence: float = settings.instruction_min_confidence,
+    limit: int = settings.instruction_retrieval_limit,
 ) -> list[dict]:
     # Build a content-match needle from significant words in the query so that
     # instructions whose content mentions the same key terms are also returned
@@ -624,7 +625,7 @@ def build_failure_teach_suggestion(
 
 async def get_rewrite_term_mapping_hints(
     pool: asyncpg.Pool,
-    min_confidence: float = 0.5,
+    min_confidence: float = settings.instruction_min_confidence,
     limit: int = 8,
 ) -> list[str]:
     """Return active term mappings before table scope is known."""

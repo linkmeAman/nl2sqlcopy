@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from nl2sql_service.config import settings as default_settings
 from nl2sql_service.llm.interfaces import GenerateInput, LLMResponse, ProviderConfig, extract_think_block
 from nl2sql_service.llm.providers.base import BaseHTTPProvider, classify_http_error
 
@@ -23,14 +24,14 @@ class OllamaProvider(BaseHTTPProvider):
             config = ProviderConfig(
                 provider="ollama",
                 model=model or "",
-                base_url=base_url or "http://localhost:11434",
+                base_url=base_url or default_settings.ollama_default_base_url,
                 timeout=default_timeout,
             )
         super().__init__(config)
 
     @property
     def _base_url(self) -> str:
-        return (self.config.base_url or "http://localhost:11434").rstrip("/")
+        return (self.config.base_url or default_settings.ollama_default_base_url).rstrip("/")
 
     async def generate(
         self,

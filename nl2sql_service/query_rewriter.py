@@ -9,6 +9,7 @@ import asyncpg
 from nl2sql_service import instruction_store
 from nl2sql_service.config import Settings
 from nl2sql_service.llm import get_model_client
+from nl2sql_service.roles import LLMRole
 from nl2sql_service.synonym_map import expand_query_with_synonyms
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ async def _call_rewrite_model(
         settings=settings,
         model=settings.effective_query_rewrite_model,
         default_timeout=settings.query_rewrite_timeout,
-        role="query_rewrite",
+        role=LLMRole.QUERY_REWRITE.value,
     )
     response = await client.generate(
         prompt=build_rewrite_prompt(query, hints),

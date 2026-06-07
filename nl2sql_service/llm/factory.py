@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterable
+from typing import Any
 
 from nl2sql_service.config import Settings
 from nl2sql_service.llm.interfaces import LLMProvider, LLMResponse, ProviderConfig
@@ -9,6 +10,11 @@ from nl2sql_service.llm.metrics import record_llm_response
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.metrics import observe_provider
 from nl2sql_service.observability.sanitization import stable_hash
+from nl2sql_service.provider_registry import (
+    normalize_provider_name,
+    provider_compat,
+    provider_requires_key,
+)
 from nl2sql_service.llm.providers import (
     AnthropicProvider,
     GeminiProvider,
@@ -16,15 +22,6 @@ from nl2sql_service.llm.providers import (
     OpenAICompatibleProvider,
     VoyageProvider,
 )
-
-_OPENAI_COMPATIBLE = {"openai", "groq", "openrouter", "together", "togetherai"}
-_API_KEY_REQUIRED = _OPENAI_COMPATIBLE | {"anthropic", "claude", "gemini", "google", "voyage", "voyageai"}
-_PROVIDER_ALIASES = {
-    "claude": "anthropic",
-    "google": "gemini",
-    "together": "togetherai",
-    "voyageai": "voyage",
-}
 
 
 class UnsupportedModelClient(LLMProvider):
@@ -187,6 +184,7 @@ class LLMFactory:
     @staticmethod
     def create(config: ProviderConfig) -> LLMProvider:
         provider = normalize_provider(config.provider)
+        compat = provider_compat(provider)
         config = ProviderConfig(
             provider=provider,
             model=config.model,
@@ -204,15 +202,15 @@ class LLMFactory:
         if validation_error:
             return UnsupportedModelClient(provider=config.provider, model=config.model)
 
-        if provider == "ollama":
+        if compat == "ollama":
             return OllamaProvider(config=config)
-        if provider in _OPENAI_COMPATIBLE:
+        if compat == "openai" and provider not in {"voyage", "voyageai"}:
             return OpenAICompatibleProvider(config=config)
         if provider == "anthropic":
             return AnthropicProvider(config=config)
         if provider == "gemini":
             return GeminiProvider(config=config)
-        if provider == "voyage":
+        if provider in {"voyage", "voyageai"}:
             return VoyageProvider(config=config)
         return UnsupportedModelClient(provider=provider, model=config.model)
 
@@ -229,6 +227,55 @@ class LLMFactory:
         if len(providers) == 1:
             return FallbackLLMProvider(role=role, providers=providers)
         return FallbackLLMProvider(role=role, providers=providers)
+
+    @staticmethod
+    async def resolve_from_registry(
+        role: str,
+        pool: Any,
+    ) -> LLMProvider | None:
+        if pool is None:
+            return None
+        from nl2sql_service import provider_store
+        from nl2sql_service.key_vault import decrypt_api_key
+
+        model_config = await provider_store.get_default_model_config(pool, role)
+        if not model_config:
+            return None
+        decrypted_key = None
+        encrypted_key = model_config.get("api_key_enc")
+        if encrypted_key:
+            decrypted_key = decrypt_api_key(str(encrypted_key))
+        provider_config = ProviderConfig(
+            provider=str(model_config["provider_name"]),
+            model=str(model_config["model_name"]),
+            api_key=decrypted_key,
+            base_url=model_config.get("base_url"),
+            timeout=float((model_config.get("provider_extra_config") or {}).get("timeout") or 60),
+            role=str(model_config.get("role") or role),
+            extra_headers={
+                "OpenAI-Organization": str(model_config["org_id"])
+            } if model_config.get("org_id") and normalize_provider(str(model_config["provider_name"])) == "openai" else {},
+        )
+        return LLMFactory.create(provider_config)
+
+    @staticmethod
+    async def create_for_role_with_registry(
+        settings: Settings,
+        *,
+        role: str,
+        pool: Any,
+        model: str | None = None,
+        default_timeout: int | float | None = None,
+    ) -> LLMProvider:
+        provider = await LLMFactory.resolve_from_registry(role, pool)
+        if provider is not None:
+            return FallbackLLMProvider(role=role, providers=[provider])
+        return LLMFactory.create_for_role(
+            settings,
+            role=role,
+            model=model,
+            default_timeout=default_timeout,
+        )
 
     @staticmethod
     def create_embedding_provider(settings: Settings) -> LLMProvider:
@@ -260,8 +307,7 @@ def get_model_client(
 
 
 def normalize_provider(provider: str | None) -> str:
-    cleaned = (provider or "ollama").strip().lower().replace("-", "_")
-    return _PROVIDER_ALIASES.get(cleaned, cleaned)
+    return normalize_provider_name(provider)
 
 
 def resolve_secret(value: str | None) -> str | None:
@@ -283,7 +329,7 @@ def validate_provider_config(config: ProviderConfig) -> str | None:
         return "provider is required"
     if not config.model:
         return "model is required"
-    if config.provider in _API_KEY_REQUIRED and not config.api_key:
+    if provider_requires_key(config.provider) and not config.api_key:
         return f"{config.provider} requires an API key"
     return None
 

@@ -96,7 +96,9 @@ Runtime routing is separate from the env file. Use `/config/model-routing` to
 inspect or patch the full active process routing at runtime, or
 `/config/ask-model` when you only want to change the model used for `/ask`
 answer generation. Runtime route changes are not persisted across restart; edit
-`.env` when you want new startup defaults.
+`.env` when you want new startup defaults. For persistent DB-backed role
+defaults, use `/config/active-model/{role}` after registering providers and
+models in the provider registry.
 
 ## Key Runtime Paths
 
@@ -111,6 +113,16 @@ answer generation. Runtime route changes are not persisted across restart; edit
 - `GET /config/ask-model`, `PATCH /config/ask-model`
   - inspect and patch only the model used by `/ask` and `/ask/stream` answer
     generation
+- `GET /providers`, `POST /providers`, `GET /providers/{id}`, `PATCH /providers/{id}`, `DELETE /providers/{id}`
+  - manage DB-backed provider records including local endpoints and cloud base URLs
+- `POST /providers/{id}/test`, `GET /providers/{id}/models`
+  - probe provider connectivity and list discoverable models without exposing raw secrets
+- `POST /providers/{id}/keys`, `GET /providers/{id}/keys`, `DELETE /providers/{id}/keys/{key_id}`
+  - manage encrypted provider API keys; responses expose only hash prefixes for operator identification
+- `GET /model-registry`, `POST /model-registry`, `PATCH /model-registry/{id}`, `DELETE /model-registry/{id}`, `POST /model-registry/{id}/set-default`, `GET /model-registry/default`
+  - manage DB-backed model registry entries and persistent per-role defaults
+- `PATCH /config/active-model/{role}`
+  - persist a role's default model in the DB registry and patch the live process routing immediately
 - `GET /metrics/llm`, `GET /metrics/teach`, `GET /metrics/prometheus`
   - surface provider usage metrics, teach-confirmation operational drift, and Prometheus-formatted backend observability metrics
 - `GET /logs/days`, `GET /logs/recent`, `GET /logs/stream`
@@ -174,11 +186,30 @@ It now uses:
 
 Important runtime behavior:
 
+- iteration 1 bootstraps correction memory and initial schema retrieval together before iteration 2 planning begins
 - past corrections are injected into learned instructions before SQL planning
+- when broad group retrieval leaves too many tables in scope, SQL generation is focused down to the top `SQL_GENERATION_MAX_TABLES` tables by column similarity
+- if broad scope exceeds that cap and no column-level schema was refreshed yet, the planner runs a focused `RETRIEVE_SCHEMA_FOR_TABLES` step before allowing `GENERATE_SQL`
 - duplicate retrieval of the same table/action is blocked within a request
 - retrieval/setup actions do not consume the same retry budget as SQL-generation attempts
 - ReAct trace `details` include `context_confidence_score` and `context_confidence_details`
+- a `sql_context_focus` trace event records `tables_before_focus`, `tables_after_focus`, and `column_hits_used` before SQL generation
 - planner logic remains schema-driven and does not hardcode database-specific table names
+
+## Deterministic Fast Path
+
+The deterministic SQL path is no longer enabled by query keywords alone.
+
+It now requires all of the following:
+
+- the query embedding's top column-similarity hits all belong to one table
+- no top column hit points to another table, which would imply a join
+- the candidate table from the top column hit is confirmed by retrieved schema context
+  such as `tables_in_scope` from schema-group retrieval
+
+If any top column hit belongs to another table, or if the candidate table is not
+confirmed by retrieved schema context, the service skips deterministic SQL and
+falls back to the normal ReAct planner.
 
 ## Streaming Ask
 
@@ -203,11 +234,33 @@ execution, or answer generation exceeds the Ask budget, the service emits a
 `timeout` event followed by a `final` rejected response with
 `REQUEST_TIMEOUT`.
 
-Deterministic recent-list queries, such as "show me the 5 most recent contacts
-with name", bypass the answer LLM and return a direct fallback answer. For this
-class of query, the goal is to stay well under a 10 second budget. If the query
-is not deterministic, the final answer step still uses the configured answer
-model and can be slower.
+Schema-confirmed single-table deterministic queries bypass the answer LLM and
+return a direct fallback answer. This path is intended for simple requests where
+column-level similarity signals prove the answer can be satisfied from one table
+without joins. If that proof fails, the final answer step still uses the
+configured answer model and can be slower.
+
+## Documentation Maintenance
+
+For any major behavioral change, routing change, new config key, planner action
+change, cache strategy change, or observability event change:
+
+- update `README.md`
+- update `ROUTES.md`
+- update operator-facing architecture docs when the runtime contract changes
+
+Treat documentation updates as part of the code change, not a follow-up task.
+
+## Provider Management
+
+The provider layer now supports an optional DB-backed registry in addition to
+the existing env-based configuration.
+
+- env config still works as the fallback path and remains required for bootstrap-only deployments
+- DB-backed defaults win when a role is explicitly switched through the provider registry flow
+- encrypted provider keys are stored in `nl2sql_llm_api_keys`; raw keys never appear in API responses, logs, or trace payloads
+- `PROVIDER_KEY_ENCRYPTION_SECRET` must be configured before `POST /providers/{id}/keys` is allowed
+- the live process can still be patched ephemerally through `/config/model-routing`; `/config/active-model/{role}` is the persistent path
 
 ## Trace Events
 
@@ -391,6 +444,7 @@ VECTOR_PROVIDER=pgvector
 VECTOR_HNSW_EF_SEARCH=40
 TOP_K=5
 REACT_MAX_ITERATIONS=2
+SQL_GENERATION_MAX_TABLES=5
 SQL_GENERATION_TIMEOUT=90
 ASK_TIMEOUT=105
 EMBED_CACHE_TTL_SECONDS=3600
@@ -402,6 +456,7 @@ CACHE_SEMANTIC_THRESHOLD_ASK=0.92
 SQL_CACHE_SEMANTIC_THRESHOLD=0.96
 OBSERVABILITY_LOG_DIR=logs
 OBSERVABILITY_LOG_RETENTION_DAYS=30
+PROVIDER_KEY_ENCRYPTION_SECRET=<32+ char secret>
 ```
 
 ## Production Env Contract
@@ -425,6 +480,9 @@ hidden dev defaults.
 - `STARTUP_ENFORCEMENT_MODE=strict` turns provider/runtime readiness failures
   into startup failures. In `warn` mode, the service still starts and exposes
   those failures through `/health` and `/health/runtime`.
+- `PROVIDER_KEY_ENCRYPTION_SECRET` is required only for provider-key creation
+  and registry-backed cloud-secret storage. If it is unset, the service still
+  starts, but `POST /providers/{id}/keys` returns `503`.
 
 Use `GET /health/config` to inspect the resolved provider readiness report and
 `GET /health` to confirm the service is starting with `provider_config.status=ok`.

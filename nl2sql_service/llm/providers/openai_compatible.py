@@ -2,20 +2,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+from nl2sql_service.config import settings as default_settings
 from nl2sql_service.llm.adapters.openai import OpenAIAdapter
 from nl2sql_service.llm.interfaces import GenerateInput, LLMRequest, LLMResponse, ProviderConfig
 from nl2sql_service.llm.providers.base import BaseHTTPProvider
 
 
 class OpenAICompatibleProvider(BaseHTTPProvider):
-    DEFAULT_BASE_URLS = {
-        "openai": "https://api.openai.com/v1",
-        "groq": "https://api.groq.com/openai/v1",
-        "openrouter": "https://openrouter.ai/api/v1",
-        "togetherai": "https://api.together.xyz/v1",
-        "together": "https://api.together.xyz/v1",
-    }
-
     def __init__(
         self,
         config: ProviderConfig | None = None,
@@ -39,7 +32,7 @@ class OpenAICompatibleProvider(BaseHTTPProvider):
 
     @property
     def _base_url(self) -> str:
-        base_url = self.config.base_url or self.DEFAULT_BASE_URLS.get(self.provider_name)
+        base_url = self.config.base_url or default_settings.openai_default_base_url
         if not base_url:
             raise ValueError(f"No base URL configured for {self.provider_name}")
         return base_url.rstrip("/")
