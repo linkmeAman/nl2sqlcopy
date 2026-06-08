@@ -35,7 +35,10 @@ class _JsonFormatter(logging.Formatter):
         if isinstance(extra_payload, dict):
             payload.update(extra_payload)
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            exc_type = record.exc_info[0]
+            exc_value = record.exc_info[1]
+            payload["exception_type"] = exc_type.__name__ if exc_type else None
+            payload["exception"] = str(exc_value) if exc_value else None
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
@@ -44,6 +47,7 @@ def _build_file_handler(
     log_dir: Path,
     filename: str,
     retention_days: int,
+    level: int,
 ) -> logging.Handler:
     log_dir.mkdir(parents=True, exist_ok=True)
     handler = TimedRotatingFileHandler(
@@ -56,6 +60,7 @@ def _build_file_handler(
     )
     handler.suffix = "%Y-%m-%d"
     handler.setFormatter(_JsonFormatter())
+    handler.setLevel(level)
     return handler
 
 
@@ -66,6 +71,7 @@ def configure_logging(
     log_dir: Path | None = None,
     log_filename: str = "nl2sql.log",
     retention_days: int = 30,
+    file_log_level: int = logging.ERROR,
 ) -> None:
     root = logging.getLogger()
     for handler in root.handlers[:]:
@@ -81,6 +87,7 @@ def configure_logging(
                 log_dir=resolved_dir,
                 filename=log_filename,
                 retention_days=retention_days,
+                level=file_log_level,
             )
         )
     root.setLevel(level)
@@ -173,5 +180,9 @@ class AsyncObservabilityPipeline:
             if self.pool is not None and hasattr(self.pool, "acquire"):
                 try:
                     await self.persist_event(self.pool, event)
-                except Exception:  # noqa: BLE001
-                    logger.exception("Failed to persist observability event")
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Failed to persist observability event (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                    )

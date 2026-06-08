@@ -286,6 +286,7 @@ class Settings(BaseSettings):
     observability_log_dir: str = "logs"
     observability_log_file_basename: str = "nl2sql.log"
     observability_log_retention_days: int = 30
+    observability_file_log_level: str = "ERROR"
     otel_enabled: bool = True
     otel_exporter_otlp_endpoint: str | None = None
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 
 import asyncpg
 import pgvector.asyncpg  # registers the vector codec
@@ -601,8 +602,8 @@ async def insert_trace_event(
     errors: list[str] | None = None,
     details: dict | None = None,
     metadata: dict | None = None,
-    started_at: str | None = None,
-    ended_at: str | None = None,
+    started_at: datetime | str | None = None,
+    ended_at: datetime | str | None = None,
     schema_version: str | None = None,
 ) -> None:
     """Persist one sanitized per-stage trace event for request debugging."""

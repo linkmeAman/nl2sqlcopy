@@ -123,6 +123,11 @@ configure_logging(
     log_dir=settings.observability_log_dir_path(),
     log_filename=settings.observability_log_file_basename,
     retention_days=settings.observability_log_retention_days,
+    file_log_level=getattr(
+        logging,
+        settings.observability_file_log_level.upper(),
+        logging.ERROR,
+    ),
 )
 logger = logging.getLogger(__name__)
 
@@ -683,6 +688,18 @@ class TraceRecorder:
 async def _persist_trace_event(pool: asyncpg.Pool, event: dict[str, object]) -> None:
     if not hasattr(pool, "acquire"):
         return
+    def _parse_datetime(value: object) -> datetime | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        return None
+
     try:
         await db.insert_trace_event(
             pool,
@@ -716,12 +733,12 @@ async def _persist_trace_event(pool: asyncpg.Pool, event: dict[str, object]) -> 
             errors=[str(error) for error in (event.get("errors") or []) if error],
             details=event.get("metadata", {}).get("details", {}) if isinstance(event.get("metadata"), dict) else {},
             metadata=event.get("metadata") if isinstance(event.get("metadata"), dict) else {},
-            started_at=str(event.get("started_at") or "") or None,
-            ended_at=str(event.get("ended_at") or "") or None,
+            started_at=_parse_datetime(event.get("started_at")),
+            ended_at=_parse_datetime(event.get("ended_at")),
             schema_version=str(event.get("schema_version") or "") or None,
         )
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to write trace event")
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to write trace event (%s: %s)", type(exc).__name__, exc)
 
 
 async def _drain_trace_queue(queue: asyncio.Queue[dict[str, object]]) -> list[dict[str, object]]:
