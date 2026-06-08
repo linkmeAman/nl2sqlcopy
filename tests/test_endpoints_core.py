@@ -122,6 +122,80 @@ async def test_health_config_endpoint(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_health_llm_embedding_returns_200_when_probe_succeeds(
+    client: httpx.AsyncClient,
+) -> None:
+    from nl2sql_service import embed
+
+    with patch.object(
+        embed,
+        "health_probe",
+        AsyncMock(
+            return_value={
+                "role": "embedding",
+                "provider": "custom",
+                "model": "bge-large-en-v1.5",
+                "status": "ok",
+                "healthy": True,
+                "latency_ms": 12,
+                "last_probe_latency_ms": 12,
+                "message": "Embedding provider healthy.",
+                "source": "embedding_probe",
+            }
+        ),
+    ):
+        resp = await client.get("/health/llm", params={"role": "embedding"})
+
+    data = _ok(resp)
+    assert data["role"] == "embedding"
+    assert data["status"] == "ok"
+    assert data["healthy"] is True
+    assert data["provider"] == "custom"
+    assert data["last_probe_latency_ms"] == 12
+
+
+@pytest.mark.asyncio
+async def test_health_llm_embedding_returns_structured_degraded_response_when_unavailable(
+    client: httpx.AsyncClient,
+) -> None:
+    from nl2sql_service import embed
+
+    with patch.object(
+        embed,
+        "health_probe",
+        AsyncMock(
+            return_value={
+                "role": "embedding",
+                "provider": "custom",
+                "model": "bge-large-en-v1.5",
+                "status": "degraded",
+                "healthy": False,
+                "latency_ms": 4,
+                "last_probe_latency_ms": 4,
+                "message": "EMBEDDING_API_URL is not configured.",
+                "error_message": "EMBEDDING_API_URL is not configured.",
+                "error_type": "configuration",
+                "source": "embedding_probe",
+            }
+        ),
+    ):
+        resp = await client.get("/health/llm", params={"role": "embedding"})
+
+    data = _ok(resp)
+    assert data["role"] == "embedding"
+    assert data["status"] == "degraded"
+    assert data["healthy"] is False
+    assert data["error_message"] == "EMBEDDING_API_URL is not configured."
+
+
+@pytest.mark.asyncio
+async def test_health_llm_rejects_invalid_role(client: httpx.AsyncClient) -> None:
+    resp = await client.get("/health/llm", params={"role": "not-a-role"})
+    assert resp.status_code == 422
+    assert "Unsupported LLM health role" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_get_model_routing_endpoint(client: httpx.AsyncClient) -> None:
     resp = await client.get("/config/model-routing")
     data = _ok(resp)

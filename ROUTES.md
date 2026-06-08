@@ -114,20 +114,23 @@ Checks configured LLM connectivity for one workload role.
 
 Query parameters:
 
-- `role` - one of `sql`, `reasoning`, `query_rewrite`, `answer`, `default`
+- `role` - one of `sql`, `reasoning`, `query_rewrite`, `answer`, `embedding`, `default`
 
 Behavior:
 
 - resolves the same provider/model/fallback chain used by that workload
-- performs a short generation probe
+- performs a short generation probe for generation roles
+- performs a direct embedding probe for `role=embedding`
 - returns provider, model, status, latency, and provider error details
 - `provider_config.status="ok"` means the role config is valid
-- top-level `status="unavailable"` means the live probe for that role did not succeed
+- top-level `status="unavailable"`, `degraded`, or `error` means the live probe for that role did not succeed
+- `role=embedding` returns `200 OK` with a structured degraded payload when the embedding provider is unavailable or uninitialized
 
 Example:
 
 ```bash
 curl -s 'http://localhost:8080/health/llm?role=sql' | python -m json.tool
+curl -s 'http://localhost:8080/health/llm?role=embedding' | python -m json.tool
 ```
 
 ## GET /health

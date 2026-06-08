@@ -74,6 +74,123 @@ def _get_client() -> httpx.AsyncClient:
     return _client
 
 
+async def health_probe() -> dict[str, object]:
+    """Probe the configured embedding provider without requiring prior client init.
+
+    The probe is intentionally best-effort: a missing config or an unreachable
+    provider returns a structured degraded/unhealthy payload instead of raising.
+    """
+    probe_text = "embedding health probe"
+    started = time.monotonic()
+    provider_name = settings.embedding_provider
+    model_name = settings.embedding_model
+
+    base_result: dict[str, object] = {
+        "role": "embedding",
+        "provider": provider_name,
+        "model": model_name,
+        "healthy": False,
+        "status": "degraded",
+        "latency_ms": None,
+        "last_probe_latency_ms": None,
+        "message": None,
+        "error_message": None,
+        "error_type": None,
+        "source": "embedding_probe",
+    }
+
+    try:
+        if _is_custom_provider():
+            api_url = (settings.embedding_api_url or "").strip()
+            if not api_url:
+                raise RuntimeError("EMBEDDING_API_URL is not configured.")
+
+            async with httpx.AsyncClient(timeout=settings.embed_timeout) as client:
+                response = await client.post(api_url, json={"inputs": [probe_text]})
+
+            if response.status_code >= 500:
+                raise EmbeddingUpstreamError(
+                    f"Embedding server returned HTTP {response.status_code}: {response.text[:200]}"
+                )
+            if response.status_code >= 400:
+                raise EmbeddingClientError(
+                    f"Embedding server returned HTTP {response.status_code}: {response.text[:200]}"
+                )
+
+            payload = response.json()
+            if isinstance(payload, list):
+                embeddings = payload
+            else:
+                embeddings = payload.get("embeddings")
+            if not isinstance(embeddings, list):
+                raise EmbeddingClientError(
+                    f"Unexpected embedding response shape: {response.text[:200]}"
+                )
+            _validate_embeddings([probe_text], embeddings)
+        else:
+            provider = LLMFactory.create_embedding_provider(settings)
+            embeddings = await provider.embeddings([probe_text])
+            _validate_embeddings([probe_text], embeddings)
+
+        latency_ms = max(0, int((time.monotonic() - started) * 1000))
+        return {
+            **base_result,
+            "healthy": True,
+            "status": "ok",
+            "latency_ms": latency_ms,
+            "last_probe_latency_ms": latency_ms,
+            "message": "Embedding provider healthy.",
+        }
+    except RuntimeError as exc:
+        latency_ms = max(0, int((time.monotonic() - started) * 1000))
+        message = str(exc)
+        return {
+            **base_result,
+            "status": "degraded",
+            "latency_ms": latency_ms,
+            "last_probe_latency_ms": latency_ms,
+            "message": message,
+            "error_message": message,
+            "error_type": "configuration",
+        }
+    except httpx.TimeoutException as exc:
+        latency_ms = max(0, int((time.monotonic() - started) * 1000))
+        message = f"Embedding probe timed out: {exc}"
+        return {
+            **base_result,
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "last_probe_latency_ms": latency_ms,
+            "message": message,
+            "error_message": message,
+            "error_type": "timeout",
+        }
+    except (EmbeddingClientError, EmbeddingDimensionError, EmbeddingUpstreamError) as exc:
+        latency_ms = max(0, int((time.monotonic() - started) * 1000))
+        message = str(exc)
+        return {
+            **base_result,
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "last_probe_latency_ms": latency_ms,
+            "message": message,
+            "error_message": message,
+            "error_type": exc.__class__.__name__,
+        }
+    except Exception as exc:  # noqa: BLE001
+        latency_ms = max(0, int((time.monotonic() - started) * 1000))
+        message = str(exc)
+        return {
+            **base_result,
+            "status": "unhealthy",
+            "latency_ms": latency_ms,
+            "last_probe_latency_ms": latency_ms,
+            "message": message,
+            "error_message": message,
+            "error_type": exc.__class__.__name__,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Internal: single batch call with retry
 # ---------------------------------------------------------------------------

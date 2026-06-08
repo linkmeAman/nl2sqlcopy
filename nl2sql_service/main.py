@@ -1469,7 +1469,8 @@ async def health(request: Request) -> dict:
 
 @app.get("/health/llm", tags=["ops"])
 async def health_llm(role: str = LLMRole.SQL.value) -> dict[str, object]:
-    allowed_roles = set(ALL_ROLES) - {LLMRole.EMBEDDING.value}
+    role = role.strip()
+    allowed_roles = set(ALL_ROLES)
     if role not in allowed_roles:
         raise HTTPException(status_code=422, detail=f"Unsupported LLM health role: {role}")
 
@@ -1479,15 +1480,38 @@ async def health_llm(role: str = LLMRole.SQL.value) -> dict[str, object]:
         LLMRole.QUERY_REWRITE.value: settings.effective_query_rewrite_model,
         LLMRole.ANSWER.value: settings.answer_model or settings.reasoning_model,
         LLMRole.DEFAULT.value: settings.llm_model,
+        LLMRole.EMBEDDING.value: settings.embedding_model,
     }[role]
-    timeout = min(settings.llm_timeout, 10)
-    provider = LLMFactory.create_for_role(
-        settings,
-        role=role,
-        model=model,
-        default_timeout=timeout,
-    )
-    result = await provider.health()
+    if role == LLMRole.EMBEDDING.value:
+        result = await embed.health_probe()
+    else:
+        timeout = min(settings.llm_timeout, 10)
+        provider = LLMFactory.create_for_role(
+            settings,
+            role=role,
+            model=model,
+            default_timeout=timeout,
+        )
+        try:
+            result = await provider.health()
+        except Exception as exc:  # noqa: BLE001
+            result = {
+                "provider": provider.provider_name,
+                "model": provider.model_name,
+                "status": "error",
+                "healthy": False,
+                "latency_ms": None,
+                "last_probe_latency_ms": None,
+                "message": str(exc),
+                "error_message": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+    result.setdefault("role", role)
+    result.setdefault("provider", None)
+    result.setdefault("model", model)
+    result.setdefault("healthy", result.get("status") == "ok")
+    if result.get("last_probe_latency_ms") is None and result.get("latency_ms") is not None:
+        result["last_probe_latency_ms"] = result.get("latency_ms")
     provider_config = settings.provider_readiness_report()
     return {
         "role": role,
