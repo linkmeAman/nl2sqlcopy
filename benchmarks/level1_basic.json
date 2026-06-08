@@ -1,0 +1,93 @@
+{
+  "suite_id": "level1_basic",
+  "level": 1,
+  "title": "Level 1 - Basic",
+  "description": "Direct fact retrieval, exact keywords, and single-table schema matching.",
+  "cases": [
+    {
+      "id": "L1-001-recent-payments",
+      "query": "show me the 5 most recent payments",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["payment"],
+      "expected_keywords": ["payment"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM payment", "ORDER BY", "LIMIT"],
+        "must_exclude": ["JOIN"],
+        "must_use_tables": ["payment"],
+        "forbid_select_star": true,
+        "requires_order_by": true,
+        "requires_limit": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["payment should be top-ranked", "single-table query should not need a join"],
+        "investigation": "Check embedding recall for payment and the schema-group ranking order."
+      }
+    },
+    {
+      "id": "L1-002-recent-inquiries",
+      "query": "show me the 5 most recent inquiries",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["inquiry"],
+      "expected_keywords": ["inquiry"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM inquiry", "ORDER BY", "LIMIT"],
+        "must_exclude": ["JOIN"],
+        "must_use_tables": ["inquiry"],
+        "forbid_select_star": true,
+        "requires_order_by": true,
+        "requires_limit": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["inquiry should be found directly without joins"],
+        "investigation": "Inspect query rewrite, embedding recall, and schema-group retrieval for inquiry."
+      }
+    },
+    {
+      "id": "L1-003-active-members",
+      "query": "list active members",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["member"],
+      "expected_keywords": ["member"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM member", "WHERE"],
+        "must_use_tables": ["member"],
+        "must_exclude": ["JOIN", "DELETE", "UPDATE", "INSERT", "DROP"],
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["SCHEMA_RETRIEVAL_FAILURE", "PLANNING_FAILURE"],
+        "signals": ["member is a single-table lookup with a simple active filter"],
+        "investigation": "Check whether the planner is selecting the correct member schema group and filter column."
+      }
+    },
+    {
+      "id": "L1-004-contact-by-mobile",
+      "query": "find contact by mobile number",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["contact"],
+      "expected_keywords": ["contact", "mobile"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM contact", "WHERE", "mobile"],
+        "must_use_tables": ["contact"],
+        "must_exclude": ["JOIN"],
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "SQL_GENERATION_FAILURE"],
+        "signals": ["contact mobile should map to the contact table and mobile column"],
+        "investigation": "Check whether the column catalog retrieval surfaces mobile/fname/lname correctly."
+      }
+    }
+  ]
+}
+

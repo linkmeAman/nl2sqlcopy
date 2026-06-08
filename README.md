@@ -171,6 +171,48 @@ models in the provider registry.
 - `POST /ingest`, `POST /ingest/groups`, `POST /ingest/knowledge`, `POST /ingest/patterns`, `POST /ingest/instructions`
   - ingest free text, schema groups, enriched knowledge, learned patterns, and user instructions
 
+## NL2SQL Evaluation CLI
+
+Production evaluation runs live in `scripts/nl2sql_evaluate.py` and are designed to diagnose
+why a request failed, not just whether it failed.
+
+It reuses the existing backend lifecycle:
+
+- `POST /ask` and `POST /ask/stream` for execution
+- `GET /telemetry/trace/{request_id}` for full trace collection
+- `GET /failures` for failure-log enrichment
+- `POST /benchmark/cases` when `--sync-db` is enabled
+
+Benchmark suites live in `benchmarks/` and are split by difficulty:
+
+- `level1_basic.json`
+- `level2_intermediate.json`
+- `level3_advanced.json`
+- `level4_expert.json`
+- `level5_stress.json`
+
+Each case carries expected tables, keywords, SQL characteristics, and failure hints so the analyzer can
+classify the root cause into retrieval, chunking, reranking, schema retrieval, planning, SQL generation,
+SQL validation, execution, answer generation, cache, or provider failure buckets.
+
+Typical usage:
+
+```bash
+./.venv/bin/python scripts/nl2sql_evaluate.py \
+  --url http://localhost:8080 \
+  --benchmarks benchmarks \
+  --output-dir reports/evaluation \
+  --parallel 4 \
+  --require-ready
+```
+
+Outputs:
+
+- `reports/evaluation/evaluation_failures.jsonl`
+- `reports/evaluation/evaluation_summary.json`
+
+The `Makefile` target `make evaluate` runs the same CLI with the default local service URL.
+
 ## Current ReAct Planner
 
 The current ReAct planner is no longer a single repeated retrieval loop.

@@ -1,4 +1,4 @@
-.PHONY: setup run test ingest benchmark smoke smoke-report smoke-deploy sync-schema
+.PHONY: setup run test ingest benchmark evaluate smoke smoke-report smoke-deploy sync-schema
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 setup:
@@ -24,6 +24,14 @@ benchmark:
 	./.venv/bin/python scripts/nl2sql_replay_benchmark.py \
 		--url http://localhost:8080 \
 		--output reports/replay-$$(date +%F).json
+
+# ── Production NL2SQL evaluation suite ────────────────────────────────────
+evaluate:
+	mkdir -p reports/evaluation
+	./.venv/bin/python scripts/nl2sql_evaluate.py \
+		--url http://localhost:8080 \
+		--benchmarks benchmarks \
+		--output-dir reports/evaluation
 
 # ── Full-route smoke matrix ────────────────────────────────────────────────
 smoke:

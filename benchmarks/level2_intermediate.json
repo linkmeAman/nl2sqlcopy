@@ -1,0 +1,91 @@
+{
+  "suite_id": "level2_intermediate",
+  "level": 2,
+  "title": "Level 2 - Intermediate",
+  "description": "Semantic retrieval, synonym matching, and basic multi-entity ambiguity.",
+  "cases": [
+    {
+      "id": "L2-001-payment-by-invoice",
+      "query": "show payment details for invoice code 123",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["payment", "invoice"],
+      "expected_keywords": ["payment", "invoice"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "invoice_id"],
+        "must_use_tables": ["payment", "invoice"],
+        "requires_join": true,
+        "min_join_count": 1,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["SCHEMA_RETRIEVAL_FAILURE", "RERANKING_FAILURE"],
+        "signals": ["invoice and payment should both be in scope"],
+        "investigation": "Check whether the join path and invoice/payment column catalog are surfaced together."
+      }
+    },
+    {
+      "id": "L2-002-active-campaigns",
+      "query": "which campaigns are active right now",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["campaign"],
+      "expected_keywords": ["campaign", "active"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM campaign", "WHERE", "status"],
+        "must_use_tables": ["campaign"],
+        "must_exclude": ["JOIN"],
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "SQL_GENERATION_FAILURE"],
+        "signals": ["campaign status should be a straightforward single-table filter"],
+        "investigation": "Inspect the campaign schema group and the status filter prompt."
+      }
+    },
+    {
+      "id": "L2-003-latest-inquiries-by-counsellor",
+      "query": "which counsellor is assigned to the latest inquiries",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["inquiry", "assign_counsellor_log", "employee"],
+      "expected_keywords": ["inquiry", "counsellor"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "inquiry", "assign_counsellor_log"],
+        "must_use_tables": ["inquiry", "assign_counsellor_log"],
+        "requires_join": true,
+        "min_join_count": 1,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RERANKING_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["the assignment log is needed to link inquiry to employee"],
+        "investigation": "Inspect the relation metadata and whether the planner retrieves assignment history before SQL generation."
+      }
+    },
+    {
+      "id": "L2-004-contact-by-email",
+      "query": "find the contact with email sample@example.com",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["contact"],
+      "expected_keywords": ["contact", "email"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM contact", "WHERE", "email"],
+        "must_use_tables": ["contact"],
+        "must_exclude": ["JOIN"],
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["contact email lookup should not require joins"],
+        "investigation": "Check column catalog retrieval for email and contact table synonyms."
+      }
+    }
+  ]
+}
+

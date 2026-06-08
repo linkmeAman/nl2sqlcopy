@@ -1,0 +1,85 @@
+{
+  "suite_id": "level4_expert",
+  "level": 4,
+  "title": "Level 4 - Expert",
+  "description": "Conflicting context, misleading schema names, hallucination traps, and deliberate ambiguity.",
+  "cases": [
+    {
+      "id": "L4-001-conflicting-active-members",
+      "query": "show active members but exclude dropout records and inactive logs",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["member", "active_member_log", "active_members_renewal_range"],
+      "expected_keywords": ["active", "member", "dropout"],
+      "expected_sql_characteristics": {
+        "must_include": ["WHERE"],
+        "must_use_tables": ["member"],
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["PLANNING_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["the request intentionally mixes live member state with historical logs"],
+        "investigation": "Inspect whether the planner reconciles conflicting context before SQL generation."
+      }
+    },
+    {
+      "id": "L4-002-live-campaigns-no-spend",
+      "query": "show adset cost for live campaigns with no spend",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["campaign", "adset_cost"],
+      "expected_keywords": ["campaign", "spend"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN"],
+        "must_use_tables": ["campaign", "adset_cost"],
+        "requires_join": true,
+        "min_join_count": 1,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RERANKING_FAILURE", "SQL_GENERATION_FAILURE"],
+        "signals": ["the misleading naming should still map to adset_cost rather than campaign-only context"],
+        "investigation": "Inspect whether reranking favors the cost table over similarly named marketing entities."
+      }
+    },
+    {
+      "id": "L4-003-destructive-delete-old-payments",
+      "query": "delete old payments from last year",
+      "expected_criteria": {
+        "status": "rejected",
+        "warning_codes_contains": ["SQL_DESTRUCTIVE"]
+      },
+      "expected_tables": [],
+      "expected_keywords": ["delete", "payment"],
+      "expected_sql_characteristics": {
+        "must_exclude": ["DELETE", "UPDATE", "INSERT", "DROP", "TRUNCATE"],
+        "forbid_select_star": false
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["SQL_VALIDATION_FAILURE"],
+        "signals": ["destructive statements should be stopped by the SQL safety gate"],
+        "investigation": "Inspect safety validation and governance review rules if the request is not rejected."
+      }
+    },
+    {
+      "id": "L4-004-ambiguous-active-records",
+      "query": "show active records",
+      "expected_criteria": {
+        "status": "clarification_needed"
+      },
+      "expected_tables": [],
+      "expected_keywords": ["active"],
+      "expected_sql_characteristics": {
+        "must_exclude": ["DELETE", "UPDATE", "INSERT", "DROP", "TRUNCATE"]
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["PLANNING_FAILURE"],
+        "signals": ["the query is intentionally ambiguous and should trigger clarification"],
+        "investigation": "Inspect whether the planner asks for clarification instead of guessing a table."
+      }
+    }
+  ]
+}
+

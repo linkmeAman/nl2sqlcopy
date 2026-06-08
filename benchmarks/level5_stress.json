@@ -1,0 +1,105 @@
+{
+  "suite_id": "level5_stress",
+  "level": 5,
+  "title": "Level 5 - Stress Test",
+  "description": "Large-context runs, top-k sensitivity, reranking sensitivity, and cache interaction testing.",
+  "cases": [
+    {
+      "id": "L5-001-broad-ops-mix",
+      "query": "show recent payments, invoices, inquiries, and member renewals by branch",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["payment", "invoice", "inquiry", "member"],
+      "expected_keywords": ["payment", "invoice", "inquiry", "renewal"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "GROUP BY", "ORDER BY"],
+        "must_use_tables": ["payment", "invoice", "inquiry", "member"],
+        "requires_join": true,
+        "min_join_count": 2,
+        "requires_group_by": true,
+        "requires_order_by": true,
+        "forbid_select_star": true
+      },
+      "top_k_values": [3, 5, 10],
+      "repeat": 2,
+      "failure_classification_hints": {
+        "likely_failure_types": ["RERANKING_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["this case is sensitive to how top-k expands the in-scope context"],
+        "investigation": "Compare the trace at top_k=3 versus top_k=10 to see where the wrong tables enter the context."
+      }
+    },
+    {
+      "id": "L5-002-source-conversion-overload",
+      "query": "which sources create the most inquiries and which campaigns convert them",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["inquiry", "campaign"],
+      "expected_keywords": ["source", "campaign", "inquiry"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "GROUP BY"],
+        "must_use_tables": ["inquiry", "campaign"],
+        "requires_join": true,
+        "min_join_count": 1,
+        "requires_group_by": true,
+        "forbid_select_star": true
+      },
+      "top_k_values": [3, 5, 10],
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "RERANKING_FAILURE"],
+        "signals": ["conversion queries tend to pull in adjacent marketing tables"],
+        "investigation": "Inspect top-k sensitivity and reranking between inquiry and campaign-related chunks."
+      }
+    },
+    {
+      "id": "L5-003-cache-reuse-regression",
+      "query": "show me the 5 most recent payments",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["payment"],
+      "expected_keywords": ["payment"],
+      "expected_sql_characteristics": {
+        "must_include": ["FROM payment", "ORDER BY", "LIMIT"],
+        "must_use_tables": ["payment"],
+        "must_exclude": ["JOIN"],
+        "forbid_select_star": true,
+        "requires_order_by": true,
+        "requires_limit": true
+      },
+      "top_k_values": [5],
+      "repeat": 3,
+      "failure_classification_hints": {
+        "likely_failure_types": ["CACHE_FAILURE"],
+        "signals": ["this case should warm the cache and then test whether the cached answer stays correct"],
+        "investigation": "Inspect cache epoch behavior and ensure repeated runs do not reuse stale SQL or answer text."
+      }
+    },
+    {
+      "id": "L5-004-token-pressure-join-roster",
+      "query": "summarize employees, workshifts, contacts, and invoices for the last 30 days",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["employee", "workshift", "contact", "invoice"],
+      "expected_keywords": ["employee", "workshift", "contact", "invoice"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "GROUP BY"],
+        "must_use_tables": ["employee", "workshift", "contact", "invoice"],
+        "requires_join": true,
+        "min_join_count": 2,
+        "requires_group_by": true,
+        "forbid_select_star": true
+      },
+      "top_k_values": [5, 10],
+      "repeat": 2,
+      "failure_classification_hints": {
+        "likely_failure_types": ["PLANNING_FAILURE", "RERANKING_FAILURE", "SCHEMA_RETRIEVAL_FAILURE"],
+        "signals": ["large-context runs can expose token pressure and wrong table prioritization"],
+        "investigation": "Inspect the sql_context_focus trace and compare the tables_before_focus versus tables_after_focus sequence."
+      }
+    }
+  ]
+}
+

@@ -1,0 +1,94 @@
+{
+  "suite_id": "level3_advanced",
+  "level": 3,
+  "title": "Level 3 - Advanced",
+  "description": "Multi-table reasoning, join discovery, and context compression across related schema groups.",
+  "cases": [
+    {
+      "id": "L3-001-unpaid-invoices-by-counsellor",
+      "query": "show unpaid invoices by counsellor with payment status",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["invoice", "payment", "employee"],
+      "expected_keywords": ["invoice", "payment", "counsellor"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "invoice", "payment"],
+        "must_use_tables": ["invoice", "payment"],
+        "requires_join": true,
+        "min_join_count": 1,
+        "requires_group_by": false,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["SCHEMA_RETRIEVAL_FAILURE", "PLANNING_FAILURE"],
+        "signals": ["the planner needs both invoice and payment context before generating SQL"],
+        "investigation": "Inspect join discovery and the schema context passed into SQL generation."
+      }
+    },
+    {
+      "id": "L3-002-member-renewals-by-branch",
+      "query": "show member renewals due this month by branch",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["active_members_renewal_range", "member"],
+      "expected_keywords": ["renewal", "branch"],
+      "expected_sql_characteristics": {
+        "must_include": ["GROUP BY"],
+        "must_use_tables": ["member"],
+        "requires_group_by": true,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RETRIEVAL_FAILURE", "RERANKING_FAILURE"],
+        "signals": ["renewal range tables can be crowded by related member tables"],
+        "investigation": "Check schema-group retrieval and whether the relevant branch-level renewal table is selected."
+      }
+    },
+    {
+      "id": "L3-003-campaign-spend-by-day",
+      "query": "compare campaign spend and clicks by campaign and date",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["campaign", "adset_cost"],
+      "expected_keywords": ["campaign", "spend", "clicks"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN", "SUM", "GROUP BY"],
+        "must_use_tables": ["campaign", "adset_cost"],
+        "requires_join": true,
+        "min_join_count": 1,
+        "requires_group_by": true,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["RERANKING_FAILURE", "SQL_GENERATION_FAILURE"],
+        "signals": ["campaign spend data should come from adset_cost"],
+        "investigation": "Inspect column-level retrieval and whether adset_cost is ranked above similarly named marketing tables."
+      }
+    },
+    {
+      "id": "L3-004-employee-shift-roster",
+      "query": "show employees with their workshift and contact details",
+      "expected_criteria": {
+        "status": "ok"
+      },
+      "expected_tables": ["employee", "workshift", "contact"],
+      "expected_keywords": ["employee", "workshift", "contact"],
+      "expected_sql_characteristics": {
+        "must_include": ["JOIN"],
+        "must_use_tables": ["employee", "workshift", "contact"],
+        "requires_join": true,
+        "min_join_count": 2,
+        "forbid_select_star": true
+      },
+      "failure_classification_hints": {
+        "likely_failure_types": ["SCHEMA_RETRIEVAL_FAILURE", "RETRIEVAL_FAILURE"],
+        "signals": ["the request spans employee, workshift, and contact relation paths"],
+        "investigation": "Check whether the planner retrieves both relation metadata and the correct employee/contact schema groups."
+      }
+    }
+  ]
+}
+
