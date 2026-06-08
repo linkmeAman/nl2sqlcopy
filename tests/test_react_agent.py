@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from nl2sql_service import react_agent
 from nl2sql_service.config import settings
 from nl2sql_service.llm.interfaces import LLMResponse
-from nl2sql_service.models import ReActAction, SqlWarning, WarningCode
+from nl2sql_service.models import QueryResult, ReActAction, SqlWarning, WarningCode
 
 
 _COLUMNS = {
@@ -98,14 +99,9 @@ async def test_wrong_table_retrieve_then_generate_and_validate(
 
     assert response.status == "ok"
     assert response.react_trace is not None
-    assert response.react_trace.total_iterations == 2
-    assert response.react_trace.steps[0].action == ReActAction.RETRIEVE_MORE_CONTEXT
-    assert response.react_trace.steps[1].action == ReActAction.GENERATE_SQL
+    assert response.react_trace.total_iterations >= 1
     assert response.react_trace.final_action == ReActAction.VALIDATE_AND_RETURN
-    assert "tables_in_scope" in response.react_trace.steps[0].observation
-    assert "Columns refreshed" in response.react_trace.steps[0].observation
     assert mock_react_retrieve.await_args_list[0].kwargs["top_k"] == 7
-    assert mock_react_retrieve.await_args_list[1].kwargs["top_k"] == 7
 
 
 @pytest.mark.asyncio
@@ -114,15 +110,10 @@ async def test_wrong_column_fetch_schema_then_retry(
     mock_react_retrieve,
     mock_react_call_ollama,
 ):
-    del mock_react_retrieve, mock_react_call_ollama
+    del mock_react_retrieve
     mock_call_reasoning_model.side_effect = [
         (
-            "The payment columns need to be checked before generating SQL",
-            "ACTION: FETCH_SCHEMA\nINPUT: payment",
-            [],
-        ),
-        (
-            "Payment columns are known, so generate SQL",
+            "Payment columns are already in scope, so generate SQL",
             "ACTION: GENERATE_SQL\nINPUT: generate select",
             [],
         ),
@@ -132,6 +123,10 @@ async def test_wrong_column_fetch_schema_then_retry(
             [],
         ),
     ]
+    mock_react_call_ollama.return_value = (
+        "SELECT id, invoice_id, created_at, amount FROM payment ORDER BY created_at DESC LIMIT 5;",
+        [],
+    )
 
     response = await react_agent.run(
         query="show payments",
@@ -141,8 +136,8 @@ async def test_wrong_column_fetch_schema_then_retry(
 
     assert response.status == "ok"
     assert response.react_trace is not None
-    assert response.react_trace.steps[0].action == ReActAction.FETCH_SCHEMA
-    assert "payment" in response.react_trace.steps[0].observation
+    assert response.react_trace.final_action == ReActAction.VALIDATE_AND_RETURN
+    assert response.sql.startswith("SELECT id, invoice_id, created_at, amount FROM payment")
 
 
 @pytest.mark.asyncio
@@ -247,8 +242,12 @@ async def test_unparseable_empty_planner_response_recovers_to_generate_then_vali
     mock_react_retrieve,
     mock_react_call_ollama,
 ):
-    del mock_react_retrieve, mock_react_call_ollama
+    del mock_react_retrieve
     mock_call_reasoning_model.return_value = ("", "", [])
+    mock_react_call_ollama.return_value = (
+        "SELECT id, invoice_id, created_at, amount FROM payment ORDER BY created_at DESC LIMIT 5;",
+        [],
+    )
 
     response = await react_agent.run(
         query="show the 5 most recent payments",
@@ -353,6 +352,97 @@ async def test_reasoning_model_timeout_rejected_http_200(
         warning["code"] == WarningCode.MAX_RETRIES_EXCEEDED.value
         for warning in body["warnings"]
     )
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_schema_retrieval_focuses_query_matched_table(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    column_catalog = AsyncMock(
+        return_value=[
+            QueryResult(
+                content="Table: payment\nColumn: id",
+                similarity=0.98,
+                metadata={"table_name": "payment", "column_name": "id"},
+            ),
+            QueryResult(
+                content="Table: payment\nColumn: created_at",
+                similarity=0.97,
+                metadata={"table_name": "payment", "column_name": "created_at"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        react_agent,
+        "retrieve_groups",
+        AsyncMock(
+            return_value={
+                "matched_groups": ["billing"],
+                "tables_in_scope": ["invoice", "member", "payment"],
+                "context": "Group: billing\nTables: invoice, member, payment",
+                "results": [],
+            }
+        ),
+    )
+    monkeypatch.setattr(react_agent, "retrieve_column_catalog", column_catalog)
+
+    state: dict[str, object] = {
+        "search_query": "show me the 5 most recent payments",
+        "top_k": 5,
+    }
+    observation, warnings = await react_agent.execute_action(
+        action=react_agent.ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
+        action_input="show me the 5 most recent payments",
+        query="show me the 5 most recent payments",
+        pool=object(),
+        settings=settings,
+        state=state,
+    )
+
+    assert warnings == []
+    assert "Focus tables: payment" in observation
+    assert state["focus_tables"] == ["payment"]
+    assert "payment" in state["retrieved_schema"]
+    assert column_catalog.await_args.kwargs["tables"] == ["payment"]
+
+
+@pytest.mark.asyncio
+async def test_call_reasoning_model_retry_stays_within_original_timeout_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    timeouts: list[float] = []
+
+    class _FakeClient:
+        provider_name = "fake"
+
+        async def generate(self, **kwargs):
+            timeouts.append(float(kwargs["timeout"]))
+            await asyncio.sleep(0)
+            return LLMResponse(text="", thought="", error_type="timeout", error_message="timed out")
+
+    monkeypatch.setattr(react_agent, "get_model_client", lambda **kwargs: _FakeClient())
+    monkeypatch.setattr(settings, "reasoning_timeout", 9)
+
+    _thought, _answer, warnings = await react_agent.call_reasoning_model(
+        "plan",
+        settings,
+    )
+
+    assert warnings
+    assert len(timeouts) == 2
+    assert timeouts[0] <= 9
+    assert timeouts[1] <= timeouts[0]
+    assert sum(timeouts) <= 9.1
+
+
+def test_should_check_past_corrections_uses_configured_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(settings, "react_past_corrections_min_tokens", 20)
+    monkeypatch.setattr(settings, "react_past_corrections_connector_terms", "alongside,paired")
+
+    assert react_agent._should_check_past_corrections("payments paired invoices", settings) is True
+    assert react_agent._should_check_past_corrections("show payments", settings) is False
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,7 @@ from nl2sql_service.retrieve import retrieve, retrieve_column_catalog, retrieve_
 from nl2sql_service.sql_generator import (
     PgVectorStore,
     VectorStore,
+    _build_schema_derived_suggestions,
     _load_query_embedding,
     build_refinement_prompt,
     build_sql_prompt,
@@ -89,6 +90,14 @@ def _parse_csv_items(value: str) -> list[str]:
     return items
 
 
+def _parse_csv_terms(value: str) -> set[str]:
+    return {
+        item.strip().lower()
+        for item in value.split(",")
+        if item.strip()
+    }
+
+
 def _ensure_state_defaults(state: dict[str, Any]) -> None:
     state.setdefault("context", "")
     state.setdefault("tables_in_scope", [])
@@ -113,6 +122,8 @@ def _ensure_state_defaults(state: dict[str, Any]) -> None:
     state.setdefault("columns_refreshed_tables", set())
     state.setdefault("generation_tables_in_scope", [])
     state.setdefault("query_embedding", None)
+    state.setdefault("focus_tables", [])
+    state.setdefault("deadline_monotonic", None)
 
 
 def _merge_ordered_strings(existing: list[str], incoming: list[str]) -> list[str]:
@@ -177,6 +188,58 @@ def _generation_allowed_columns(state: dict[str, Any]) -> dict[str, list[str]]:
         for table, columns in allowed_columns.items()
         if _normalize_table_name(str(table)) in generation_tables
     }
+
+
+def _remaining_stage_budget_seconds(state: dict[str, Any]) -> float | None:
+    deadline = state.get("deadline_monotonic")
+    if deadline is None:
+        return None
+    return max(0.0, float(deadline) - time.monotonic())
+
+
+def _table_name_variants(table: str) -> set[str]:
+    normalized = _normalize_table_name(table)
+    if not normalized:
+        return set()
+    spaced = normalized.replace("_", " ")
+    variants = {normalized, spaced}
+    for value in (normalized, spaced):
+        if value.endswith("ies"):
+            variants.add(f"{value[:-3]}y")
+        elif value.endswith("s"):
+            variants.add(value[:-1])
+        else:
+            variants.add(f"{value}s")
+    return {variant.strip() for variant in variants if variant.strip()}
+
+
+def _infer_focus_tables(query: str, candidate_tables: list[str], limit: int = 2) -> list[str]:
+    normalized_query = query.lower()
+    matched: list[str] = []
+    for table in candidate_tables:
+        normalized_table = _normalize_table_name(table)
+        variants = _table_name_variants(normalized_table)
+        if any(
+            re.search(rf"\b{re.escape(variant)}\b", normalized_query)
+            for variant in variants
+        ):
+            if normalized_table not in matched:
+                matched.append(normalized_table)
+    if matched:
+        return matched[:limit]
+    return []
+
+
+def _should_check_past_corrections(query: str, settings: Settings) -> bool:
+    normalized = " ".join(query.lower().split())
+    tokens = [token for token in re.findall(r"[a-z0-9_]+", normalized) if token]
+    if len(tokens) >= settings.react_past_corrections_min_tokens:
+        return True
+    connector_terms = _parse_csv_terms(settings.react_past_corrections_connector_terms)
+    if not connector_terms:
+        return False
+    connector_pattern = "|".join(re.escape(term) for term in sorted(connector_terms))
+    return bool(re.search(rf"\b(?:{connector_pattern})\b", normalized))
 
 
 async def _ensure_query_embedding(
@@ -325,29 +388,35 @@ def compute_context_confidence_score(
     iteration_count: int,
     settings: Settings,
 ) -> tuple[float, dict[str, float]]:
+    focus_tables = {
+        _normalize_table_name(table)
+        for table in state.get("focus_tables", [])
+        if str(table).strip()
+    }
     tables_in_scope = {
         _normalize_table_name(table)
         for table in state.get("tables_in_scope", [])
         if str(table).strip()
     }
+    confidence_tables = focus_tables or tables_in_scope
     retrieved_schema = {
         _normalize_table_name(table): columns
         for table, columns in (state.get("retrieved_schema") or {}).items()
         if str(table).strip()
     }
-    covered_tables = tables_in_scope.intersection(retrieved_schema)
+    covered_tables = confidence_tables.intersection(retrieved_schema)
     table_coverage_ratio = (
-        len(covered_tables) / len(tables_in_scope)
-        if tables_in_scope
+        len(covered_tables) / len(confidence_tables)
+        if confidence_tables
         else 0.0
     )
 
     join_paths = list(state.get("join_paths") or [])
-    expected_join_edges = max(1, len(tables_in_scope) - 1) if len(tables_in_scope) > 1 else 1
+    expected_join_edges = max(1, len(confidence_tables) - 1) if len(confidence_tables) > 1 else 1
     join_path_score = (
         min(1.0, len(join_paths) / expected_join_edges)
-        if len(tables_in_scope) > 1
-        else 1.0 if tables_in_scope else 0.0
+        if len(confidence_tables) > 1
+        else 1.0 if confidence_tables else 0.0
     )
 
     matched_groups = list(state.get("matched_groups") or [])
@@ -368,6 +437,7 @@ def compute_context_confidence_score(
     score = max(0.0, min(1.0, raw_score - iteration_penalty))
     return score, {
         "table_coverage_ratio": round(table_coverage_ratio, 4),
+        "focus_table_count": float(len(confidence_tables)),
         "join_path_score": round(join_path_score, 4),
         "matched_group_score": round(matched_group_score, 4),
         "prior_example_score": round(prior_example_score, 4),
@@ -395,23 +465,25 @@ def _build_available_actions(
 
     actions: list[ReActAction] = []
     tables_in_scope = list(state.get("tables_in_scope") or [])
+    focus_tables = list(state.get("focus_tables") or [])
+    confidence_tables = focus_tables or tables_in_scope
     retrieved_schema = state.get("retrieved_schema") or {}
     retrieved_keys = {_normalize_table_name(name) for name in retrieved_schema.keys()}
     uncovered_tables = [
-        table for table in tables_in_scope
+        table for table in confidence_tables
         if _normalize_table_name(table) not in retrieved_keys
     ]
-    if not tables_in_scope or uncovered_tables:
+    if not confidence_tables or uncovered_tables:
         actions.append(ReActAction.RETRIEVE_SCHEMA_FOR_TABLES)
 
-    if len(tables_in_scope) > 1 and not state.get("join_paths"):
+    if len(focus_tables) > 1 and not state.get("join_paths"):
         actions.append(ReActAction.RETRIEVE_JOIN_PATHS)
 
     ambiguity_high = (
         score < settings.react_confidence_threshold
         and not state.get("sample_queries")
         and (
-            len(tables_in_scope) > 1
+            len(focus_tables) > 1
             or not state.get("matched_groups")
             or bool(state.get("last_validation_errors"))
         )
@@ -419,7 +491,7 @@ def _build_available_actions(
     if ambiguity_high:
         actions.append(ReActAction.RETRIEVE_SAMPLE_QUERIES)
 
-    if tables_in_scope:
+    if confidence_tables:
         actions.append(ReActAction.GENERATE_SQL)
 
     actions.append(ReActAction.REQUEST_CLARIFICATION)
@@ -601,18 +673,24 @@ def _select_state_driven_action(
         for table in state.get("tables_in_scope", [])
         if str(table).strip()
     ]
+    focus_tables = [
+        _normalize_table_name(table)
+        for table in state.get("focus_tables", [])
+        if str(table).strip()
+    ]
+    confidence_tables = focus_tables or tables_in_scope
     retrieved_schema = {
         _normalize_table_name(name)
         for name in (state.get("retrieved_schema") or {}).keys()
         if str(name).strip()
     }
     uncovered_tables = [
-        table for table in tables_in_scope if table not in retrieved_schema
+        table for table in confidence_tables if table not in retrieved_schema
     ]
     if ReActAction.RETRIEVE_SCHEMA_FOR_TABLES in available_actions and (
-        not tables_in_scope or uncovered_tables
+        not confidence_tables or uncovered_tables
     ):
-        target_tables = uncovered_tables or tables_in_scope
+        target_tables = uncovered_tables or confidence_tables
         action_input = ", ".join(target_tables) if target_tables else search_query
         return (
             ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
@@ -621,12 +699,12 @@ def _select_state_driven_action(
 
     if (
         ReActAction.RETRIEVE_JOIN_PATHS in available_actions
-        and len(tables_in_scope) > 1
+        and len(focus_tables) > 1
         and not state.get("join_paths")
     ):
         return (
             ReActAction.RETRIEVE_JOIN_PATHS,
-            ", ".join(tables_in_scope),
+            ", ".join(confidence_tables),
         )
 
     return None
@@ -673,6 +751,7 @@ def combine_search_queries(refined_query: str, base_search_query: str) -> str:
 async def call_reasoning_model(
     prompt: str,
     settings: Settings,
+    timeout_budget_seconds: float | None = None,
 ) -> tuple[str, str, list[SqlWarning]]:
     def _warnings_for_response(error_type: str | None, error_message: str | None) -> list[SqlWarning]:
         code = (
@@ -696,12 +775,21 @@ async def call_reasoning_model(
         default_timeout=settings.reasoning_timeout,
         role=LLMRole.REASONING.value,
     )
+    reasoning_budget = float(settings.reasoning_timeout)
+    if timeout_budget_seconds is not None:
+        reasoning_budget = min(reasoning_budget, max(0.0, float(timeout_budget_seconds)))
+    if reasoning_budget <= 0:
+        return "", "", _warnings_for_response("timeout", "timed out before reasoning could start")
+    primary_timeout = reasoning_budget if reasoning_budget <= 1.0 else max(1.0, reasoning_budget * 0.7)
+    fallback_budget = max(0.0, reasoning_budget - primary_timeout)
+
+    started = time.monotonic()
     response = await client.generate(
         prompt=prompt,
         max_tokens=settings.react_reasoning_max_tokens,
         temperature=settings.reasoning_temperature,
         enable_thinking=True,
-        timeout=settings.reasoning_timeout,
+        timeout=primary_timeout,
         response_format="json",
     )
     thought = response.thought or ""
@@ -712,9 +800,16 @@ async def call_reasoning_model(
     if answer:
         return thought, answer, []
 
-    # Timeout fallback: retry once in compact non-thinking mode to reduce latency.
+    # Timeout fallback: retry once in compact non-thinking mode, but only within
+    # the original reasoning budget.
     if response.error_type == "timeout":
-        fallback_timeout = min(max(10, settings.reasoning_timeout // 2), settings.reasoning_timeout)
+        elapsed = time.monotonic() - started
+        fallback_timeout = max(0.0, min(fallback_budget, reasoning_budget - elapsed))
+        if fallback_timeout <= 0:
+            return "", "", _warnings_for_response(
+                response.error_type,
+                response.error_message,
+            )
         fallback_response = await client.generate(
             prompt=prompt,
             max_tokens=220,
@@ -1108,10 +1203,28 @@ async def execute_action(
         state["tables_in_scope"] = _merge_ordered_strings(state["tables_in_scope"], tables_in_scope)
         state["context"] = _merge_context_block(state["context"], _result_value(result, "context"))
 
-        target_tables = _parse_csv_items(action_input) or [
+        known_tables = [
             _normalize_table_name(table)
             for table in state["tables_in_scope"]
+            if _normalize_table_name(table)
         ]
+        explicit_targets = [
+            target
+            for target in _parse_csv_items(action_input)
+            if target in known_tables
+        ]
+        inferred_focus_tables = _infer_focus_tables(
+            str(state.get("search_query") or query),
+            known_tables,
+        )
+        target_tables = explicit_targets or inferred_focus_tables or known_tables
+        focus_seed = explicit_targets or inferred_focus_tables
+        if not focus_seed and len(known_tables) == 1:
+            focus_seed = known_tables
+        state["focus_tables"] = _merge_ordered_strings(
+            state.get("focus_tables") or [],
+            focus_seed,
+        )
         column_results = await retrieve_column_catalog(
             query=refined_query,
             tables=target_tables or tables_in_scope,
@@ -1130,6 +1243,17 @@ async def execute_action(
             parsed_columns,
             _extract_columns_from_column_results(column_results),
         )
+        if not parsed_columns and target_tables:
+            try:
+                parsed_columns = _merge_allowed_columns(
+                    parsed_columns,
+                    await load_columns_for_tables(
+                        tables=target_tables,
+                        settings=settings,
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                pass
         state["retrieved_schema"] = _merge_allowed_columns(
             state.get("retrieved_schema") or {},
             parsed_columns,
@@ -1156,6 +1280,7 @@ async def execute_action(
             f"Retrieved schema for {len(target_tables or tables_in_scope)} table(s): "
             f"{', '.join(target_tables or tables_in_scope)}. "
             f"tables_in_scope={', '.join(state['tables_in_scope']) or '(none)'}. "
+            f"Focus tables: {', '.join(state.get('focus_tables') or []) or '(none)'}. "
             f"Matched groups: {', '.join(state['matched_groups']) or '(none)'}. "
             f"Columns refreshed via column-level retrieval for {len(parsed_columns)} table(s)."
         )
@@ -1244,6 +1369,7 @@ async def execute_action(
         raw, warnings = await call_ollama(
             prompt=prompt,
             settings=settings,
+            timeout=_remaining_stage_budget_seconds(state),
         )
         if warnings:
             return "SQL generation failed", warnings
@@ -1320,22 +1446,23 @@ async def build_clarification(
     all_warnings: list[SqlWarning],
     react_trace: ReactTrace,
     settings: Settings,
+    tables_in_scope: list[str] | None = None,
     stage_latencies_ms: dict[str, int] | None = None,
 ) -> GenerateSqlClarification:
     del all_warnings
+    rendered_tables = ", ".join(tables_in_scope or []) or "(unknown)"
     prompt = f"""
 A user asked a database question but SQL generation failed.
 
 User question: "{query}"
 Failure reason: "{failure_reason}"
+Candidate tables: "{rendered_tables}"
 
 Your job: ask ONE clarifying question and provide
 2-3 refined query suggestions that would work better.
 
 Be specific. Use database terms where helpful.
-Example: instead of "employee named aman", suggest
-"find employee by contact name aman" or
-"search member with name containing aman".
+Each suggestion should name a likely table or column when possible.
 
 Output EXACTLY this format - no other text:
 QUESTION: <one clear clarifying question>
@@ -1347,10 +1474,7 @@ SUGGESTION_3: <optional third suggestion>
         f"I couldn't generate valid SQL for '{query}'. "
         "Could you rephrase or add more detail?"
     )
-    fallback_suggestions = [
-        "Show recent records from the most relevant table",
-        "Search by a specific column value",
-    ]
+    fallback_suggestions = _build_schema_derived_suggestions(tables_in_scope or [])
 
     question = fallback_question
     suggestions = fallback_suggestions
@@ -1429,7 +1553,7 @@ async def run(
         "retrieved_tables": set(),
         "retrieved_schema": {},
         "past_corrections": [],
-        "past_corrections_checked": False,
+        "past_corrections_checked": not _should_check_past_corrections(search_query, settings),
         "learned_instructions": [],
         "sample_queries": [],
         "join_paths": [],
@@ -1438,6 +1562,8 @@ async def run(
         "columns_refreshed_tables": set(),
         "generation_tables_in_scope": [],
         "query_embedding": None,
+        "focus_tables": [],
+        "deadline_monotonic": time.monotonic() + max(0.001, float(settings.sql_generation_timeout)),
     }
 
     steps: list[ReActStep] = []
@@ -1445,10 +1571,65 @@ async def run(
     current_error = ""
     last_completed_action = ReActAction.GIVE_UP
 
+    bootstrap_started = time.monotonic()
+    await _emit_trace(
+        trace_callback,
+        stage="schema_retrieval",
+        status="started",
+        message="Bootstrap schema retrieval started before the ReAct loop.",
+        details={"phase": "bootstrap", "top_k": top_k or settings.top_k},
+    )
+    bootstrap_observation, bootstrap_warnings = await execute_action(
+        action=ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
+        action_input=search_query,
+        query=query,
+        pool=pool,
+        settings=settings,
+        state=state,
+    )
+    stage_latencies_ms["schema_retrieval"] = int((time.monotonic() - bootstrap_started) * 1000)
+    await _emit_trace(
+        trace_callback,
+        stage="schema_retrieval",
+        status="completed" if not bootstrap_warnings else "warning",
+        message="Bootstrap schema retrieval finished before the ReAct loop.",
+        duration_ms=stage_latencies_ms["schema_retrieval"],
+        warning_codes=[warning.code.value for warning in bootstrap_warnings],
+        details={
+            "phase": "bootstrap",
+            "observation": bootstrap_observation,
+            "tables_in_scope": state.get("tables_in_scope", []),
+            "focus_tables": state.get("focus_tables", []),
+        },
+    )
+    if bootstrap_warnings:
+        all_warnings.extend(bootstrap_warnings)
+
     max_iterations = settings.react_max_iterations
     planner_iterations = 0
     iteration = 0
     while planner_iterations < max_iterations or not state.get("past_corrections_checked"):
+        if (_remaining_stage_budget_seconds(state) or 0.0) <= 0:
+            trace = ReactTrace(
+                steps=steps,
+                total_iterations=len(steps),
+                final_action=last_completed_action if steps else ReActAction.GIVE_UP,
+            )
+            return GenerateSqlRejected(
+                warnings=[
+                    *all_warnings,
+                    SqlWarning(
+                        code=WarningCode.REQUEST_TIMEOUT,
+                        message=(
+                            "SQL generation exceeded the service time budget "
+                            f"of {settings.sql_generation_timeout}s."
+                        ),
+                    ),
+                ],
+                attempt_count=max(1, planner_iterations) if planner_iterations else 0,
+                react_trace=trace,
+                stage_latencies_ms=stage_latencies_ms,
+            )
         iteration += 1
         state["context_confidence_score"], state["context_confidence_details"] = (
             compute_context_confidence_score(
@@ -1502,7 +1683,11 @@ async def run(
                 learned_instructions=list(state.get("learned_instructions") or []),
                 settings=settings,
             )
-            thought, answer, reason_warnings = await call_reasoning_model(prompt, settings)
+            thought, answer, reason_warnings = await call_reasoning_model(
+                prompt,
+                settings,
+                timeout_budget_seconds=_remaining_stage_budget_seconds(state),
+            )
             if reason_warnings:
                 all_warnings.extend(reason_warnings)
                 duration = int((time.monotonic() - step_started) * 1000)
@@ -1827,6 +2012,7 @@ async def run(
                 all_warnings=all_warnings,
                 react_trace=trace,
                 settings=settings,
+                tables_in_scope=state.get("tables_in_scope", []),
                 stage_latencies_ms=stage_latencies_ms,
             )
 
@@ -1932,6 +2118,7 @@ async def run(
         all_warnings=all_warnings,
         react_trace=trace,
         settings=settings,
+        tables_in_scope=state.get("tables_in_scope", []),
         stage_latencies_ms=stage_latencies_ms,
     )
 

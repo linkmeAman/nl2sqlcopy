@@ -551,6 +551,65 @@ def test_deterministic_payment_sql_ignores_non_recent_payment_query():
     assert built is None
 
 
+def test_deterministic_sql_uses_configured_filter_rules(monkeypatch: pytest.MonkeyPatch):
+    from nl2sql_service.config import settings
+
+    monkeypatch.setattr(
+        settings,
+        "deterministic_filter_rules_json",
+        (
+            '[{"name":"region_lookup","query_terms":["region"],'
+            '"column_terms":["region_code"],"literal_type":"integer","fallback":"not_null"}]'
+        ),
+    )
+
+    built = sql_generator.build_deterministic_sql(
+        query="find member by region code",
+        allowed_columns={"member": ["id", "region_code", "created_at"]},
+        top_k=5,
+        settings=settings,
+    )
+
+    assert built is not None
+    sql, tables_used = built
+    assert tables_used == ["member"]
+    assert "WHERE region_code IS NOT NULL" in sql
+
+
+def test_detect_destructive_query_intent_uses_configured_keywords(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service.config import settings
+
+    monkeypatch.setattr(settings, "destructive_query_keywords", "purge,erase")
+
+    assert sql_generator.detect_destructive_query_intent("purge stale rows", settings) == "purge"
+    assert sql_generator.detect_destructive_query_intent("delete stale rows", settings) is None
+
+
+def test_detect_basic_ambiguity_reason_uses_configured_terms(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from nl2sql_service.config import settings
+
+    monkeypatch.setattr(settings, "ambiguity_query_stopwords", "show,me")
+    monkeypatch.setattr(settings, "ambiguity_generic_terms", "things")
+    monkeypatch.setattr(settings, "ambiguity_modifier_terms", "open")
+
+    reason = sql_generator.detect_basic_ambiguity_reason("show me open things", settings)
+
+    assert reason is not None
+    assert "things" in reason
+
+
+def test_schema_derived_suggestions_use_tables_not_domain_examples():
+    suggestions = sql_generator._build_schema_derived_suggestions(["support_ticket"])
+
+    assert suggestions[0] == "Show recent support tickets"
+    assert "List support tickets" in suggestions
+    assert "Find support ticket by a specific column value" in suggestions
+
+
 def test_review_prompt_flags_followup_query_using_inquiry_table():
     from nl2sql_service import main
 
@@ -619,6 +678,50 @@ async def test_destructive_sql_returns_clarification(
 
 
 @pytest.mark.asyncio
+async def test_destructive_query_is_rejected_before_react(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    react_run = AsyncMock(side_effect=AssertionError("ReAct should not run"))
+    monkeypatch.setattr(react_agent, "run", react_run)
+
+    response = await client.post(
+        "/generate-sql",
+        json={"query": "delete old payments from last year"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "rejected"
+    assert react_run.await_count == 0
+    assert any(
+        warning["code"] == WarningCode.SQL_DESTRUCTIVE.value
+        for warning in body["warnings"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_query_returns_clarification_before_react(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    react_run = AsyncMock(side_effect=AssertionError("ReAct should not run"))
+    monkeypatch.setattr(react_agent, "run", react_run)
+
+    response = await client.post(
+        "/generate-sql",
+        json={"query": "show active records"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "clarification_needed"
+    assert react_run.await_count == 0
+    assert "target entity" in body["failure_reason"]
+    assert "Show active members" not in body["suggestions"]
+
+
+@pytest.mark.asyncio
 async def test_multi_statement_returns_clarification(
     client,
     mock_ollama,
@@ -635,8 +738,11 @@ async def test_multi_statement_returns_clarification(
 
     body = response.json()
     assert response.status_code == 200
-    assert body["status"] == "clarification_needed"
-    assert WarningCode.SQL_MULTI_STATEMENT.value in body["failure_reason"]
+    assert body["status"] == "rejected"
+    assert any(
+        warning["code"] == WarningCode.SQL_DESTRUCTIVE.value
+        for warning in body["warnings"]
+    )
 
 
 @pytest.mark.asyncio

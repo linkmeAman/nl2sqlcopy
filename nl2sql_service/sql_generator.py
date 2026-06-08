@@ -22,6 +22,8 @@ from nl2sql_service.config import Settings, settings as default_settings
 from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import (
     CacheSource,
+    ReActAction,
+    ReactTrace,
     GenerateSqlClarification,
     GenerateSqlRejected,
     GenerateSqlResponse,
@@ -37,6 +39,8 @@ from nl2sql_service.rulebook import build_governance_block, get_config
 logger = logging.getLogger(__name__)
 
 TraceCallback = Callable[..., Awaitable[None]]
+_EMAIL_LITERAL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+_INTEGER_LITERAL_RE = re.compile(r"\b\d+\b")
 
 
 @dataclass(frozen=True)
@@ -269,10 +273,87 @@ COLUMN_SELECTION_RULE = """COLUMN SELECTION RULE:
    fee, cost), audit columns (created_by, updated_by,
    allocation_date, last_updated), or internal columns
    unless the user specifically asks for them.
- For aggregation queries (total, count, sum, average):
-   SELECT only the columns needed for the calculation.
+For aggregation queries (total, count, sum, average):
+  SELECT only the columns needed for the calculation.
  For detail queries (details, full, all columns, *):
    SELECT * is acceptable."""
+
+
+def _parse_csv_terms(value: str) -> set[str]:
+    return {
+        item.strip().lower()
+        for item in value.split(",")
+        if item.strip()
+    }
+
+
+def _load_deterministic_filter_rules(settings: Settings) -> list[dict[str, Any]]:
+    try:
+        parsed = json.loads(settings.deterministic_filter_rules_json)
+    except json.JSONDecodeError:
+        logger.warning("Invalid DETERMINISTIC_FILTER_RULES_JSON; deterministic filters disabled.")
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [rule for rule in parsed if isinstance(rule, dict)]
+
+
+def _table_label(table: str) -> str:
+    return _normalize_table_name(table).replace("_", " ").strip()
+
+
+def _singularize_label(label: str) -> str:
+    if label.endswith("ies"):
+        return f"{label[:-3]}y"
+    if label.endswith("s") and not label.endswith("ss"):
+        return label[:-1]
+    return label
+
+
+def _pluralize_label(label: str) -> str:
+    if label.endswith("y") and not label.endswith(("ay", "ey", "iy", "oy", "uy")):
+        return f"{label[:-1]}ies"
+    if label.endswith("s"):
+        return label
+    return f"{label}s"
+
+
+def _build_schema_derived_suggestions(
+    tables_in_scope: list[str],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    suggestions: list[str] = []
+    normalized_tables: list[str] = []
+    for table in tables_in_scope:
+        label = _table_label(table)
+        if label and label not in normalized_tables:
+            normalized_tables.append(label)
+
+    for label in normalized_tables:
+        plural = _pluralize_label(label)
+        singular = _singularize_label(label)
+        for suggestion in (
+            f"Show recent {plural}",
+            f"List {plural}",
+            f"Find {singular} by a specific column value",
+        ):
+            if suggestion not in suggestions:
+                suggestions.append(suggestion)
+            if len(suggestions) >= limit:
+                return suggestions
+
+    fallback_suggestions = [
+        "List records from a specific table",
+        "Show recent rows from one table",
+        "Find a row by a specific column value",
+    ]
+    for suggestion in fallback_suggestions:
+        if suggestion not in suggestions:
+            suggestions.append(suggestion)
+        if len(suggestions) >= limit:
+            break
+    return suggestions
 
 
 def _quote_identifier(identifier: str) -> str:
@@ -281,7 +362,15 @@ def _quote_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
 
 
+def _query_looks_multi_table(query: str) -> bool:
+    normalized = " ".join(query.lower().split())
+    if re.search(r"\b(join|compare|between|alongside|versus|vs)\b", normalized):
+        return True
+    return bool(re.search(r",|\band\b|\bwith\b|\bby\b", normalized))
+
+
 async def _schema_is_self_contained(
+    query: str,
     query_embedding: list[float],
     candidate_table: str,
     retrieved_columns: list[str],
@@ -319,12 +408,30 @@ async def _schema_is_self_contained(
         )
         return False
 
+    candidate_hits = [
+        column
+        for column in top_columns
+        if _normalize_table_name(column.table_name).lower() == candidate
+    ]
     foreign_table_hits = [
         column
         for column in top_columns
         if _normalize_table_name(column.table_name).lower() != candidate
     ]
-    return len(foreign_table_hits) == 0
+    if not foreign_table_hits:
+        return True
+
+    dominant_ratio = len(candidate_hits) / max(1, len(top_columns))
+    foreign_tables = {
+        _normalize_table_name(column.table_name).lower()
+        for column in foreign_table_hits
+    }
+    return (
+        len(candidate_hits) >= 2
+        and dominant_ratio >= 0.6
+        and len(foreign_tables) <= 1
+        and not _query_looks_multi_table(query)
+    )
 
 
 async def is_deterministic_generation_candidate(
@@ -335,13 +442,29 @@ async def is_deterministic_generation_candidate(
     known_schema_tables: list[str],
     matched_groups: list[str] | None = None,
 ) -> bool:
-    del query
     top_k = max(1, settings.top_k)
     top_columns = await vector_store.search_columns(
         embedding=query_embedding,
         top_k=top_k,
     )
     if not top_columns:
+        normalized_known_tables = [
+            _normalize_table_name(table).lower()
+            for table in known_schema_tables
+            if _normalize_table_name(table)
+        ]
+        if (
+            len(normalized_known_tables) == 1
+            and not _query_looks_multi_table(query)
+            and _query_mentions_table_form(query, normalized_known_tables[0], plural=True)
+        ):
+            await emit_current_trace_event(
+                stage="deterministic_candidate_check",
+                status="passed",
+                message="Single-table schema confirmation allowed the deterministic fast path without column hits",
+                details={"candidate_table": normalized_known_tables[0]},
+            )
+            return True
         await emit_current_trace_event(
             stage="deterministic_candidate_check",
             status="skipped",
@@ -364,6 +487,7 @@ async def is_deterministic_generation_candidate(
         }
     )
     self_contained = await _schema_is_self_contained(
+        query=query,
         query_embedding=query_embedding,
         candidate_table=candidate_table,
         retrieved_columns=retrieved_columns,
@@ -376,8 +500,12 @@ async def is_deterministic_generation_candidate(
         await emit_current_trace_event(
             stage="deterministic_candidate_check",
             status="skipped",
-            message="Column similarity signals cross-table join requirement",
-            details={"foreign_table_hits": foreign_table_hits},
+            message="Column similarity signals were not dominant enough for a fast-path candidate",
+            details={
+                "candidate_table": candidate_table,
+                "retrieved_columns": retrieved_columns,
+                "foreign_table_hits": foreign_table_hits,
+            },
         )
         return False
 
@@ -556,6 +684,65 @@ def _choose_explicit_table(query: str, tables: list[str]) -> str | None:
     return sorted(scored)[0][2]
 
 
+def _find_column_by_fragments(columns: list[str], *fragments: str) -> str | None:
+    lowered = {column.lower(): column for column in columns}
+    for fragment in fragments:
+        if fragment in lowered:
+            return lowered[fragment]
+    for column in columns:
+        column_lower = column.lower()
+        if any(fragment in column_lower for fragment in fragments):
+            return column
+    return None
+
+
+def _build_deterministic_filter_clause(
+    query: str,
+    columns: list[str],
+    settings: Settings,
+) -> str | None:
+    query_lower = query.lower()
+    for rule in _load_deterministic_filter_rules(settings):
+        query_terms = [str(term).strip().lower() for term in rule.get("query_terms", []) if str(term).strip()]
+        column_terms = [str(term).strip().lower() for term in rule.get("column_terms", []) if str(term).strip()]
+        if query_terms and not any(re.search(rf"\b{re.escape(term)}\b", query_lower) for term in query_terms):
+            continue
+        target_column = _find_column_by_fragments(columns, *column_terms)
+        if not target_column:
+            continue
+        literal_type = str(rule.get("literal_type") or "").strip().lower()
+        fallback = str(rule.get("fallback") or "").strip().lower()
+        if literal_type == "email" and not _query_mentions_column(query_lower, target_column.lower()):
+            continue
+        if literal_type == "integer" and not _query_mentions_column(query_lower, target_column.lower()):
+            continue
+
+        if literal_type == "email":
+            email_match = _EMAIL_LITERAL_RE.search(query)
+            if email_match:
+                return f"{_quote_identifier(target_column)} = '{email_match.group(0)}'"
+            if fallback == "not_null":
+                return f"{_quote_identifier(target_column)} IS NOT NULL"
+            continue
+
+        if literal_type == "integer":
+            number_match = _INTEGER_LITERAL_RE.search(query)
+            if number_match:
+                return f"{_quote_identifier(target_column)} = {number_match.group(0)}"
+            if fallback == "not_null":
+                return f"{_quote_identifier(target_column)} IS NOT NULL"
+            continue
+
+        operator = str(rule.get("operator") or "=").strip() or "="
+        value = rule.get("value")
+        if value is None:
+            continue
+        escaped_value = str(value).replace("'", "''")
+        return f"{_quote_identifier(target_column)} {operator} '{escaped_value}'"
+
+    return None
+
+
 def _has_blocking_warnings(warnings: list[SqlWarning]) -> bool:
     return any(warning.code != WarningCode.MYSQL_EXPLAIN_UNAVAILABLE for warning in warnings)
 
@@ -589,8 +776,11 @@ def build_deterministic_sql(
     query: str,
     allowed_columns: dict[str, list[str]],
     top_k: int,
+    settings: Settings | None = None,
 ) -> tuple[str, list[str]] | None:
     """Return validated-template SQL for high-confidence simple intents."""
+    active_settings = settings or default_settings
+    query_lower = query.lower()
     tables = list(allowed_columns)
     target_table = _choose_explicit_table(query, tables)
     if target_table is None:
@@ -600,13 +790,14 @@ def build_deterministic_sql(
     if not columns:
         return None
 
+    is_recent_style = (
+        _COUNT_RE.search(query) is not None
+        or any(term in query_lower for term in _RECENT_QUERY_TERMS)
+    )
     order_columns = _best_recent_order_columns(columns)
-    if not order_columns:
-        return None
-
     selected_columns = _select_listing_columns(
         columns=columns,
-        order_columns=order_columns,
+        order_columns=order_columns if is_recent_style else [],
         max_columns=8,
     )
     if not selected_columns:
@@ -614,11 +805,17 @@ def build_deterministic_sql(
 
     limit = _deterministic_limit(query, top_k, target_table=target_table)
     select_list = ", ".join(_quote_identifier(column) for column in selected_columns)
-    order_by = ", ".join(f"{_quote_identifier(column)} DESC" for column in order_columns)
-    sql = (
-        f"SELECT {select_list} FROM {_quote_identifier(target_table)} "
-        f"ORDER BY {order_by} LIMIT {limit}"
-    )
+    sql = f"SELECT {select_list} FROM {_quote_identifier(target_table)}"
+    if is_recent_style:
+        if not order_columns:
+            return None
+        order_by = ", ".join(f"{_quote_identifier(column)} DESC" for column in order_columns)
+        sql = f"{sql} ORDER BY {order_by} LIMIT {limit}"
+    else:
+        where_clause = _build_deterministic_filter_clause(query, columns, active_settings)
+        if not where_clause:
+            return None
+        sql = f"{sql} WHERE {where_clause} LIMIT {limit}"
     return sql, [target_table]
 
 
@@ -760,6 +957,7 @@ def build_refinement_prompt(
 async def call_ollama(
     prompt: str,
     settings: Settings,
+    timeout: float | None = None,
 ) -> tuple[str | None, list[SqlWarning]]:
     client = get_model_client(
         settings=settings,
@@ -784,7 +982,7 @@ async def call_ollama(
     response = await client.generate(
         prompt=prompt,
         temperature=0.0,
-        timeout=settings.llm_timeout,
+        timeout=max(0.001, min(float(timeout or settings.llm_timeout), float(settings.llm_timeout))),
     )
     if not response.text:
         code = (
@@ -968,6 +1166,40 @@ def _score_column_for_query(
 
 def _query_mentions_column(query_lower: str, column_lower: str) -> bool:
     return column_lower in query_lower or column_lower.replace("_", " ") in query_lower
+
+
+def detect_destructive_query_intent(query: str, settings: Settings) -> str | None:
+    normalized_query = " ".join(query.lower().split())
+    for keyword in _parse_csv_terms(settings.destructive_query_keywords):
+        if re.search(rf"\b{re.escape(keyword)}\b", normalized_query, flags=re.IGNORECASE):
+            return keyword
+    return None
+
+
+def detect_basic_ambiguity_reason(query: str, settings: Settings) -> str | None:
+    stopwords = _parse_csv_terms(settings.ambiguity_query_stopwords)
+    generic_terms = _parse_csv_terms(settings.ambiguity_generic_terms)
+    modifier_terms = _parse_csv_terms(settings.ambiguity_modifier_terms)
+    tokens = [
+        token
+        for token in re.findall(r"[a-z0-9_]+", query.lower())
+        if token not in stopwords and not token.isdigit()
+    ]
+    if not tokens:
+        return "The request does not identify which business entity to query."
+
+    generic_tokens = [token for token in tokens if token in generic_terms]
+    specific_tokens = [
+        token
+        for token in tokens
+        if token not in generic_terms and token not in modifier_terms
+    ]
+    if generic_tokens and not specific_tokens:
+        return (
+            "The request uses generic terms like "
+            f"{', '.join(sorted(set(generic_tokens)))} without naming the target entity."
+        )
+    return None
 
 
 def _query_requests_all_columns(query: str) -> bool:
@@ -1368,6 +1600,78 @@ async def generate_sql(
     effective_top_k = top_k or settings.top_k
     cache_epoch: int | None = None
     query_embedding: list[float] | None = None
+    search_query = query
+    destructive_keyword = detect_destructive_query_intent(query, settings)
+    if destructive_keyword:
+        await _emit_trace(
+            trace_callback,
+            stage="sql_generation",
+            status="failed",
+            message="Destructive query intent rejected before SQL planning.",
+            warning_codes=[WarningCode.SQL_DESTRUCTIVE.value],
+            error_source="preflight_guardrail",
+            details={"destructive_keyword": destructive_keyword},
+        )
+        return GenerateSqlRejected(
+            warnings=[
+                SqlWarning(
+                    code=WarningCode.SQL_DESTRUCTIVE,
+                    message=(
+                        "The request asks for a destructive operation "
+                        f"({destructive_keyword}), but only read-only SQL is allowed."
+                    ),
+                )
+            ],
+            attempt_count=0,
+            react_trace=ReactTrace(
+                steps=[],
+                total_iterations=0,
+                final_action=ReActAction.GIVE_UP,
+            ),
+        )
+
+    ambiguity_reason = detect_basic_ambiguity_reason(query, settings)
+    if ambiguity_reason:
+        ambiguity_tables_in_scope: list[str] = []
+        try:
+            search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+            ambiguity_retrieved = await retrieve.retrieve_groups(
+                query=query,
+                top_k=effective_top_k,
+                pool=pool,
+                search_query=search_query,
+            )
+            ambiguity_tables_in_scope = list(
+                _result_value(ambiguity_retrieved, "tables_in_scope") or []
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "Ambiguity preflight retrieval failed for query %r: %s",
+                query[:80],
+                exc,
+            )
+        await _emit_trace(
+            trace_callback,
+            stage="sql_generation",
+            status="needs_context",
+            message="Basic ambiguity preflight requested clarification before SQL planning.",
+            details={"reason": ambiguity_reason, "tables_in_scope": ambiguity_tables_in_scope},
+        )
+        return GenerateSqlClarification(
+            question=(
+                "Which table or business entity do you want to query for "
+                f"'{query}'?"
+            ),
+            suggestions=_build_schema_derived_suggestions(ambiguity_tables_in_scope),
+            original_query=query,
+            failure_reason=ambiguity_reason,
+            react_trace=ReactTrace(
+                steps=[],
+                total_iterations=0,
+                final_action=ReActAction.REQUEST_CLARIFICATION,
+            ),
+        )
+
     await _emit_trace(
         trace_callback,
         stage="cache_lookup",
@@ -1389,25 +1693,114 @@ async def generate_sql(
                 _with_cache_metadata(cached, CacheSource.MEMORY_EXACT)
             )
 
-    try:
-        query_embedding = await _load_query_embedding(query)
-    except Exception:
-        query_embedding = None
-
     vector_store = PgVectorStore(pool)
     deterministic_candidate = False
     deterministic_retrieved: Any | None = None
     deterministic_tables_in_scope: list[str] = []
     deterministic_matched_groups: list[str] = []
+
+    await _emit_trace(
+        trace_callback,
+        stage="cache_lookup",
+        status="completed",
+        message="No reusable SQL cache entry found.",
+        details={"cache_source": CacheSource.NONE.value},
+    )
+
+    obvious_deterministic_result: GenerateSqlSuccess | None = None
+    try:
+        search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+        deterministic_retrieved = await retrieve.retrieve_groups(
+            query=query,
+            top_k=effective_top_k,
+            pool=pool,
+            search_query=search_query,
+        )
+        obvious_tables_in_scope = list(
+            _result_value(deterministic_retrieved, "tables_in_scope") or []
+        )
+        if len(obvious_tables_in_scope) == 1:
+            obvious_columns = await load_columns_for_tables(
+                tables=obvious_tables_in_scope,
+                settings=settings,
+            )
+            built = build_deterministic_sql(
+                query=query,
+                allowed_columns=obvious_columns,
+                top_k=effective_top_k,
+                settings=settings,
+            )
+            if built is not None:
+                sql, tables_used = built
+                warnings = validate_sql_safety(sql, settings.sql_dialect)
+                validated_tables, table_warnings = validate_tables_used(sql, tables_used)
+                warnings.extend(table_warnings)
+                warnings.extend(validate_columns_used(sql, obvious_columns))
+                if not _has_blocking_warnings(warnings):
+                    explain_warnings = await run_explain(sql, settings)
+                    if not _has_blocking_warnings(explain_warnings):
+                        obvious_deterministic_result = GenerateSqlSuccess(
+                            sql=sql,
+                            warnings=[
+                                warning
+                                for warning in explain_warnings
+                                if warning.code == WarningCode.MYSQL_EXPLAIN_UNAVAILABLE
+                            ],
+                            tables_used=validated_tables,
+                            matched_groups=[f"deterministic_{tables_used[0]}"],
+                            attempt_count=0,
+                            react_trace=None,
+                        )
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Obvious deterministic generation precheck failed for query %r: %s", query[:80], exc)
+
+    if obvious_deterministic_result is not None:
+        deterministic_result = obvious_deterministic_result
+        await _emit_trace(
+            trace_callback,
+            stage="sql_generation",
+            status="completed",
+            message="Deterministic SQL rule generated a validated query.",
+            details={
+                "matched_groups": deterministic_result.matched_groups,
+                "tables_used": deterministic_result.tables_used,
+                "sql_preview": deterministic_result.sql[:500],
+            },
+        )
+        if settings.sql_cache_enabled and deterministic_result.status == "ok":
+            payload = deterministic_result.model_dump(mode="json")
+            payload["cache_hit"] = False
+            payload["cache_source"] = CacheSource.NONE.value
+            sql_cache.set(query, effective_top_k, payload)
+            try:
+                await db.upsert_query_cache_entry(
+                    pool,
+                    endpoint="generate-sql",
+                    query_text=query,
+                    top_k=effective_top_k,
+                    response_json=payload,
+                    query_embedding=None,
+                    cache_epoch=cache_epoch or await db.get_query_cache_epoch(pool),
+                )
+            except Exception:
+                logger.exception("Failed to persist generate-sql cache entry")
+        return deterministic_result
+
+    try:
+        query_embedding = await _load_query_embedding(query)
+    except Exception:
+        query_embedding = None
+
     if query_embedding is not None:
         try:
-            search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
-            deterministic_retrieved = await retrieve.retrieve_groups(
-                query=query,
-                top_k=effective_top_k,
-                pool=pool,
-                search_query=search_query,
-            )
+            if deterministic_retrieved is None:
+                search_query = await query_rewriter.rewrite_search_query(query, pool, settings)
+                deterministic_retrieved = await retrieve.retrieve_groups(
+                    query=query,
+                    top_k=effective_top_k,
+                    pool=pool,
+                    search_query=search_query,
+                )
             deterministic_tables_in_scope = list(
                 _result_value(deterministic_retrieved, "tables_in_scope") or []
             )
@@ -1446,7 +1839,7 @@ async def generate_sql(
                     _with_cache_metadata(sem_cached, CacheSource.MEMORY_SEMANTIC)
                 )
         except Exception:
-            pass  # semantic lookup is best-effort; never block on failure
+            pass
 
     if settings.sql_cache_enabled:
         try:
@@ -1501,14 +1894,6 @@ async def generate_sql(
                     )
         except Exception:
             logger.exception("Failed DB SQL cache lookup")
-
-    await _emit_trace(
-        trace_callback,
-        stage="cache_lookup",
-        status="completed",
-        message="No reusable SQL cache entry found.",
-        details={"cache_source": CacheSource.NONE.value},
-    )
 
     deterministic_result = await _try_deterministic_generation(
         query=query,

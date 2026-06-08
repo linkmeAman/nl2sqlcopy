@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from functools import lru_cache
@@ -135,6 +136,62 @@ class Settings(BaseSettings):
     sql_generation_max_tables: int = Field(
         default=5,
         description="Max tables passed to SQL generation context.",
+    )
+    ambiguity_query_stopwords: str = (
+        "a,all,an,and,by,fetch,find,for,from,get,give,list,me,of,please,search,"
+        "show,summarize,the,their,these,those,with"
+    )
+    ambiguity_generic_terms: str = (
+        "data,detail,details,entries,entry,info,information,item,items,record,"
+        "records,report,reports,results,rows"
+    )
+    ambiguity_modifier_terms: str = (
+        "active,closed,current,inactive,latest,live,new,newest,old,open,recent"
+    )
+    destructive_query_keywords: str = (
+        "delete,drop,truncate,update,insert,alter,create,grant,revoke"
+    )
+    react_past_corrections_min_tokens: int = 8
+    react_past_corrections_connector_terms: str = "and,join,compare,between,versus,vs,with"
+    deterministic_filter_rules_json: str = json.dumps(
+        [
+            {
+                "name": "status_active",
+                "query_terms": ["active"],
+                "column_terms": ["status", "state", "active"],
+                "operator": "=",
+                "value": "active",
+            },
+            {
+                "name": "status_inactive",
+                "query_terms": ["inactive"],
+                "column_terms": ["status", "state", "active"],
+                "operator": "=",
+                "value": "inactive",
+            },
+            {
+                "name": "email_lookup",
+                "query_terms": ["email"],
+                "column_terms": ["email", "email_id"],
+                "literal_type": "email",
+                "fallback": "not_null",
+            },
+            {
+                "name": "number_lookup",
+                "query_terms": ["mobile", "phone", "number", "code"],
+                "column_terms": [
+                    "mobile",
+                    "phone",
+                    "phone_number",
+                    "contact_no",
+                    "contact_number",
+                    "code",
+                    "number",
+                ],
+                "literal_type": "integer",
+                "fallback": "not_null",
+            },
+        ]
     )
     sql_subcall_max_tokens: int = 150
     sql_dialect: str = "mysql"
