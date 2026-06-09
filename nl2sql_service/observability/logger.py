@@ -15,6 +15,28 @@ from nl2sql_service.observability.metrics import observe_stage
 logger = logging.getLogger(__name__)
 
 
+_IMPORTANT_OBSERVABILITY_STAGES = {
+    "answer_generation",
+    "execution",
+    "sql_generation",
+    "complete",
+}
+
+
+class _ImportantLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        payload = getattr(record, "observability_payload", None)
+        if not isinstance(payload, dict):
+            return False
+        stage = str(payload.get("stage") or "").strip().lower()
+        status = str(payload.get("status") or "").strip().lower()
+        if stage in _IMPORTANT_OBSERVABILITY_STAGES:
+            return status in {"completed", "failed", "warning"}
+        return False
+
+
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         context = get_observability_context()
@@ -61,6 +83,7 @@ def _build_file_handler(
     handler.suffix = "%Y-%m-%d"
     handler.setFormatter(_JsonFormatter())
     handler.setLevel(level)
+    handler.addFilter(_ImportantLogFilter())
     return handler
 
 
