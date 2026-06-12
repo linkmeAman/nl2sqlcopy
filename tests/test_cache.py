@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from nl2sql_service import cache, retrieve, sql_generator
-from nl2sql_service.models import GenerateSqlSuccess
+from nl2sql_service.models import CacheSource, GenerateSqlSuccess
 
 
 def test_embed_cache_expires_by_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -50,6 +50,25 @@ def test_sql_cache_only_caches_ok_results() -> None:
 
     local_cache.set("show invoices", 5, {"status": "ok", "sql": "SELECT 1"})
     assert local_cache.get(" SHOW INVOICES ", 5) == {"status": "ok", "sql": "SELECT 1"}
+
+
+def test_sql_cache_uses_canonical_exact_key() -> None:
+    local_cache = cache.SqlCache()
+    local_cache.invalidate_all()
+
+    local_cache.set("latest payment", 5, {"status": "ok", "sql": "SELECT 1"})
+
+    assert local_cache.get("newest payment", 5) == {"status": "ok", "sql": "SELECT 1"}
+
+
+def test_ask_cache_uses_canonical_exact_key() -> None:
+    local_cache = cache.AskCache()
+    local_cache.invalidate_all()
+
+    payload = {"status": "ok", "answer": "cached"}
+    local_cache.set("What is the latest payment?", 5, payload)
+
+    assert local_cache.get_exact("show newest payment", 5) == {"status": "ok", "answer": "cached", "_top_k": 5}
 
 
 @pytest.mark.asyncio
@@ -124,3 +143,92 @@ async def test_cache_ops_endpoints(client) -> None:
     assert {"semantic_sql_cleared", "ask_cleared", "db_query_cache_cleared"}.issubset(
         body.keys()
     )
+
+
+@pytest.mark.asyncio
+async def test_ask_semantic_cache_hits_for_deterministic_candidate(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nl2sql_service import main
+
+    embedding = [0.1] * 1024
+    ask_workflow = AsyncMock()
+
+    monkeypatch.setattr(main, "_load_query_embedding", AsyncMock(return_value=embedding))
+    monkeypatch.setattr(main, "is_deterministic_generation_candidate", AsyncMock(return_value=True))
+    monkeypatch.setattr(main, "_run_ask_workflow", ask_workflow)
+
+    cache.ask_cache.set(
+        "latest payment",
+        5,
+        {
+            "status": "ok",
+            "answer": "Cached latest payment answer",
+            "sql": "SELECT order_reference_no FROM payment ORDER BY date DESC LIMIT 1;",
+            "warnings": [],
+            "row_count": 1,
+            "columns": ["order_reference_no"],
+            "tables_used": ["payment"],
+            "matched_groups": ["deterministic_payment"],
+            "attempt_count": 1,
+            "cache_hit": False,
+            "cache_source": CacheSource.NONE.value,
+            "react_trace": None,
+            "stage_latencies_ms": {"sql_generation": 10, "execution": 1, "answer_generation": 1},
+            "review_prompt": None,
+        },
+        embedding=embedding,
+    )
+
+    response = await client.post("/ask", json={"query": "most recent payment", "top_k": 5})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["answer"] == "Cached latest payment answer"
+    assert body["cache_hit"] is True
+    assert body["cache_source"] == CacheSource.MEMORY_SEMANTIC.value
+    assert ask_workflow.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_ask_exact_cache_hits_for_canonical_variant(
+    client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nl2sql_service import main
+
+    ask_workflow = AsyncMock()
+    monkeypatch.setattr(main, "_run_ask_workflow", ask_workflow)
+
+    cache.ask_cache.set(
+        "latest payment",
+        5,
+        {
+            "status": "ok",
+            "answer": "Cached latest payment answer",
+            "sql": "SELECT order_reference_no FROM payment ORDER BY date DESC LIMIT 1;",
+            "warnings": [],
+            "row_count": 1,
+            "columns": ["order_reference_no"],
+            "tables_used": ["payment"],
+            "matched_groups": ["deterministic_payment"],
+            "attempt_count": 1,
+            "cache_hit": False,
+            "cache_source": CacheSource.NONE.value,
+            "react_trace": None,
+            "stage_latencies_ms": {"sql_generation": 10, "execution": 1, "answer_generation": 1},
+            "review_prompt": None,
+        },
+    )
+
+    response = await client.post("/ask", json={"query": "newest payment", "top_k": 5})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["answer"] == "Cached latest payment answer"
+    assert body["cache_hit"] is True
+    assert body["cache_source"] == CacheSource.MEMORY_EXACT.value
+    assert ask_workflow.await_count == 0

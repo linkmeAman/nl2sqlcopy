@@ -15,6 +15,25 @@ execution, interactive teaching, trace telemetry, and version-aware ingest.
 - Version-aware ingest routes that skip unchanged chunks
 - In-memory exact/semantic caches plus DB-backed exact/semantic query cache
 
+## MCP Integration
+
+The MCP wrapper lives in `mcp_server/` and is deployed as a separate service.
+It does not import `nl2sql_service` internals. Instead, it proxies tool calls
+over HTTP to the FastAPI service using `NL2SQL_SERVICE_URL`.
+
+Default topology:
+
+- `nl2sql_service` on `http://localhost:8080`
+- `mcp_server` on `http://localhost:9090`
+
+Use `make run` for the FastAPI service and `make run-mcp` for the MCP service.
+For systemd-based deployments, use separate units for each process.
+
+Systemd deployment files for the main API and MCP wrapper live in
+`deploy/systemd/`. The MCP unit expects `/var/www/py-workspace/nl2sql/.env.mcp`
+to exist with the variables from `.env.mcp.example`, then starts the bridge
+entrypoint with `python -m mcp_server`.
+
 ## Provider-Agnostic Models
 
 All model calls go through `nl2sql_service/llm/`. Business logic depends on the

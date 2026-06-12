@@ -1818,7 +1818,7 @@ async def generate_sql(
             matched_groups=deterministic_matched_groups,
         )
 
-    if settings.sql_cache_enabled and not deterministic_candidate:
+    if settings.sql_cache_enabled:
         try:
             if query_embedding is None:
                 raise ValueError("query embedding unavailable")

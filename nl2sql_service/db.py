@@ -7,6 +7,7 @@ from datetime import datetime
 import asyncpg
 import pgvector.asyncpg  # registers the vector codec
 
+from nl2sql_service.cache_keys import canonicalize_query_text
 from nl2sql_service.config import settings
 
 logger = logging.getLogger(__name__)
@@ -1118,7 +1119,7 @@ async def cleanup_pending_teach_confirmations(pool: asyncpg.Pool) -> int:
 
 
 def normalize_query_text(query: str) -> str:
-    return " ".join(query.strip().lower().split())
+    return canonicalize_query_text(query)
 
 
 async def get_query_cache_epoch(pool: asyncpg.Pool) -> int:

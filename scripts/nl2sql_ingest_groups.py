@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 import sys
+import urllib.error
 import urllib.request
 
 
@@ -31,6 +33,28 @@ def _post(url: str, payload: dict, timeout: int = 300) -> dict:
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read())
+
+
+def _get(url: str, timeout: int = 10) -> dict:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read())
+
+
+def _wait_until_ready(base_url: str, *, timeout: int, poll_interval: float = 1.0) -> None:
+    deadline = time.monotonic() + max(1, timeout)
+    health_url = base_url.rstrip("/") + "/health/runtime"
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        try:
+            payload = _get(health_url, timeout=min(timeout, 10))
+            if str(payload.get("status", "")).lower() == "ok":
+                return
+            last_error = f"runtime health status={payload.get('status')!r}"
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+        time.sleep(poll_interval)
+    raise RuntimeError(f"Service did not become ready at {health_url}: {last_error or 'unknown error'}")
 
 
 def main() -> None:
@@ -118,9 +142,20 @@ def main() -> None:
         default=300,
         help="HTTP request timeout in seconds (default: 300). Increase for large knowledge ingests.",
     )
+    parser.add_argument(
+        "--ready-timeout",
+        type=int,
+        default=90,
+        help="How long to wait for /health/runtime to report ok before posting ingest requests.",
+    )
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
+    try:
+        _wait_until_ready(base, timeout=args.ready_timeout)
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.all:
         _run_step(

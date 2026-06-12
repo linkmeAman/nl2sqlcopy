@@ -10,6 +10,7 @@ from typing import Any
 import asyncpg
 
 from nl2sql_service import embed
+from nl2sql_service.cache_keys import canonicalize_query_text
 from nl2sql_service.config import settings
 from nl2sql_service.models import (
     InstructionType,
@@ -26,6 +27,36 @@ _PENDING_TTL = timedelta(minutes=30)
 _MAX_PENDING = 100
 # Legacy test shim; runtime confirmations are persisted in PostgreSQL.
 _pending_instructions: dict[str, dict] = {}
+_INSTRUCTION_QUERY_STOPWORDS = {
+    "and",
+    "for",
+    "from",
+    "into",
+    "with",
+    "without",
+    "that",
+    "this",
+    "these",
+    "those",
+    "handle",
+    "using",
+    "user",
+    "asks",
+    "asked",
+    "query",
+    "correct",
+    "columns",
+    "column",
+    "table",
+    "tables",
+    "expected",
+    "output",
+    "failure",
+    "failed",
+    "issue",
+    "observed",
+    "reason",
+}
 
 
 def build_embedding_source(
@@ -573,7 +604,12 @@ async def get_relevant_instructions(
                     min_confidence,
                     limit,
                 )
-        return [_instruction_row_to_dict(row) for row in rows]
+        candidates = [_instruction_row_to_dict(row) for row in rows]
+        return [
+            item
+            for item in candidates
+            if _instruction_matches_query(query, item)
+        ]
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to load relevant user instructions: %s", exc)
         return []
@@ -902,6 +938,47 @@ def _instruction_row_to_dict(row: Any) -> dict:
     elif not isinstance(data["tables_affected"], list):
         data["tables_affected"] = list(data["tables_affected"])
     return data
+
+
+def _instruction_matches_query(query: str, instruction: dict[str, Any]) -> bool:
+    query_tokens = _instruction_match_tokens(query)
+    if not query_tokens:
+        return True
+
+    source_query = str(instruction.get("source_query") or "").strip()
+    source_tokens = _instruction_match_tokens(source_query)
+    if source_tokens:
+        shared_source = query_tokens.intersection(source_tokens)
+        if len(shared_source) >= 2:
+            return True
+        if shared_source and len(shared_source) == len(query_tokens):
+            return True
+        if shared_source and (len(shared_source) / max(1, len(query_tokens))) >= 0.6:
+            return True
+
+    content_tokens = _instruction_match_tokens(str(instruction.get("content") or ""))
+    table_tokens = {
+        _normalize_token(str(table))
+        for table in (instruction.get("tables_affected") or [])
+        if str(table).strip()
+    }
+    if query_tokens.intersection(content_tokens.union(table_tokens)):
+        return True
+
+    # Query-specific instructions must match the current query materially.
+    if source_tokens:
+        return False
+
+    return False
+
+
+def _instruction_match_tokens(value: str) -> set[str]:
+    canonical = canonicalize_query_text(value)
+    return {
+        token
+        for token in canonical.split()
+        if len(token) >= 3 and token not in _INSTRUCTION_QUERY_STOPWORDS
+    }
 
 
 async def _embed_instruction(text: str) -> list[float] | None:

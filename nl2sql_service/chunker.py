@@ -146,9 +146,9 @@ async def chunk_schema_group(
         if cols:
             enriched_columns = []
             for column in cols:
-                aliases = aliases_for_column_introspection(column)
-                if aliases:
-                    enriched_columns.append(f"{column} ({'; '.join(aliases[:3])})")
+                column_aliases = aliases_for_column_introspection(column)
+                if column_aliases:
+                    enriched_columns.append(f"{column} ({'; '.join(column_aliases[:3])})")
                 else:
                     enriched_columns.append(column)
             lines.append(f"  {table}: {', '.join(enriched_columns)}")
@@ -195,6 +195,9 @@ async def chunk_schema_group(
         "chunk_group_name": entity["chunk_group_name"],
         "root_table": entity["root_table"],
         "root_table_ref": entity.get("root_table_ref", ""),
+        "included_tables": included_tables,
+        "summarized_tables": summarized_tables,
+        "referenced_tables": referenced_tables,
         "tables": tables,
         "related_tables": related_tables,
         "group_description": entity.get("rationale", ""),

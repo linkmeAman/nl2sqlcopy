@@ -5,6 +5,7 @@ import math
 import time
 from typing import Any
 
+from nl2sql_service.cache_keys import canonicalize_query_text
 from nl2sql_service.config import settings
 
 
@@ -76,7 +77,8 @@ class SqlCache:
 
     @staticmethod
     def _key(query: str, top_k: int) -> str:
-        return hashlib.md5(f"{query.strip().lower()}:{top_k}".encode()).hexdigest()
+        canonical = canonicalize_query_text(query)
+        return hashlib.md5(f"{canonical}:{top_k}".encode()).hexdigest()
 
 
 class SemanticSqlCache:
@@ -157,7 +159,8 @@ class SemanticSqlCache:
 
     @staticmethod
     def _key(query: str, top_k: int) -> str:
-        return hashlib.md5(f"{query.strip().lower()}:{top_k}".encode()).hexdigest()
+        canonical = canonicalize_query_text(query)
+        return hashlib.md5(f"{canonical}:{top_k}".encode()).hexdigest()
 
 
 class AskCache:
@@ -240,7 +243,8 @@ class AskCache:
 
     @staticmethod
     def _key(query: str, top_k: int) -> str:
-        return hashlib.md5(f"{query.strip().lower()}:{top_k}".encode()).hexdigest()
+        canonical = canonicalize_query_text(query)
+        return hashlib.md5(f"{canonical}:{top_k}".encode()).hexdigest()
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

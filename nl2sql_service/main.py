@@ -2603,7 +2603,7 @@ async def ask_endpoint(
         )
 
     # --- Ask cache: semantic match -----------------------------------------------
-    if settings.ask_cache_enabled and not deterministic_candidate:
+    if settings.ask_cache_enabled:
         try:
             if query_embedding is None:
                 raise ValueError("query embedding unavailable")
