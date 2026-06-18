@@ -98,7 +98,7 @@ async def test_ask_deterministic_inquiry_uses_fallback_answer(
     assert response.status_code == 200
     assert body["status"] == "ok"
     assert body["answer"].startswith("Found 2 rows.")
-    assert "10 | 2026-05-01 | 200" in body["answer"]
+    assert "10 | 200 | 2026-05-01" in body["answer"]
     assert body["matched_groups"] == ["deterministic_inquiry"]
     assert mock_generate_answer.await_count == 0
     assert mock_embed.await_count <= 1

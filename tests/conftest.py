@@ -152,30 +152,20 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
             [],
         )
     )
-    reasoning_mock: AsyncMock = AsyncMock(
-        side_effect=[
-            (
-                "I should generate SQL for billing tables",
-                "ACTION: GENERATE_SQL\nINPUT: generate select",
-                [],
-            ),
-            (
-                "I should validate the generated SQL",
-                "ACTION: VALIDATE_AND_RETURN\nINPUT: validate current SQL",
-                [],
-            ),
-            (
-                "The prior SQL failed, so I should generate a corrected query",
-                "ACTION: GENERATE_SQL\nINPUT: generate corrected select",
-                [],
-            ),
-            (
-                "I should validate the corrected SQL",
-                "ACTION: VALIDATE_AND_RETURN\nINPUT: validate current SQL",
-                [],
-            ),
-        ]
-    )
+    def reasoning_side_effect(*args, **kwargs):
+        call_count = getattr(reasoning_side_effect, "call_count", 0)
+        setattr(reasoning_side_effect, "call_count", call_count + 1)
+        if call_count == 0:
+            return ("I should generate SQL for billing tables", "ACTION: GENERATE_SQL\nINPUT: generate select", [])
+        if call_count == 1:
+            return ("I should validate the generated SQL", "ACTION: VALIDATE_AND_RETURN\nINPUT: validate current SQL", [])
+        if call_count == 2:
+            return ("The prior SQL failed, so I should generate a corrected query", "ACTION: GENERATE_SQL\nINPUT: generate corrected select", [])
+        if call_count == 3:
+            return ("I should validate the corrected SQL", "ACTION: VALIDATE_AND_RETURN\nINPUT: validate current SQL", [])
+        return ("I should give up", "ACTION: ASK_CLARIFICATION\nINPUT: too many retries", [])
+
+    reasoning_mock: AsyncMock = AsyncMock(side_effect=reasoning_side_effect)
     monkeypatch.setattr(sql_generator, "call_ollama", async_mock)
     monkeypatch.setattr(react_agent, "call_ollama", async_mock)
     monkeypatch.setattr(react_agent, "call_reasoning_model", reasoning_mock)

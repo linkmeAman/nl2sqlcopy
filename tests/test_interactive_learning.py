@@ -143,12 +143,13 @@ class _InstructionConn:
                 "instruction_type": args[0],
                 "content": args[1],
                 "embedding_source": args[2],
-                "tables_affected": list(args[3] or []),
-                "confidence_score": float(args[4]),
-                "is_verified": bool(args[5]),
+                "instruction_embedding": args[3],
+                "tables_affected": list(args[4] or []),
+                "confidence_score": float(args[5]),
+                "is_verified": bool(args[6]),
                 "is_active": True,
-                "conflict_group": args[7],
-                "source_query": args[6],
+                "conflict_group": args[8],
+                "source_query": args[7],
                 "use_count": 0,
                 "success_count": 0,
                 "failure_count": 0,
@@ -629,6 +630,7 @@ async def test_instructions_appear_before_patterns(
 
 @pytest.mark.asyncio
 async def test_give_up_triggers_confidence_decay(
+    mock_embed,
     monkeypatch: pytest.MonkeyPatch,
     mock_instruction_store_with_rules,
     mock_build_clarification,

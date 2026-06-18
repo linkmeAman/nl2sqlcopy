@@ -53,7 +53,7 @@ async def test_generate_answer_falls_back_when_answer_model_fails(
     assert answer.startswith("Found 2 rows.")
     assert "invoice_id" in answer
     assert "amount" in answer
-    assert "created_at" in answer
+    assert "date" in answer
 
 
 def test_answer_prompt_uses_structured_template_rows():

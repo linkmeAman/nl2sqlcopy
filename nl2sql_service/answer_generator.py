@@ -10,7 +10,6 @@ from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.sanitization import stable_hash, summarize_text
 from nl2sql_service.roles import LLMRole
 from nl2sql_service.rulebook import build_governance_block, get_config
-from nl2sql_service.sql_generator import select_relevant_column_indexes
 
 
 def _format_warning_lines(warnings: list[SqlWarning]) -> str:
@@ -124,7 +123,7 @@ def _combine_answer_sections(sections: dict[str, str]) -> str:
 
 
 def _fallback_column_indexes(query: str, columns: list[str], max_columns: int = 8) -> list[int]:
-    return select_relevant_column_indexes(query, columns, max_columns)
+    return list(range(min(max_columns, len(columns))))
 
 
 def _truncate_to_max_words(text: str, max_words: int) -> str:

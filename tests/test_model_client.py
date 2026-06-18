@@ -89,6 +89,7 @@ async def test_sql_wrapper_returns_warning_when_model_client_is_empty(
 ) -> None:
     class EmptyClient:
         provider_name = "fake"
+        model_name = "fake_model"
 
         async def generate(self, **kwargs):
             del kwargs
@@ -112,6 +113,7 @@ async def test_sql_wrapper_maps_timeout_warning(
 ) -> None:
     class EmptyClient:
         provider_name = "fake"
+        model_name = "fake_model"
 
         async def generate(self, **kwargs):
             del kwargs

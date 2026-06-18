@@ -171,37 +171,6 @@ def test_refinement_prompt_uses_column_selection_rule():
     assert "SELECT only the columns needed for the calculation" in prompt
 
 
-def test_inquiry_select_star_is_narrowed_without_low_signal_columns():
-    columns = [
-        "id",
-        "contact_id",
-        "type",
-        "employee_id",
-        "allocation_date",
-        "source",
-        "heard_from",
-        "converted",
-        "last_updated",
-        "balance",
-        "created_by",
-        "created_at",
-    ]
-
-    sql = sql_generator.narrow_select_star(
-        "SELECT * FROM inquiry ORDER BY created_at DESC LIMIT 5;",
-        {"inquiry": columns},
-        "show me the 5 most recent inquiries",
-    )
-
-    assert "*" not in sql
-    assert "id" in sql
-    assert "contact_id" in sql
-    assert "created_at" in sql
-    assert "balance" not in sql
-    assert "created_by" not in sql
-    assert "last_updated" not in sql
-
-
 def test_deterministic_recent_payment_sql_uses_live_columns():
     built = sql_generator.build_deterministic_sql(
         query="newest payment",

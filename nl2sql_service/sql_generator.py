@@ -42,13 +42,11 @@ TraceCallback = Callable[..., Awaitable[None]]
 _EMAIL_LITERAL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _INTEGER_LITERAL_RE = re.compile(r"\b\d+\b")
 
-
 @dataclass(frozen=True)
 class ColumnSearchHit:
     table_name: str
     column_name: str
     similarity: float = 0.0
-
 
 class VectorStore(Protocol):
     async def search_columns(
@@ -58,7 +56,6 @@ class VectorStore(Protocol):
         top_k: int,
     ) -> list[ColumnSearchHit]:
         ...
-
 
 # TODO: Move concrete vector-store calls up to the route/service layer and pass
 # list[ColumnSearchHit] into this module so SQL generation depends only on data,
@@ -72,7 +69,6 @@ WHERE metadata->>'type' = 'column_catalog'
 ORDER BY embedding <=> $1
 LIMIT $2
 """
-
 
 class PgVectorStore:
     def __init__(self, pool: asyncpg.Pool):
@@ -116,7 +112,6 @@ class PgVectorStore:
             )
         return hits
 
-
 class _StaticColumnSearchVectorStore:
     def __init__(self, hits: list[ColumnSearchHit]):
         self._hits = hits
@@ -129,7 +124,6 @@ class _StaticColumnSearchVectorStore:
     ) -> list[ColumnSearchHit]:
         del embedding
         return self._hits[:top_k]
-
 
 async def _emit_trace(
     trace_callback: TraceCallback | None,
@@ -247,24 +241,6 @@ _COLUMN_NAME_SKIP_KEYWORDS = {
 }
 _RECENT_QUERY_TERMS = ("recent", "latest", "newest", "last")
 _COUNT_RE = re.compile(r"\b(\d{1,3})\b")
-_FINANCIAL_QUERY_TERMS = (
-    "amount",
-    "balance",
-    "cost",
-    "fee",
-    "paid",
-    "total",
-)
-_AUDIT_QUERY_TERMS = (
-    "audit",
-    "created by",
-    "creator",
-    "last updated",
-    "modified",
-    "modified by",
-    "updated",
-    "updated by",
-)
 COLUMN_SELECTION_RULE = """COLUMN SELECTION RULE:
  For listing queries (show, list, find, get, fetch):
    SELECT: id, name/title/subject columns, status,
@@ -278,14 +254,12 @@ For aggregation queries (total, count, sum, average):
  For detail queries (details, full, all columns, *):
    SELECT * is acceptable."""
 
-
 def _parse_csv_terms(value: str) -> set[str]:
     return {
         item.strip().lower()
         for item in value.split(",")
         if item.strip()
     }
-
 
 def _load_deterministic_filter_rules(settings: Settings) -> list[dict[str, Any]]:
     try:
@@ -297,10 +271,8 @@ def _load_deterministic_filter_rules(settings: Settings) -> list[dict[str, Any]]
         return []
     return [rule for rule in parsed if isinstance(rule, dict)]
 
-
 def _table_label(table: str) -> str:
     return _normalize_table_name(table).replace("_", " ").strip()
-
 
 def _singularize_label(label: str) -> str:
     if label.endswith("ies"):
@@ -309,14 +281,12 @@ def _singularize_label(label: str) -> str:
         return label[:-1]
     return label
 
-
 def _pluralize_label(label: str) -> str:
     if label.endswith("y") and not label.endswith(("ay", "ey", "iy", "oy", "uy")):
         return f"{label[:-1]}ies"
     if label.endswith("s"):
         return label
     return f"{label}s"
-
 
 def _build_schema_derived_suggestions(
     tables_in_scope: list[str],
@@ -355,19 +325,16 @@ def _build_schema_derived_suggestions(
             break
     return suggestions
 
-
 def _quote_identifier(identifier: str) -> str:
     if _SQL_NAME_RE.match(identifier):
         return identifier
     return f"`{identifier.replace('`', '``')}`"
-
 
 def _query_looks_multi_table(query: str) -> bool:
     normalized = " ".join(query.lower().split())
     if re.search(r"\b(join|compare|between|alongside|versus|vs)\b", normalized):
         return True
     return bool(re.search(r",|\band\b|\bwith\b|\bby\b", normalized))
-
 
 async def _schema_is_self_contained(
     query: str,
@@ -432,7 +399,6 @@ async def _schema_is_self_contained(
         and len(foreign_tables) <= 1
         and not _query_looks_multi_table(query)
     )
-
 
 async def is_deterministic_generation_candidate(
     query: str,
@@ -526,7 +492,6 @@ async def is_deterministic_generation_candidate(
     )
     return True
 
-
 def _deterministic_limit(query: str, top_k: int, target_table: str | None = None) -> int:
     match = _COUNT_RE.search(query)
     if match:
@@ -535,7 +500,6 @@ def _deterministic_limit(query: str, top_k: int, target_table: str | None = None
     if target_table and _query_mentions_table_form(query, target_table, plural=False):
         return 1
     return max(1, min(top_k, 50))
-
 
 def _best_recent_order_columns(columns: list[str]) -> list[str]:
     lookup = {column.lower(): column for column in columns}
@@ -561,7 +525,6 @@ def _best_recent_order_columns(columns: list[str]) -> list[str]:
         if len(ordered) >= 4:
             break
     return ordered
-
 
 def _select_listing_columns(
     columns: list[str],
@@ -611,10 +574,24 @@ def _select_listing_columns(
 
     return (selected or columns[:max_columns])[:max_columns]
 
+def _is_audit_column(column_lower: str) -> bool:
+    return column_lower in {
+        "created_by",
+        "created_at",
+        "creator",
+        "creator_id",
+        "last_updated",
+        "modified_at",
+        "modified_by",
+        "updated_at",
+        "updated_by",
+    }
+
+def _query_mentions_column(query_lower: str, column_lower: str) -> bool:
+    return column_lower in query_lower or column_lower.replace("_", " ") in query_lower
 
 def _normalize_match_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
-
 
 def _singularize(term: str) -> str:
     if len(term) > 3 and term.endswith("ies"):
@@ -625,14 +602,12 @@ def _singularize(term: str) -> str:
         return term[:-1]
     return term
 
-
 def _pluralize(term: str) -> str:
     if term.endswith("y") and len(term) > 1 and term[-2] not in "aeiou":
         return term[:-1] + "ies"
     if term.endswith("s"):
         return term + "es"
     return term + "s"
-
 
 def _table_aliases(table: str) -> set[str]:
     normalized = _normalize_match_text(table)
@@ -646,7 +621,6 @@ def _table_aliases(table: str) -> set[str]:
         aliases.add(" ".join([*tokens[:-1], singular_last]))
         aliases.add(" ".join([*tokens[:-1], _pluralize(singular_last)]))
     return {alias for alias in aliases if alias}
-
 
 def _query_mentions_table_form(
     query: str,
@@ -663,7 +637,6 @@ def _query_mentions_table_form(
         if f" {alias} " in query_text:
             return True
     return False
-
 
 def _choose_explicit_table(query: str, tables: list[str]) -> str | None:
     query_text = f" {_normalize_match_text(query)} "
@@ -683,7 +656,6 @@ def _choose_explicit_table(query: str, tables: list[str]) -> str | None:
         return None
     return sorted(scored)[0][2]
 
-
 def _find_column_by_fragments(columns: list[str], *fragments: str) -> str | None:
     lowered = {column.lower(): column for column in columns}
     for fragment in fragments:
@@ -694,7 +666,6 @@ def _find_column_by_fragments(columns: list[str], *fragments: str) -> str | None
         if any(fragment in column_lower for fragment in fragments):
             return column
     return None
-
 
 def _build_deterministic_filter_clause(
     query: str,
@@ -742,17 +713,14 @@ def _build_deterministic_filter_clause(
 
     return None
 
-
 def _has_blocking_warnings(warnings: list[SqlWarning]) -> bool:
     return any(warning.code != WarningCode.MYSQL_EXPLAIN_UNAVAILABLE for warning in warnings)
-
 
 def _with_cache_metadata(payload: dict[str, Any], source: CacheSource) -> dict[str, Any]:
     updated = dict(payload)
     updated["cache_hit"] = source != CacheSource.NONE
     updated["cache_source"] = source.value
     return updated
-
 
 async def _load_query_embedding(
     query: str,
@@ -770,7 +738,6 @@ async def _load_query_embedding(
     q_vec = vecs[0]
     embed_cache.set(query, q_vec)
     return q_vec
-
 
 def build_deterministic_sql(
     query: str,
@@ -817,7 +784,6 @@ def build_deterministic_sql(
             return None
         sql = f"{sql} WHERE {where_clause} LIMIT {limit}"
     return sql, [target_table]
-
 
 def build_sql_prompt(
     query: str,
@@ -877,7 +843,6 @@ def build_sql_prompt(
         ]
     )
     return "\n".join(lines)
-
 
 def build_refinement_prompt(
     query: str,
@@ -953,7 +918,6 @@ def build_refinement_prompt(
     )
     return "\n".join(lines)
 
-
 async def call_ollama(
     prompt: str,
     settings: Settings,
@@ -1017,7 +981,6 @@ async def call_ollama(
     )
     return response.text, []
 
-
 def extract_sql(raw: str) -> str:
     stripped = raw.strip()
     if not stripped:
@@ -1040,14 +1003,19 @@ def extract_sql(raw: str) -> str:
 
     return ""
 
-
 def narrow_select_star(
     sql: str,
     allowed_columns: dict[str, list[str]],
     query: str,
     max_columns: int = 8,
 ) -> str:
-    """Replace simple single-table SELECT * with a focused column list."""
+    """
+    Replace simple single-table SELECT * with a focused column list.
+    
+    We now rely on exact column generation from RAG. The available columns
+    in `allowed_columns` have already been pre-filtered by relevance. We
+    simply apply the top `max_columns` to avoid huge result sets.
+    """
     if _query_requests_all_columns(query):
         return sql
 
@@ -1060,113 +1028,12 @@ def narrow_select_star(
     if not columns:
         return sql
 
-    selected_columns = _select_relevant_columns(query, columns, max_columns)
-    if not selected_columns:
-        return sql
+    selected_columns = columns[:max_columns]
 
     return (
         f"{match.group('prefix')}{', '.join(selected_columns)} "
         f"{match.group('from')}{match.group('table')}{match.group('rest')}"
     )
-
-
-def _select_relevant_columns(
-    query: str,
-    columns: list[str],
-    max_columns: int,
-) -> list[str]:
-    indexes = select_relevant_column_indexes(query, columns, max_columns)
-    return [columns[index] for index in indexes]
-
-
-def select_relevant_column_indexes(
-    query: str,
-    columns: list[str],
-    max_columns: int = 8,
-) -> list[int]:
-    query_lower = query.lower()
-    recent_query = any(term in query_lower for term in _RECENT_QUERY_TERMS)
-    financial_query = any(term in query_lower for term in _FINANCIAL_QUERY_TERMS)
-    audit_query = any(term in query_lower for term in _AUDIT_QUERY_TERMS)
-    scored: list[tuple[int, int]] = []
-    for index, column in enumerate(columns):
-        column_lower = column.lower()
-        score = _score_column_for_query(
-            column_lower=column_lower,
-            query_lower=query_lower,
-            recent_query=recent_query,
-            financial_query=financial_query,
-            audit_query=audit_query,
-        )
-        if score > 0:
-            scored.append((-score, index))
-
-    selected = [index for _, index in sorted(scored)[:max_columns]]
-    if selected:
-        return selected
-
-    fallback_indexes = [
-        index
-        for index, column in enumerate(columns)
-        if not _is_low_signal_column(column.lower(), financial_query, audit_query)
-    ]
-    return (fallback_indexes or list(range(len(columns))))[:max_columns]
-
-
-def _score_column_for_query(
-    column_lower: str,
-    query_lower: str,
-    recent_query: bool,
-    financial_query: bool,
-    audit_query: bool,
-) -> int:
-    score = 0
-    mentioned = _query_mentions_column(query_lower, column_lower)
-    if mentioned:
-        score += 220
-
-    if column_lower == "id":
-        score += 130
-    elif column_lower == "contact_id":
-        score += 65
-    elif column_lower.endswith("_id"):
-        score += 45
-
-    if column_lower == "created_at":
-        score += 110 if recent_query else 65
-    elif column_lower in {"date", "doi", "doc"}:
-        score += 95 if recent_query else 55
-    elif column_lower == "allocation_date":
-        score += 65
-    elif any(fragment in column_lower for fragment in ("date", "time")):
-        score += 70 if recent_query else 40
-
-    if any(fragment in column_lower for fragment in ("amount", "total")):
-        score += 95 if financial_query else 20
-    if column_lower == "balance":
-        score += 90 if financial_query else -120
-    if any(fragment in column_lower for fragment in ("mode", "method", "reference")):
-        score += 80 if financial_query else 30
-    if any(fragment in column_lower for fragment in ("reference", "txn", "tracking")):
-        score += 55
-    if "status" in column_lower or column_lower in {"converted", "active", "park"}:
-        status_query = any(
-            term in query_lower
-            for term in ("active", "converted", "open", "status")
-        )
-        score += 70 if status_query else 45
-    if "source" in column_lower or column_lower == "heard_from":
-        score += 70 if "source" in query_lower else 35
-
-    if _is_audit_column(column_lower) and not (audit_query or mentioned):
-        score -= 120
-
-    return score
-
-
-def _query_mentions_column(query_lower: str, column_lower: str) -> bool:
-    return column_lower in query_lower or column_lower.replace("_", " ") in query_lower
-
 
 def detect_destructive_query_intent(query: str, settings: Settings) -> str | None:
     normalized_query = " ".join(query.lower().split())
@@ -1174,7 +1041,6 @@ def detect_destructive_query_intent(query: str, settings: Settings) -> str | Non
         if re.search(rf"\b{re.escape(keyword)}\b", normalized_query, flags=re.IGNORECASE):
             return keyword
     return None
-
 
 def detect_basic_ambiguity_reason(query: str, settings: Settings) -> str | None:
     stopwords = _parse_csv_terms(settings.ambiguity_query_stopwords)
@@ -1201,7 +1067,6 @@ def detect_basic_ambiguity_reason(query: str, settings: Settings) -> str | None:
         )
     return None
 
-
 def _query_requests_all_columns(query: str) -> bool:
     return bool(
         re.search(
@@ -1211,30 +1076,6 @@ def _query_requests_all_columns(query: str) -> bool:
             flags=re.IGNORECASE,
         )
     )
-
-
-def _is_audit_column(column_lower: str) -> bool:
-    return column_lower in {
-        "created_by",
-        "last_updated",
-        "modified_at",
-        "modified_by",
-        "updated_at",
-        "updated_by",
-    }
-
-
-def _is_low_signal_column(
-    column_lower: str,
-    financial_query: bool,
-    audit_query: bool,
-) -> bool:
-    if column_lower == "balance" and not financial_query:
-        return True
-    if _is_audit_column(column_lower) and not audit_query:
-        return True
-    return False
-
 
 def validate_sql_safety(
     sql: str,
@@ -1288,7 +1129,6 @@ def validate_sql_safety(
 
     return []
 
-
 def validate_tables_used(
     sql: str,
     tables_in_scope: list[str],
@@ -1336,7 +1176,6 @@ def validate_tables_used(
         ]
 
     return tables_used, []
-
 
 def validate_columns_used(
     sql: str,
@@ -1389,7 +1228,6 @@ def validate_columns_used(
 
     return []
 
-
 async def run_explain(sql: str, settings: Settings) -> list[SqlWarning]:
     schema_name = (settings.db_name or settings.db_central or "").strip()
     if not schema_name:
@@ -1441,7 +1279,6 @@ async def run_explain(sql: str, settings: Settings) -> list[SqlWarning]:
         ]
     finally:
         connection.close()
-
 
 async def review_sql(
     sql: str,
@@ -1522,7 +1359,6 @@ REASON: <one sentence explaining the verdict>
 
     return True, []
 
-
 async def _apply_review_gate(
     result: GenerateSqlSuccess,
     query: str,
@@ -1586,7 +1422,6 @@ async def _apply_review_gate(
         ),
     )
     return result.model_copy(update={"warnings": [*result.warnings, warning]})
-
 
 async def generate_sql(
     query: str,
@@ -2044,7 +1879,6 @@ async def generate_sql(
             )
     return result
 
-
 async def _try_deterministic_generation(
     query: str,
     pool: asyncpg.Pool,
@@ -2126,7 +1960,6 @@ async def _try_deterministic_generation(
         react_trace=None,
     )
 
-
 def _generate_sql_response_from_dict(payload: dict[str, Any]) -> GenerateSqlResponse:
     status = payload.get("status")
     if status == "ok":
@@ -2137,12 +1970,10 @@ def _generate_sql_response_from_dict(payload: dict[str, Any]) -> GenerateSqlResp
         return GenerateSqlClarification(**payload)
     raise ValueError(f"Unknown SQL generation status in cache: {status}")
 
-
 def _result_value(result: Any, field: str) -> Any:
     if isinstance(result, dict):
         return result[field]
     return getattr(result, field)
-
 
 def _find_destructive_keyword(statement: Statement) -> str | None:
     for token in statement.flatten():
@@ -2153,7 +1984,6 @@ def _find_destructive_keyword(statement: Statement) -> str | None:
             return value
     return None
 
-
 def _is_comment_or_string(token: Token) -> bool:
     return (
         isinstance(token, Comment)
@@ -2161,7 +1991,6 @@ def _is_comment_or_string(token: Token) -> bool:
         or token.ttype in T.String
         or token.ttype in T.Literal.String
     )
-
 
 def _is_select_statement(statement: Statement) -> bool:
     if statement.get_type() == "SELECT":
@@ -2179,14 +2008,12 @@ def _is_select_statement(statement: Statement) -> bool:
 
     return False
 
-
 def _first_meaningful_token(token_list: TokenList) -> Token | None:
     for token in token_list.tokens:
         if token.is_whitespace or _is_comment_or_string(token):
             continue
         return token
     return None
-
 
 def _collect_cte_names(statement: Statement) -> set[str]:
     cte_names: set[str] = set()
@@ -2218,10 +2045,8 @@ def _collect_cte_names(statement: Statement) -> set[str]:
 
     return cte_names
 
-
 def _extract_table_names(statement: Statement) -> list[str]:
     return _extract_table_names_from_tokenlist(statement)
-
 
 def _extract_table_names_from_tokenlist(token_list: TokenList) -> list[str]:
     tables: list[str] = []
@@ -2251,7 +2076,6 @@ def _extract_table_names_from_tokenlist(token_list: TokenList) -> list[str]:
 
     return tables
 
-
 def _tables_from_candidate(candidate: Token) -> list[str]:
     if isinstance(candidate, IdentifierList):
         tables: list[str] = []
@@ -2273,7 +2097,6 @@ def _tables_from_candidate(candidate: Token) -> list[str]:
 
     return []
 
-
 def _tables_from_identifier(identifier: Identifier) -> list[str]:
     for token in identifier.tokens:
         if isinstance(token, Parenthesis):
@@ -2282,21 +2105,17 @@ def _tables_from_identifier(identifier: Identifier) -> list[str]:
     name = _identifier_name(identifier)
     return [name] if name else []
 
-
 def _identifier_name(identifier: Identifier) -> str:
     name = identifier.get_real_name() or identifier.get_name() or identifier.value
     return _normalize_table_name(name)
-
 
 def _is_from_or_join(token: Token) -> bool:
     normalized = token.normalized.upper()
     return normalized == "FROM" or "JOIN" in normalized.split()
 
-
 def _is_clause_end(token: Token) -> bool:
     normalized = token.normalized.upper()
     return normalized in _CLAUSE_END_KEYWORDS
-
 
 def _normalize_table_name(name: str) -> str:
     cleaned = name.strip().strip("`\"'[]")
@@ -2306,13 +2125,11 @@ def _normalize_table_name(name: str) -> str:
         cleaned = cleaned.split(".")[-1]
     return cleaned.strip().strip("`\"'[]")
 
-
 def _extract_table_aliases(sql: str) -> dict[str, str]:
     aliases: dict[str, str] = {}
     for statement in sqlparse.parse(sql):
         aliases.update(_extract_table_aliases_from_tokenlist(statement))
     return aliases
-
 
 def _extract_table_aliases_from_tokenlist(token_list: TokenList) -> dict[str, str]:
     aliases: dict[str, str] = {}
@@ -2341,7 +2158,6 @@ def _extract_table_aliases_from_tokenlist(token_list: TokenList) -> dict[str, st
 
     return aliases
 
-
 def _table_aliases_from_candidate(candidate: Token) -> dict[str, str]:
     if isinstance(candidate, IdentifierList):
         aliases: dict[str, str] = {}
@@ -2361,7 +2177,6 @@ def _table_aliases_from_candidate(candidate: Token) -> dict[str, str]:
 
     return {}
 
-
 def _table_aliases_from_identifier(identifier: Identifier) -> dict[str, str]:
     for token in identifier.tokens:
         if isinstance(token, Parenthesis):
@@ -2377,7 +2192,6 @@ def _table_aliases_from_identifier(identifier: Identifier) -> dict[str, str]:
     if alias:
         aliases[alias] = table_key
     return aliases
-
 
 def _extract_column_references(sql: str) -> list[tuple[str | None, str]]:
     references: list[tuple[str | None, str]] = []
@@ -2440,7 +2254,6 @@ def _extract_column_references(sql: str) -> list[tuple[str | None, str]]:
 
     return references
 
-
 def _should_skip_column_token(token: Token) -> bool:
     if token.is_whitespace or _is_comment_or_string(token):
         return True
@@ -2454,7 +2267,6 @@ def _should_skip_column_token(token: Token) -> bool:
         return True
     return False
 
-
 def _previous_meaningful(tokens: list[Token], index: int) -> Token | None:
     cursor = index - 1
     while cursor >= 0:
@@ -2463,7 +2275,6 @@ def _previous_meaningful(tokens: list[Token], index: int) -> Token | None:
             return token
         cursor -= 1
     return None
-
 
 def _next_meaningful(tokens: list[Token], index: int) -> Token | None:
     cursor = index + 1

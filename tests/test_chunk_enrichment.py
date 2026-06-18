@@ -62,7 +62,7 @@ async def test_business_aliases_in_chunk_text(
 
 
 @pytest.mark.asyncio
-async def test_column_aliases_are_embedded_from_synonym_map(
+async def test_column_aliases_are_embedded_from_introspection(
     monkeypatch: pytest.MonkeyPatch,
 ):
     entity = {
@@ -82,7 +82,7 @@ async def test_column_aliases_are_embedded_from_synonym_map(
     }
 
     async def _columns(*args, **kwargs):
-        return {"contact": ["fname", "mobile"]}
+        return {"contact": ["first_name", "mobile_number"]}
 
     monkeypatch.setattr(schema_loader, "get_entity", lambda _group: entity)
     monkeypatch.setattr(schema_loader, "get_schema_version", lambda _group: "abcd1234")
@@ -263,7 +263,7 @@ async def test_live_column_catalog_chunks_include_semantic_aliases(
             return_value=[
                 {
                     "table_name": "contact",
-                    "column_name": "fname",
+                    "column_name": "first_name",
                     "data_type": "varchar",
                     "ordinal_position": 1,
                 }

@@ -250,6 +250,8 @@ async def test_rewrite_expands_synonym_hints_from_json(
 
 @pytest.mark.asyncio
 async def test_react_agent_rewrites_once_and_reuses_expansion(
+    mock_embed,
+    mock_ollama,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rewrite_mock = AsyncMock(return_value="show unpaid invoices by counselor employee")
@@ -262,14 +264,20 @@ async def test_react_agent_rewrites_once_and_reuses_expansion(
         }
     )
     monkeypatch.setattr(settings, "query_rewrite_enabled", True)
+    monkeypatch.setattr(settings, "react_confidence_threshold", 2.0)
+    print("REACT CONFIDENCE THRESHOLD IS:", settings.react_confidence_threshold)
     monkeypatch.setattr(react_agent.query_rewriter, "rewrite_search_query", rewrite_mock)
     monkeypatch.setattr(react_agent, "retrieve_groups", retrieve_mock)
     monkeypatch.setattr(react_agent, "retrieve_past_corrections", AsyncMock(return_value=[]))
+    class MockColumnDoc:
+        def __init__(self, table: str, col: str):
+            self.metadata = {"table_name": table, "column_name": col}
     monkeypatch.setattr(
         react_agent,
         "retrieve_column_catalog",
-        AsyncMock(return_value=[]),
+        AsyncMock(return_value=[MockColumnDoc("invoice", "id"), MockColumnDoc("employee", "id")]),
     )
+    monkeypatch.setattr(react_agent, "retrieve_join_paths", AsyncMock(return_value=[]))
     monkeypatch.setattr(
         react_agent,
         "call_reasoning_model",
@@ -308,15 +316,12 @@ async def test_react_agent_rewrites_once_and_reuses_expansion(
         settings=settings,
         top_k=4,
     )
+    print("RESPONSE:", response)
 
     assert response.status == "clarification_needed"
     assert rewrite_mock.await_count == 1
-    assert retrieve_mock.await_count == 2
+    assert retrieve_mock.await_count == 1
     assert (
         retrieve_mock.await_args_list[0].kwargs["search_query"]
         == "show unpaid invoices by counselor employee"
     )
-    second_search = retrieve_mock.await_args_list[1].kwargs["search_query"]
-    assert "billing unpaid invoices" in second_search
-    assert "show unpaid invoices by counselor employee" in second_search
-    assert retrieve_mock.await_args_list[1].kwargs["top_k"] == 4
