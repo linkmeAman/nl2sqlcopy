@@ -10,7 +10,8 @@ async def test_telemetry_recent_endpoint_returns_results(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import db, main
+    from nl2sql_service.db import db
+    from nl2sql_service import main
 
     mock_list_recent = AsyncMock(
         return_value=[
@@ -39,7 +40,7 @@ async def test_telemetry_summary_endpoint_returns_kpis(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_summary = AsyncMock(
         return_value={
@@ -75,7 +76,7 @@ async def test_benchmark_add_case_endpoint_persists_case(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_insert_case = AsyncMock(return_value=42)
     monkeypatch.setattr(db, "insert_benchmark_case", mock_insert_case)
@@ -106,7 +107,7 @@ async def test_benchmark_list_cases_endpoint_returns_results(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_list_cases = AsyncMock(
         return_value=[

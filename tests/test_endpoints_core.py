@@ -44,7 +44,7 @@ def _ok(resp: httpx.Response) -> dict:
 
 @pytest.mark.asyncio
 async def test_health_ok(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import mysql_executor, schema_loader
+    from nl2sql_service.db import mysql_executor, schema_loader
 
     with patch.object(
         mysql_executor,
@@ -67,7 +67,7 @@ async def test_health_ok(client: httpx.AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_health_db_unavailable(app) -> None:
     """When the pool is missing the app must still return a degraded-but-200 health response."""
-    from nl2sql_service import mysql_executor, schema_loader
+    from nl2sql_service.db import mysql_executor, schema_loader
 
     original = getattr(app.state, "pool", None)
     app.state.pool = None
@@ -92,7 +92,7 @@ async def test_health_db_unavailable(app) -> None:
 
 @pytest.mark.asyncio
 async def test_teach_metrics_endpoint(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_stats = AsyncMock(
         return_value={
@@ -125,7 +125,7 @@ async def test_health_config_endpoint(client: httpx.AsyncClient) -> None:
 async def test_health_llm_embedding_returns_200_when_probe_succeeds(
     client: httpx.AsyncClient,
 ) -> None:
-    from nl2sql_service import embed
+    from nl2sql_service.rag import embed
 
     with patch.object(
         embed,
@@ -158,7 +158,7 @@ async def test_health_llm_embedding_returns_200_when_probe_succeeds(
 async def test_health_llm_embedding_returns_structured_degraded_response_when_unavailable(
     client: httpx.AsyncClient,
 ) -> None:
-    from nl2sql_service import embed
+    from nl2sql_service.rag import embed
 
     with patch.object(
         embed,
@@ -215,7 +215,7 @@ async def test_get_ask_model_endpoint(client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_patch_model_routing_endpoint_updates_runtime_config(client: httpx.AsyncClient) -> None:
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     previous = {
         "sql_model_provider": settings.sql_model_provider,
@@ -241,7 +241,7 @@ async def test_patch_model_routing_endpoint_updates_runtime_config(client: httpx
 
 @pytest.mark.asyncio
 async def test_patch_ask_model_endpoint_updates_runtime_config(client: httpx.AsyncClient) -> None:
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     previous = {
         "answer_model_provider": settings.answer_model_provider,
@@ -267,7 +267,7 @@ async def test_patch_ask_model_endpoint_updates_runtime_config(client: httpx.Asy
 
 @pytest.mark.asyncio
 async def test_patch_model_routing_rejects_invalid_config(client: httpx.AsyncClient) -> None:
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     previous = {
         "llm_base_url": settings.llm_base_url,
@@ -295,7 +295,7 @@ async def test_patch_model_routing_rejects_invalid_config(client: httpx.AsyncCli
 
 @pytest.mark.asyncio
 async def test_patch_ask_model_rejects_invalid_config(client: httpx.AsyncClient) -> None:
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     previous = {
         "llm_base_url": settings.llm_base_url,
@@ -323,7 +323,7 @@ async def test_patch_ask_model_rejects_invalid_config(client: httpx.AsyncClient)
 
 @pytest.mark.asyncio
 async def test_health_runtime_endpoint(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import mysql_executor, schema_loader
+    from nl2sql_service.db import mysql_executor, schema_loader
 
     with patch.object(
         mysql_executor,
@@ -361,7 +361,7 @@ async def test_health_runtime_endpoint(client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_health_warns_on_teach_confirmation_alerts(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import db, mysql_executor, schema_loader
+    from nl2sql_service.db import db, mysql_executor, schema_loader
 
     mock_stats = AsyncMock(
         return_value={
@@ -389,7 +389,7 @@ async def test_health_warns_on_teach_confirmation_alerts(client: httpx.AsyncClie
 
 @pytest.mark.asyncio
 async def test_health_errors_on_runtime_dependency_failure(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import mysql_executor, schema_loader
+    from nl2sql_service.db import mysql_executor, schema_loader
 
     with patch.object(
         mysql_executor,
@@ -413,7 +413,7 @@ async def test_health_errors_on_runtime_dependency_failure(client: httpx.AsyncCl
 
 @pytest.mark.asyncio
 async def test_teach_pending_list_endpoint(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_list = AsyncMock(
         return_value=[
@@ -449,7 +449,7 @@ async def test_teach_pending_list_endpoint(client: httpx.AsyncClient) -> None:
 
 @pytest.mark.asyncio
 async def test_teach_pending_cleanup_endpoint(client: httpx.AsyncClient) -> None:
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_cleanup = AsyncMock(return_value=3)
     mock_stats = AsyncMock(
@@ -480,7 +480,7 @@ async def test_ingest_text(
     mock_embed: AsyncMock,
 ) -> None:
     """POST /ingest with type=text should embed and persist chunks."""
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     with patch.object(db, "insert_chunks", new_callable=AsyncMock) as mock_insert:
         mock_insert.return_value = 1
@@ -503,7 +503,7 @@ async def test_ingest_schema(
     mock_embed: AsyncMock,
 ) -> None:
     """POST /ingest with type=schema should embed the provided table definitions."""
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     tables = [
         {
@@ -535,7 +535,7 @@ async def test_ingest_schema(
 @pytest.mark.asyncio
 async def test_query(client: httpx.AsyncClient, mock_embed: AsyncMock) -> None:
     """POST /query should return a results list (may be empty with mocked embeddings)."""
-    from nl2sql_service import retrieve
+    from nl2sql_service.rag import retrieve
 
     with patch.object(
         retrieve,
@@ -562,7 +562,7 @@ async def test_ingest_groups(
     mock_load_columns_for_ingest: AsyncMock,
 ) -> None:
     """POST /ingest/groups with no body should ingest all entities without error."""
-    from nl2sql_service import ingest
+    from nl2sql_service.rag import ingest
 
     stub_result = {
         "inserted_count": 2,
@@ -587,7 +587,7 @@ async def test_ingest_groups_includes_partial_failures(
     mock_load_columns_for_ingest: AsyncMock,
 ) -> None:
     """POST /ingest/groups should include failed_groups for overflowed entities."""
-    from nl2sql_service import ingest
+    from nl2sql_service.rag import ingest
 
     del tmp_rag_schema
     del mock_load_columns_for_ingest
@@ -630,7 +630,7 @@ async def test_ingest_knowledge_defaults(
     mock_load_columns_for_ingest: AsyncMock,
 ) -> None:
     """POST /ingest/knowledge with defaults should embed knowledge chunks."""
-    from nl2sql_service import ingest
+    from nl2sql_service.rag import ingest
 
     stub_result = {"inserted_count": 5, "updated_count": 0}
     with patch.object(ingest, "ingest_enriched_knowledge", new_callable=AsyncMock, return_value=stub_result):
@@ -670,7 +670,7 @@ async def test_ingest_groups_status_all_never_embedded(
     tmp_rag_schema,
 ) -> None:
     """When no embeddings exist yet every group should be never_embedded."""
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     with patch.object(
         db,
@@ -692,7 +692,7 @@ async def test_ingest_groups_status_current(
     tmp_rag_schema,
 ) -> None:
     """When stored_version matches the file hash the group should be current."""
-    from nl2sql_service import db, schema_loader
+    from nl2sql_service.db import db, schema_loader
 
     # Compute the real file hash so we can plant a matching stored_version.
     real_hash = schema_loader.get_schema_version("billing")
@@ -723,7 +723,7 @@ async def test_ingest_groups_status_stale(
     tmp_rag_schema,
 ) -> None:
     """When stored_version is outdated the group should be stale."""
-    from nl2sql_service import db
+    from nl2sql_service.db import db
 
     mock_rows = [
         {

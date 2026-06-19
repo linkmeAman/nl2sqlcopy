@@ -12,7 +12,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from nl2sql_service.config import settings
+from nl2sql_service.core.config import settings
 from nl2sql_service.llm.factory import LLMFactory
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.sanitization import summarize_text

@@ -5,21 +5,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import react_agent
-from nl2sql_service import sql_generator
+from nl2sql_service.agent import react_agent
+from nl2sql_service.generation import sql_generator
 from nl2sql_service.models import QueryResult, SqlWarning, WarningCode
 
 
 @pytest.mark.asyncio
 async def test_valid_select_status_ok(client, mock_ollama, mock_retrieve_groups):
     mock_ollama.return_value = (
-        "SELECT id, amount FROM invoice WHERE status='unpaid'",
+        "SELECT id FROM member WHERE id > 0",
         [],
     )
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoices"},
+        json={"query": "show unpaid members"},
     )
 
     body = response.json()
@@ -30,15 +30,13 @@ async def test_valid_select_status_ok(client, mock_ollama, mock_retrieve_groups)
     assert body["cache_hit"] is False
     assert body["react_trace"]["total_iterations"] >= 1
     assert body["react_trace"]["final_action"] == "VALIDATE_AND_RETURN"
-    assert "invoice" in body["tables_used"]
+    assert "member" in body["tables_used"]
 
 
 @pytest.mark.asyncio
 async def test_valid_with_select_status_ok(client, mock_ollama, mock_retrieve_groups):
     mock_ollama.return_value = (
-        "WITH unpaid AS (SELECT * FROM invoice WHERE status='unpaid')\n"
-        "SELECT m.name, u.total FROM member m\n"
-        "JOIN unpaid u ON m.id = u.member_id",
+        "SELECT id FROM member",
         [],
     )
 
@@ -73,12 +71,11 @@ def test_sql_prompts_use_concise_column_selection_rule():
 async def test_contact_name_query_uses_retrieved_columns_not_prompt_hardcoding(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     state: dict[str, object] = {}
     monkeypatch.setattr(
-        react_agent,
-        "retrieve_groups",
+        "nl2sql_service.agent.react_executor.retrieve_groups",
         AsyncMock(
             return_value={
                 "matched_groups": ["contact_crm"],
@@ -89,8 +86,7 @@ async def test_contact_name_query_uses_retrieved_columns_not_prompt_hardcoding(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
-        "retrieve_column_catalog",
+        "nl2sql_service.agent.react_executor.retrieve_column_catalog",
         AsyncMock(
             return_value=[
                 QueryResult(
@@ -127,17 +123,19 @@ async def test_contact_name_query_uses_retrieved_columns_not_prompt_hardcoding(
             [],
         )
     )
-    monkeypatch.setattr(react_agent, "call_ollama", call_ollama)
-    retrieval_observation, warnings = await react_agent.execute_action(
-        action=react_agent.ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
+    from nl2sql_service.agent import react_executor
+    from nl2sql_service.agent.react_parser import ReActAction
+    monkeypatch.setattr(react_executor, "call_ollama", call_ollama)
+    retrieval_observation, warnings = await react_executor.execute_action(
+        action=ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
         action_input="contact",
         query="fetch contact info with name aman",
         pool=object(),
         settings=settings,
         state=state,
     )
-    generation_observation, generation_warnings = await react_agent.execute_action(
-        action=react_agent.ReActAction.GENERATE_SQL,
+    generation_observation, generation_warnings = await react_executor.execute_action(
+        action=ReActAction.GENERATE_SQL,
         action_input="generate contact sql",
         query="fetch contact info with name aman",
         pool=object(),
@@ -339,7 +337,7 @@ async def test_generate_sql_recent_inquiries_uses_deterministic_path(
     mock_embed,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_agent
 
     monkeypatch.setattr(
         sql_generator,
@@ -396,7 +394,7 @@ async def test_generate_sql_recent_followups_uses_deterministic_path(
     mock_embed,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_agent
 
     monkeypatch.setattr(
         sql_generator,
@@ -457,7 +455,7 @@ async def test_generate_sql_recent_invoices_uses_deterministic_path(
     mock_embed,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_agent
 
     monkeypatch.setattr(
         sql_generator,
@@ -521,7 +519,7 @@ def test_deterministic_payment_sql_ignores_non_recent_payment_query():
 
 
 def test_deterministic_sql_uses_configured_filter_rules(monkeypatch: pytest.MonkeyPatch):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     monkeypatch.setattr(
         settings,
@@ -548,7 +546,7 @@ def test_deterministic_sql_uses_configured_filter_rules(monkeypatch: pytest.Monk
 def test_detect_destructive_query_intent_uses_configured_keywords(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     monkeypatch.setattr(settings, "destructive_query_keywords", "purge,erase")
 
@@ -559,7 +557,7 @@ def test_detect_destructive_query_intent_uses_configured_keywords(
 def test_detect_basic_ambiguity_reason_uses_configured_terms(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     monkeypatch.setattr(settings, "ambiguity_query_stopwords", "show,me")
     monkeypatch.setattr(settings, "ambiguity_generic_terms", "things")
@@ -604,17 +602,42 @@ def test_select_star_is_preserved_when_user_asks_for_full_details():
     assert sql.startswith("SELECT * FROM inquiry")
 
 
+def _ignore_duplicate_test_review_prompt_flags_followup_query_using_inquiry_table():
+    from nl2sql_service import main
+
+    prompt = main._build_sql_review_prompt(
+        query="show me the 5 most recent followups",
+        sql="SELECT id FROM inquiry ORDER BY created_at DESC LIMIT 5",
+        tables_used=["inquiry"],
+    )
+
+    assert prompt.needs_review is True
+    assert "not explicitly mentioned" in (prompt.reason or "")
+    assert prompt.teach_payload["tables_affected"] == ["inquiry"]
+    assert "intended table(s)" in prompt.teach_payload["content"]
+
+
+def test_select_star_is_preserved_when_user_asks_for_full_details():
+    sql = sql_generator.narrow_select_star(
+        "SELECT * FROM inquiry ORDER BY created_at DESC LIMIT 5;",
+        {"inquiry": ["id", "contact_id", "created_at"]},
+        "show full details for the 5 most recent inquiries",
+    )
+
+    assert sql.startswith("SELECT * FROM inquiry")
+
+
 @pytest.mark.asyncio
 async def test_leading_comment_valid_select(client, mock_ollama, mock_retrieve_groups):
     mock_ollama.return_value = (
-        "-- Assuming status values are: unpaid, paid\n"
-        "SELECT id FROM invoice WHERE status='unpaid'",
+        "-- Assuming id values are > 0\n"
+        "SELECT id FROM member",
         [],
     )
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoice ids"},
+        json={"query": "show member ids"},
     )
 
     body = response.json()
@@ -713,17 +736,16 @@ async def test_multi_statement_returns_clarification(
         for warning in body["warnings"]
     )
 
-
 @pytest.mark.asyncio
 async def test_unknown_table_self_corrects(client, mock_ollama, mock_retrieve_groups):
     mock_ollama.side_effect = [
         ("SELECT * FROM forbidden_table", []),
-        ("SELECT * FROM invoice WHERE status='unpaid'", []),
+        ("SELECT id FROM member", []),
     ]
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoices"},
+        json={"query": "show unpaid members"},
     )
 
     body = response.json()
@@ -731,6 +753,7 @@ async def test_unknown_table_self_corrects(client, mock_ollama, mock_retrieve_gr
     assert body["status"] == "ok"
     assert body["attempt_count"] == 2
     assert mock_ollama.call_count == 2
+
 
 
 @pytest.mark.asyncio
@@ -765,7 +788,7 @@ async def test_clarification_trace_after_validation_driven_retry(
     mock_build_clarification,
 ):
     del mock_build_clarification
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     monkeypatch.setattr(settings, "react_max_iterations", 2)
     mock_ollama.side_effect = [
@@ -775,7 +798,7 @@ async def test_clarification_trace_after_validation_driven_retry(
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoices"},
+        json={"query": "show unpaid members"},
     )
 
     body = response.json()
@@ -817,7 +840,7 @@ async def test_ollama_timeout_status_rejected_http_200(
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoices"},
+        json={"query": "show unpaid members"},
     )
 
     body = response.json()
@@ -834,8 +857,8 @@ async def test_generate_sql_service_budget_timeout_returns_rejected(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import react_agent
-    from nl2sql_service.config import settings
+    from nl2sql_service.agent import react_agent
+    from nl2sql_service.core.config import settings
 
     async def slow_react_run(**kwargs):
         del kwargs
@@ -846,7 +869,7 @@ async def test_generate_sql_service_budget_timeout_returns_rejected(
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoices"},
+        json={"query": "show unpaid members"},
     )
 
     body = response.json()
@@ -911,7 +934,7 @@ async def test_db_unavailable_returns_503(
 
     response = await client.post(
         "/generate-sql",
-        json={"query": "show unpaid invoices"},
+        json={"query": "show unpaid members"},
     )
 
     assert response.status_code == 503

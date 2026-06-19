@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import react_agent
-from nl2sql_service.config import settings
+from nl2sql_service.agent import react_agent, react_executor, react_planner
+from nl2sql_service.core.config import settings
 from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.models import QueryResult, ReActAction, SqlWarning, WarningCode
 
@@ -25,8 +25,8 @@ def mock_schema_and_explain(monkeypatch: pytest.MonkeyPatch) -> None:
         return {table: _COLUMNS[table] for table in tables if table in _COLUMNS}
 
     monkeypatch.setattr(settings, "react_max_iterations", 4)
-    monkeypatch.setattr(react_agent, "load_columns_for_tables", AsyncMock(side_effect=load_columns))
-    monkeypatch.setattr(react_agent, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "load_columns_for_tables", AsyncMock(side_effect=load_columns))
+    monkeypatch.setattr(react_executor, "run_explain", AsyncMock(return_value=[]))
 
 
 @pytest.mark.asyncio
@@ -49,7 +49,7 @@ async def test_happy_path_generate_then_validate(
         ),
     ]
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show unpaid invoices",
         pool=object(),
         settings=settings,
@@ -90,7 +90,7 @@ async def test_wrong_table_retrieve_then_generate_and_validate(
         ),
     ]
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show unpaid invoices",
         pool=object(),
         settings=settings,
@@ -128,7 +128,7 @@ async def test_wrong_column_fetch_schema_then_retry(
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show payments",
         pool=object(),
         settings=settings,
@@ -164,7 +164,7 @@ async def test_simple_select_star_is_narrowed_before_validation(
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show me the 5 most recent payments",
         pool=object(),
         settings=settings,
@@ -197,7 +197,7 @@ async def test_final_iteration_generated_sql_is_auto_validated(
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show me the 5 most recent payments",
         pool=object(),
         settings=settings,
@@ -224,7 +224,7 @@ async def test_reasoning_model_chooses_give_up(
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="ambiguous query",
         pool=object(),
         settings=settings,
@@ -249,7 +249,7 @@ async def test_unparseable_empty_planner_response_recovers_to_generate_then_vali
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show the 5 most recent payments",
         pool=object(),
         settings=settings,
@@ -276,7 +276,7 @@ async def test_explicit_unknown_action_returns_clarification(
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show payments",
         pool=object(),
         settings=settings,
@@ -304,7 +304,7 @@ async def test_max_iterations_exhausted(
     )
     mock_react_call_ollama.return_value = ("SELECT * FROM forbidden_table", [])
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show forbidden data",
         pool=object(),
         settings=settings,
@@ -373,7 +373,7 @@ async def test_bootstrap_schema_retrieval_focuses_query_matched_table(
         ]
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_groups",
         AsyncMock(
             return_value={
@@ -384,13 +384,13 @@ async def test_bootstrap_schema_retrieval_focuses_query_matched_table(
             }
         ),
     )
-    monkeypatch.setattr(react_agent, "retrieve_column_catalog", column_catalog)
+    monkeypatch.setattr(react_executor, "retrieve_column_catalog", column_catalog)
 
     state: dict[str, object] = {
         "search_query": "show me the 5 most recent payments",
         "top_k": 5,
     }
-    observation, warnings = await react_agent.execute_action(
+    observation, warnings = await react_executor.execute_action(
         action=react_agent.ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
         action_input="show me the 5 most recent payments",
         query="show me the 5 most recent payments",
@@ -420,10 +420,10 @@ async def test_call_reasoning_model_retry_stays_within_original_timeout_budget(
             await asyncio.sleep(0)
             return LLMResponse(text="", thought="", error_type="timeout", error_message="timed out")
 
-    monkeypatch.setattr(react_agent, "get_model_client", lambda **kwargs: _FakeClient())
+    monkeypatch.setattr(react_planner, "get_model_client", lambda **kwargs: _FakeClient())
     monkeypatch.setattr(settings, "reasoning_timeout", 9)
 
-    _thought, _answer, warnings = await react_agent.call_reasoning_model(
+    _thought, _answer, warnings = await react_planner.call_reasoning_model(
         "plan",
         settings,
     )
@@ -441,8 +441,8 @@ def test_should_check_past_corrections_uses_configured_thresholds(
     monkeypatch.setattr(settings, "react_past_corrections_min_tokens", 20)
     monkeypatch.setattr(settings, "react_past_corrections_connector_terms", "alongside,paired")
 
-    assert react_agent._should_check_past_corrections("payments paired invoices", settings) is True
-    assert react_agent._should_check_past_corrections("show payments", settings) is False
+    assert react_executor._should_check_past_corrections("payments paired invoices", settings) is True
+    assert react_executor._should_check_past_corrections("show payments", settings) is False
 
 
 @pytest.mark.asyncio
@@ -469,7 +469,7 @@ async def test_retry_generation_uses_refinement_prompt_and_planner_input(
         ("SELECT id, amount FROM invoice WHERE status='unpaid'", []),
     ]
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show unpaid invoices",
         pool=object(),
         settings=settings,
@@ -540,7 +540,7 @@ async def test_mysql_explain_unavailable_does_not_cause_rejection(
         ),
     ]
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "run_explain",
         AsyncMock(
             return_value=[
@@ -552,7 +552,7 @@ async def test_mysql_explain_unavailable_does_not_cause_rejection(
         ),
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show unpaid invoices",
         pool=object(),
         settings=settings,
@@ -567,7 +567,7 @@ async def test_mysql_explain_unavailable_does_not_cause_rejection(
 
 
 def test_extract_think_block_parsing():
-    thought, answer = react_agent.extract_think_block(
+    thought, answer = react_planner.extract_think_block(
         "<think>I need to check tables</think>\n"
         "ACTION: GENERATE_SQL\nINPUT: generate select"
     )
@@ -575,7 +575,7 @@ def test_extract_think_block_parsing():
     assert thought == "I need to check tables"
     assert answer == "ACTION: GENERATE_SQL\nINPUT: generate select"
 
-    thought, answer = react_agent.extract_think_block(
+    thought, answer = react_planner.extract_think_block(
         "ACTION: GENERATE_SQL\nINPUT: generate select"
     )
 
@@ -599,9 +599,9 @@ async def test_call_reasoning_model_uses_thinking_action_when_response_empty(
                 thought='{"action":"GENERATE_SQL","input":"show payments"}',
             )
 
-    monkeypatch.setattr(react_agent, "get_model_client", lambda **kwargs: FakeClient())
+    monkeypatch.setattr(react_planner, "get_model_client", lambda **kwargs: FakeClient())
 
-    thought, answer, warnings = await react_agent.call_reasoning_model(
+    thought, answer, warnings = await react_planner.call_reasoning_model(
         "prompt",
         settings,
     )
@@ -613,23 +613,23 @@ async def test_call_reasoning_model_uses_thinking_action_when_response_empty(
 
 def test_parse_action_handles_all_valid_actions():
     for action in ReActAction:
-        parsed_action, action_input = react_agent.parse_action(
+        parsed_action, action_input = react_planner.parse_action(
             f"ACTION: {action.value}\nINPUT: useful input"
         )
         assert parsed_action == action
         assert action_input == "useful input"
 
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         "ACTION: NOT_REAL\nINPUT: bad input"
     )
     assert parsed_action == ReActAction.GIVE_UP
     assert action_input == "Could not parse action"
 
-    parsed_action, action_input = react_agent.parse_action("ACTION: GENERATE_SQL")
+    parsed_action, action_input = react_planner.parse_action("ACTION: GENERATE_SQL")
     assert parsed_action == ReActAction.GENERATE_SQL
     assert action_input == ""
 
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         "ACTION: generate_sql\nINPUT: generate select"
     )
     assert parsed_action == ReActAction.GENERATE_SQL
@@ -637,31 +637,31 @@ def test_parse_action_handles_all_valid_actions():
 
 
 def test_parse_action_tolerates_format_drift_patterns():
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         "**Action** - `generate sql`\n**Instruction**: include latest payments"
     )
     assert parsed_action == ReActAction.GENERATE_SQL
     assert action_input == "include latest payments"
 
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         '{"action":"FETCH_SCHEMA","input":"payment, invoice"}'
     )
     assert parsed_action == ReActAction.FETCH_SCHEMA
     assert action_input == "payment, invoice"
 
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         "Next step is validate and return because SQL now passes checks."
     )
     assert parsed_action == ReActAction.VALIDATE_AND_RETURN
     assert action_input == ""
 
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         "ACTION_INPUT: tighten filters\nACTION: RETRIEVE_CONTEXT"
     )
     assert parsed_action == ReActAction.RETRIEVE_MORE_CONTEXT
     assert action_input == "tighten filters"
 
-    parsed_action, action_input = react_agent.parse_action(
+    parsed_action, action_input = react_planner.parse_action(
         "I should generate a SQL query from the retrieved payment context."
     )
     assert parsed_action == ReActAction.GENERATE_SQL

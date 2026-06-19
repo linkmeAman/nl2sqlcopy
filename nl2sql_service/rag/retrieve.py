@@ -5,11 +5,11 @@ import re
 import time
 import asyncpg
 
-from nl2sql_service import embed
-from nl2sql_service.cache import embed_cache
-from nl2sql_service import instruction_store
-from nl2sql_service import pattern_store
-from nl2sql_service.config import settings
+from nl2sql_service.rag import embed
+from nl2sql_service.core.cache import embed_cache
+from nl2sql_service.storage import instruction_store
+from nl2sql_service.storage import pattern_store
+from nl2sql_service.core.config import settings
 from nl2sql_service.models import GroupQueryResponse, QueryResult
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.metrics import observe_retrieval

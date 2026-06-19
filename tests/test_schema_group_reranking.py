@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import retrieve
+from nl2sql_service.rag import retrieve
 
 
 class _NoopTransaction:

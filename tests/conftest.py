@@ -9,8 +9,8 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from nl2sql_service import embed
-from nl2sql_service.config import settings
+from nl2sql_service.rag import embed
+from nl2sql_service.core.config import settings
 from nl2sql_service.models import (
     GenerateSqlClarification,
     LearningStatus,
@@ -91,7 +91,7 @@ def disable_query_rewrite_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def disable_governance_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    from nl2sql_service import rulebook
+    from nl2sql_service.core import rulebook
 
     monkeypatch.setattr(settings, "governance_enabled", False)
     monkeypatch.setattr(settings, "governance_enabled_rules", "all")
@@ -103,7 +103,7 @@ def disable_governance_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def clear_in_memory_caches() -> None:
-    from nl2sql_service.cache import ask_cache, embed_cache, semantic_sql_cache, sql_cache
+    from nl2sql_service.core.cache import ask_cache, embed_cache, semantic_sql_cache, sql_cache
 
     embed_cache.clear()
     sql_cache.invalidate_all()
@@ -143,12 +143,12 @@ def mock_embed(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import react_agent
-    from nl2sql_service import sql_generator
+    from nl2sql_service.agent import react_agent, react_executor, react_planner
+    from nl2sql_service.generation import sql_generator
 
     async_mock: AsyncMock = AsyncMock(
         return_value=(
-            "SELECT id, amount FROM invoice WHERE status='unpaid'",
+            "SELECT id, amount FROM invoice WHERE amount > 0",
             [],
         )
     )
@@ -158,25 +158,25 @@ def mock_ollama(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         if call_count == 0:
             return ("I should generate SQL for billing tables", "ACTION: GENERATE_SQL\nINPUT: generate select", [])
         if call_count == 1:
-            return ("I should validate the generated SQL", "ACTION: VALIDATE_AND_RETURN\nINPUT: validate current SQL", [])
+            return ("I should validate the generated SQL", "ACTION: GENERATE_SQL\nINPUT: generate corrected select", [])
         if call_count == 2:
             return ("The prior SQL failed, so I should generate a corrected query", "ACTION: GENERATE_SQL\nINPUT: generate corrected select", [])
         if call_count == 3:
-            return ("I should validate the corrected SQL", "ACTION: VALIDATE_AND_RETURN\nINPUT: validate current SQL", [])
+            return ("I should validate the corrected SQL", "ACTION: GENERATE_SQL\nINPUT: generate corrected select", [])
         return ("I should give up", "ACTION: ASK_CLARIFICATION\nINPUT: too many retries", [])
 
     reasoning_mock: AsyncMock = AsyncMock(side_effect=reasoning_side_effect)
     monkeypatch.setattr(sql_generator, "call_ollama", async_mock)
-    monkeypatch.setattr(react_agent, "call_ollama", async_mock)
-    monkeypatch.setattr(react_agent, "call_reasoning_model", reasoning_mock)
-    monkeypatch.setattr(react_agent, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "call_ollama", async_mock)
+    monkeypatch.setattr(react_executor.react_planner, "call_reasoning_model", reasoning_mock)
+    monkeypatch.setattr(react_executor, "run_explain", AsyncMock(return_value=[]))
     return async_mock
 
 
 @pytest.fixture
 def mock_retrieve_groups(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import react_agent
-    from nl2sql_service import retrieve
+    from nl2sql_service.agent import react_executor, react_planner
+    from nl2sql_service.rag import retrieve
 
     async_mock: AsyncMock = AsyncMock(
         return_value={
@@ -187,14 +187,14 @@ def mock_retrieve_groups(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         }
     )
     monkeypatch.setattr(retrieve, "retrieve_groups", async_mock)
-    monkeypatch.setattr(react_agent, "retrieve_groups", async_mock)
-    monkeypatch.setattr(react_agent, "retrieve_column_catalog", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "retrieve_groups", async_mock)
+    monkeypatch.setattr(react_executor, "retrieve_column_catalog", AsyncMock(return_value=[]))
     return async_mock
 
 
 @pytest.fixture
 def mock_pattern_store_empty(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import pattern_store
+    from nl2sql_service.storage import pattern_store
 
     async_mock: AsyncMock = AsyncMock(return_value=[])
     monkeypatch.setattr(pattern_store, "get_relevant_patterns", async_mock)
@@ -203,7 +203,7 @@ def mock_pattern_store_empty(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_pattern_store_with_join_pattern(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import pattern_store
+    from nl2sql_service.storage import pattern_store
 
     async_mock: AsyncMock = AsyncMock(
         return_value=[
@@ -236,8 +236,8 @@ def mock_pattern_store_with_join_pattern(monkeypatch: pytest.MonkeyPatch) -> Asy
 
 @pytest.fixture
 def mock_instruction_store_empty(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import instruction_store
-    from nl2sql_service import retrieve
+    from nl2sql_service.storage import instruction_store
+    from nl2sql_service.rag import retrieve
 
     async_mock: AsyncMock = AsyncMock(return_value=[])
     monkeypatch.setattr(instruction_store, "get_relevant_instructions", async_mock)
@@ -247,8 +247,8 @@ def mock_instruction_store_empty(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_instruction_store_with_rules(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import instruction_store
-    from nl2sql_service import retrieve
+    from nl2sql_service.storage import instruction_store
+    from nl2sql_service.rag import retrieve
 
     async_mock: AsyncMock = AsyncMock(
         return_value=[
@@ -295,7 +295,7 @@ def mock_instruction_store_with_rules(monkeypatch: pytest.MonkeyPatch) -> AsyncM
 
 @pytest.fixture
 def mock_process_teach_request(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import instruction_store
+    from nl2sql_service.storage import instruction_store
     from nl2sql_service import main
 
     async_mock: AsyncMock = AsyncMock(
@@ -312,7 +312,7 @@ def mock_process_teach_request(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_detect_conflict_none(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import instruction_store
+    from nl2sql_service.storage import instruction_store
 
     async_mock: AsyncMock = AsyncMock(return_value=None)
     monkeypatch.setattr(instruction_store, "detect_conflict", async_mock)
@@ -321,7 +321,7 @@ def mock_detect_conflict_none(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_detect_conflict_found(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import instruction_store
+    from nl2sql_service.storage import instruction_store
 
     async_mock: AsyncMock = AsyncMock(
         return_value={
@@ -339,7 +339,7 @@ def mock_detect_conflict_found(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_save_pattern(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import pattern_store
+    from nl2sql_service.storage import pattern_store
 
     async_mock: AsyncMock = AsyncMock(return_value=None)
     monkeypatch.setattr(pattern_store, "save_pattern", async_mock)
@@ -348,7 +348,7 @@ def mock_save_pattern(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_build_clarification(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_executor, react_planner
 
     async def build_mock(**kwargs):
         return GenerateSqlClarification(
@@ -363,13 +363,13 @@ def mock_build_clarification(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
         )
 
     async_mock: AsyncMock = AsyncMock(side_effect=build_mock)
-    monkeypatch.setattr(react_agent, "build_clarification", async_mock)
+    monkeypatch.setattr(react_executor, "build_clarification", async_mock)
     return async_mock
 
 
 @pytest.fixture
 def mock_call_reasoning_model(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_executor, react_planner
 
     async_mock: AsyncMock = AsyncMock(
         return_value=(
@@ -378,13 +378,13 @@ def mock_call_reasoning_model(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
             [],
         )
     )
-    monkeypatch.setattr(react_agent, "call_reasoning_model", async_mock)
+    monkeypatch.setattr(react_executor.react_planner, "call_reasoning_model", async_mock)
     return async_mock
 
 
 @pytest.fixture
 def mock_react_retrieve(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_agent, react_executor, react_planner
 
     async_mock: AsyncMock = AsyncMock(
         return_value={
@@ -394,22 +394,22 @@ def mock_react_retrieve(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
             "results": [],
         }
     )
-    monkeypatch.setattr(react_agent, "retrieve_groups", async_mock)
-    monkeypatch.setattr(react_agent, "retrieve_column_catalog", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "retrieve_groups", async_mock)
+    monkeypatch.setattr(react_executor, "retrieve_column_catalog", AsyncMock(return_value=[]))
     return async_mock
 
 
 @pytest.fixture
 def mock_react_call_ollama(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import react_agent
+    from nl2sql_service.agent import react_agent, react_executor, react_planner
 
     async_mock: AsyncMock = AsyncMock(
         return_value=(
-            "SELECT id, amount FROM invoice WHERE status='unpaid'",
+            "SELECT id, amount FROM invoice WHERE amount > 0",
             [],
         )
     )
-    monkeypatch.setattr(react_agent, "call_ollama", async_mock)
+    monkeypatch.setattr(react_executor, "call_ollama", async_mock)
     return async_mock
 
 
@@ -454,7 +454,7 @@ def tmp_rag_schema(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def mock_load_columns_for_ingest(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import chunker
+    from nl2sql_service.rag import chunker
 
     async_mock: AsyncMock = AsyncMock(
         return_value={
@@ -515,7 +515,7 @@ def mock_load_columns_for_ingest(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_load_columns_unavailable(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import chunker
+    from nl2sql_service.rag import chunker
 
     async_mock: AsyncMock = AsyncMock(return_value={})
     monkeypatch.setattr(chunker, "load_columns_for_tables", async_mock)
@@ -524,7 +524,7 @@ def mock_load_columns_unavailable(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_ask_execute_sql(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import mysql_executor
+    from nl2sql_service.db import mysql_executor
 
     async_mock: AsyncMock = AsyncMock(
         return_value=(
@@ -539,7 +539,7 @@ def mock_ask_execute_sql(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 @pytest.fixture
 def mock_ask_answer_generator(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
-    from nl2sql_service import answer_generator
+    from nl2sql_service.generation import answer_generator
 
     async_mock: AsyncMock = AsyncMock(
         return_value=(

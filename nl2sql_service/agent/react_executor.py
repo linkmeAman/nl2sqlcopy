@@ -1,4 +1,5 @@
 from __future__ import annotations
+from . import react_planner
 
 import asyncio
 import json
@@ -8,15 +9,17 @@ from typing import Any, Awaitable, Callable
 
 import asyncpg
 
-from nl2sql_service.column_loader import load_columns_for_tables
-from nl2sql_service import pattern_store
-from nl2sql_service import query_rewriter
-from nl2sql_service.config import Settings, settings as default_settings
-from nl2sql_service.instruction_store import (
+from nl2sql_service.db.column_loader import load_columns_for_tables
+from nl2sql_service.storage import pattern_store
+from nl2sql_service.generation import query_rewriter
+from nl2sql_service.core.config import Settings, settings as default_settings
+from nl2sql_service.storage.instruction_store import (
     record_instruction_outcome,
     retrieve_similar_corrections,
 )
 from nl2sql_service.llm import get_model_client
+
+
 from nl2sql_service.models import (
     GenerateSqlClarification,
     GenerateSqlRejected,
@@ -29,10 +32,11 @@ from nl2sql_service.models import (
     WarningCode,
 )
 from nl2sql_service.observability.sanitization import summarize_text
-from nl2sql_service.roles import LLMRole
-from nl2sql_service.rulebook import build_governance_block, get_config
-from nl2sql_service.retrieve import retrieve, retrieve_column_catalog, retrieve_groups
-from nl2sql_service.sql_generator import (
+from nl2sql_service.core.roles import LLMRole
+from nl2sql_service.agent.react_parser import extract_think_block, looks_like_action_payload, parse_action
+from nl2sql_service.core.rulebook import build_governance_block, get_config
+from nl2sql_service.rag.retrieve import retrieve, retrieve_column_catalog, retrieve_groups
+from nl2sql_service.generation.sql_generator import (
     PgVectorStore,
     VectorStore,
     _build_schema_derived_suggestions,
@@ -316,34 +320,13 @@ async def _focused_tables_for_generation(
     return focused_tables[:max_tables], column_hits_used
 
 
-def _action_target(action: ReActAction, action_input: str, state: dict[str, Any]) -> str:
-    if action in {
-        ReActAction.RETRIEVE_MORE_CONTEXT,
-        ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-        ReActAction.FETCH_SCHEMA,
-    }:
-        targets = _parse_csv_items(action_input)
-        if not targets:
-            targets = [_normalize_table_name(table) for table in state.get("tables_in_scope", [])]
-        return ",".join(targets)
-    if action == ReActAction.RETRIEVE_JOIN_PATHS:
-        targets = sorted(_normalize_table_name(table) for table in state.get("tables_in_scope", []) if table)
-        return ",".join(targets)
-    if action in {
-        ReActAction.RETRIEVE_SAMPLE_QUERIES,
-        ReActAction.RETRIEVE_PAST_CORRECTIONS,
-    }:
-        return " ".join(str(action_input or state.get("search_query") or "").split()).lower()
-    return action.value
-
-
 def apply_iteration_memory_guard(
     action: ReActAction,
     action_input: str,
     state: dict[str, Any],
 ) -> tuple[ReActAction, str]:
     _ensure_state_defaults(state)
-    target = _action_target(action, action_input, state)
+    target = react_planner._action_target(action, action_input, state)
     actions_taken = {
         (str(previous_action), str(previous_target))
         for previous_action, previous_target in state.get("actions_taken", [])
@@ -444,81 +427,6 @@ def compute_context_confidence_score(
         "iteration_penalty": round(iteration_penalty, 4),
         "score": round(score, 4),
     }
-
-
-def _build_available_actions(
-    state: dict[str, Any],
-    iteration: int,
-    settings: Settings,
-) -> list[ReActAction]:
-    _ensure_state_defaults(state)
-    if iteration == 1 and not state.get("past_corrections_checked"):
-        return [ReActAction.RETRIEVE_PAST_CORRECTIONS]
-
-    score = float(state.get("context_confidence_score") or 0.0)
-    if score >= settings.react_confidence_threshold and state.get("tables_in_scope"):
-        return [
-            ReActAction.GENERATE_SQL,
-            ReActAction.REQUEST_CLARIFICATION,
-            ReActAction.GIVE_UP,
-        ]
-
-    actions: list[ReActAction] = []
-    tables_in_scope = list(state.get("tables_in_scope") or [])
-    focus_tables = list(state.get("focus_tables") or [])
-    confidence_tables = focus_tables or tables_in_scope
-    retrieved_schema = state.get("retrieved_schema") or {}
-    retrieved_keys = {_normalize_table_name(name) for name in retrieved_schema.keys()}
-    uncovered_tables = [
-        table for table in confidence_tables
-        if _normalize_table_name(table) not in retrieved_keys
-    ]
-    if not confidence_tables or uncovered_tables:
-        actions.append(ReActAction.RETRIEVE_SCHEMA_FOR_TABLES)
-
-    if len(focus_tables) > 1 and not state.get("join_paths"):
-        actions.append(ReActAction.RETRIEVE_JOIN_PATHS)
-
-    ambiguity_high = (
-        score < settings.react_confidence_threshold
-        and not state.get("sample_queries")
-        and (
-            len(focus_tables) > 1
-            or not state.get("matched_groups")
-            or bool(state.get("last_validation_errors"))
-        )
-    )
-    if ambiguity_high:
-        actions.append(ReActAction.RETRIEVE_SAMPLE_QUERIES)
-
-    if confidence_tables:
-        actions.append(ReActAction.GENERATE_SQL)
-
-    actions.append(ReActAction.REQUEST_CLARIFICATION)
-    actions.append(ReActAction.GIVE_UP)
-
-    deduped: list[ReActAction] = []
-    for action in actions:
-        if action not in deduped:
-            deduped.append(action)
-    return deduped
-
-
-def _action_description(action: ReActAction) -> str:
-    descriptions = {
-        ReActAction.RETRIEVE_PAST_CORRECTIONS: "search verified corrections for similar queries",
-        ReActAction.RETRIEVE_SCHEMA_FOR_TABLES: "retrieve targeted table summaries and columns from the vector store",
-        ReActAction.RETRIEVE_JOIN_PATHS: "retrieve join paths between in-scope tables from stored relation metadata",
-        ReActAction.RETRIEVE_SAMPLE_QUERIES: "retrieve prior successful patterns or sample queries for ambiguous questions",
-        ReActAction.REQUEST_CLARIFICATION: "ask the user for more specificity when the context budget is exhausted",
-        ReActAction.RETRIEVE_MORE_CONTEXT: "legacy alias for targeted schema retrieval",
-        ReActAction.FETCH_SCHEMA: "legacy alias for targeted schema retrieval",
-        ReActAction.GENERATE_SQL: "generate a SQL query from the current context",
-        ReActAction.VALIDATE_AND_RETURN: "validate the current SQL and return it when safe",
-        ReActAction.ASK_CLARIFICATION: "legacy alias for clarification",
-        ReActAction.GIVE_UP: "stop when the error is unrecoverable",
-    }
-    return descriptions.get(action, action.value.replace("_", " ").lower())
 
 
 def _extract_join_sql(content: str) -> str | None:
@@ -710,27 +618,6 @@ def _select_state_driven_action(
     return None
 
 
-def extract_think_block(raw: str) -> tuple[str, str]:
-    think_start = raw.find("<think>")
-    think_end = raw.find("</think>")
-    if think_start != -1 and think_end != -1 and think_start < think_end:
-        thought = raw[think_start + len("<think>") : think_end].strip()
-        answer = raw[think_end + len("</think>") :].strip()
-        return thought, answer
-
-    return "", raw.strip()
-
-
-def looks_like_action_payload(raw: str) -> bool:
-    if re.search(r'"action"\s*:', raw, flags=re.IGNORECASE):
-        return True
-    if re.search(r"\b(?:ACTION|NEXT\s+ACTION)\b\s*[:=\-]", raw, flags=re.IGNORECASE):
-        return True
-
-    normalized = raw.upper().replace("-", "_").replace(" ", "_")
-    return any(action.value in normalized for action in ReActAction)
-
-
 def combine_search_queries(refined_query: str, base_search_query: str) -> str:
     refined = " ".join(refined_query.split())
     base = " ".join(base_search_query.split())
@@ -746,376 +633,6 @@ def combine_search_queries(refined_query: str, base_search_query: str) -> str:
     if base_lower in refined_lower:
         return refined
     return f"{refined}\n{base}"
-
-
-async def call_reasoning_model(
-    prompt: str,
-    settings: Settings,
-    timeout_budget_seconds: float | None = None,
-) -> tuple[str, str, list[SqlWarning]]:
-    def _warnings_for_response(error_type: str | None, error_message: str | None) -> list[SqlWarning]:
-        code = (
-            WarningCode.OLLAMA_TIMEOUT
-            if error_type == "timeout"
-            else WarningCode.OLLAMA_MALFORMED
-            if error_type in {"malformed", "empty"}
-            else WarningCode.OLLAMA_UPSTREAM
-        )
-        detail = error_message or f"returned no text from {client.provider_name}"
-        return [
-            SqlWarning(
-                code=code,
-                message=f"Reasoning model {detail}",
-            )
-        ]
-
-    client = get_model_client(
-        settings=settings,
-        model=settings.reasoning_model,
-        default_timeout=settings.reasoning_timeout,
-        role=LLMRole.REASONING.value,
-    )
-    reasoning_budget = float(settings.reasoning_timeout)
-    if timeout_budget_seconds is not None:
-        reasoning_budget = min(reasoning_budget, max(0.0, float(timeout_budget_seconds)))
-    if reasoning_budget <= 0:
-        return "", "", _warnings_for_response("timeout", "timed out before reasoning could start")
-    primary_timeout = reasoning_budget if reasoning_budget <= 1.0 else max(1.0, reasoning_budget * 0.7)
-    fallback_budget = max(0.0, reasoning_budget - primary_timeout)
-
-    started = time.monotonic()
-    response = await client.generate(
-        prompt=prompt,
-        max_tokens=settings.react_reasoning_max_tokens,
-        temperature=settings.reasoning_temperature,
-        enable_thinking=True,
-        timeout=primary_timeout,
-        response_format="json",
-    )
-    thought = response.thought or ""
-    answer = response.text or ""
-    if not answer and looks_like_action_payload(thought):
-        answer = thought
-        thought = ""
-    if answer:
-        return thought, answer, []
-
-    # Timeout fallback: retry once in compact non-thinking mode, but only within
-    # the original reasoning budget.
-    if response.error_type == "timeout":
-        elapsed = time.monotonic() - started
-        fallback_timeout = max(0.0, min(fallback_budget, reasoning_budget - elapsed))
-        if fallback_timeout <= 0:
-            return "", "", _warnings_for_response(
-                response.error_type,
-                response.error_message,
-            )
-        fallback_response = await client.generate(
-            prompt=prompt,
-            max_tokens=220,
-            temperature=0.0,
-            enable_thinking=False,
-            timeout=fallback_timeout,
-            response_format=None,
-        )
-        fallback_answer = fallback_response.text or ""
-        fallback_thought = fallback_response.thought or ""
-        if not fallback_answer and looks_like_action_payload(fallback_thought):
-            fallback_answer = fallback_thought
-            fallback_thought = ""
-        if fallback_answer:
-            return fallback_thought, fallback_answer, []
-        return "", "", _warnings_for_response(
-            fallback_response.error_type,
-            fallback_response.error_message,
-        )
-
-    return "", "", _warnings_for_response(response.error_type, response.error_message)
-
-
-def parse_action(answer: str) -> tuple[ReActAction, str]:
-    def _normalize_token(raw: str) -> str:
-        cleaned = raw.strip().strip("`*\"'[](){}.,;:")
-        cleaned = cleaned.replace("-", "_").replace(" ", "_")
-        cleaned = re.sub(r"[^A-Za-z0-9_]", "", cleaned)
-        return cleaned.upper()
-
-    def _resolve_action(raw: str) -> ReActAction | None:
-        normalized = _normalize_token(raw)
-        if not normalized:
-            return None
-
-        exact = {action.value: action for action in ReActAction}
-        if normalized in exact:
-            return exact[normalized]
-
-        aliases = {
-            "RETRIEVE_PAST": ReActAction.RETRIEVE_PAST_CORRECTIONS,
-            "LOAD_PAST_CORRECTIONS": ReActAction.RETRIEVE_PAST_CORRECTIONS,
-            "RETRIEVE_SCHEMA": ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-            "RETRIEVE_CONTEXT": ReActAction.RETRIEVE_MORE_CONTEXT,
-            "RETRIEVE_MORE": ReActAction.RETRIEVE_MORE_CONTEXT,
-            "FETCH_COLUMNS": ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-            "GET_SCHEMA": ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-            "FETCH_SCHEMA": ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-            "JOIN_PATHS": ReActAction.RETRIEVE_JOIN_PATHS,
-            "RETRIEVE_JOINS": ReActAction.RETRIEVE_JOIN_PATHS,
-            "SAMPLE_QUERIES": ReActAction.RETRIEVE_SAMPLE_QUERIES,
-            "RETRIEVE_EXAMPLES": ReActAction.RETRIEVE_SAMPLE_QUERIES,
-            "GENERATE": ReActAction.GENERATE_SQL,
-            "WRITE_SQL": ReActAction.GENERATE_SQL,
-            "VALIDATE": ReActAction.VALIDATE_AND_RETURN,
-            "RETURN_SQL": ReActAction.VALIDATE_AND_RETURN,
-            "ASK_CLARIFICATION": ReActAction.REQUEST_CLARIFICATION,
-            "REQUEST_CLARIFICATION": ReActAction.REQUEST_CLARIFICATION,
-            "CLARIFY": ReActAction.REQUEST_CLARIFICATION,
-            "GIVEUP": ReActAction.GIVE_UP,
-        }
-        if normalized in aliases:
-            return aliases[normalized]
-
-        for action in ReActAction:
-            if action.value in normalized:
-                return action
-        for alias, mapped_action in aliases.items():
-            if alias in normalized:
-                return mapped_action
-        return None
-
-    action_text: str | None = None
-    action_input = ""
-
-    action_line_pattern = re.compile(
-        r"^(?:[-*]\s*)?(?:\*\*)?(?:NEXT\s+)?ACTION(?:\*\*)?\s*[:=\-]\s*(.+)$",
-        re.IGNORECASE,
-    )
-    input_line_pattern = re.compile(
-        r"^(?:[-*]\s*)?(?:\*\*)?(?:INPUT|ACTION_INPUT|INSTRUCTION)(?:\*\*)?\s*[:=\-]\s*(.+)$",
-        re.IGNORECASE,
-    )
-
-    for line in answer.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-
-        action_match = action_line_pattern.match(stripped)
-        if action_match and not action_text:
-            action_text = action_match.group(1).strip()
-            continue
-
-        input_match = input_line_pattern.match(stripped)
-        if input_match and not action_input:
-            action_input = input_match.group(1).strip()
-
-    if not action_text:
-        json_action_match = re.search(r'"action"\s*:\s*"([^"]+)"', answer, flags=re.IGNORECASE)
-        if json_action_match:
-            action_text = json_action_match.group(1).strip()
-
-    if not action_input:
-        json_input_match = re.search(
-            r'"(?:input|action_input|instruction)"\s*:\s*"([^"]*)"',
-            answer,
-            flags=re.IGNORECASE,
-        )
-        if json_input_match:
-            action_input = json_input_match.group(1).strip()
-
-    if not action_text:
-        for action in ReActAction:
-            pattern = action.value.replace("_", r"[\s_-]*")
-            if re.search(rf"\b{pattern}\b", answer, flags=re.IGNORECASE):
-                action_text = action.value
-                break
-
-    if not action_text:
-        natural_language_aliases = [
-            (
-                ReActAction.RETRIEVE_MORE_CONTEXT,
-                r"\b(retrieve|search|find|load)\b.*\b(context|schema\s+group|more)\b",
-            ),
-            (
-                ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-                r"\b(fetch|load|get|inspect)\b.*\b(schema|columns?)\b",
-            ),
-            (
-                ReActAction.RETRIEVE_JOIN_PATHS,
-                r"\b(join|relationship|path)\b",
-            ),
-            (
-                ReActAction.RETRIEVE_SAMPLE_QUERIES,
-                r"\b(sample|example|previous|similar)\b.*\b(query|pattern|sql)\b",
-            ),
-            (
-                ReActAction.GENERATE_SQL,
-                r"\b(generate|write|create|draft)\b.*\bsql\b",
-            ),
-            (
-                ReActAction.VALIDATE_AND_RETURN,
-                r"\b(validate|check)\b.*\b(return|sql|query)\b",
-            ),
-            (
-                ReActAction.REQUEST_CLARIFICATION,
-                r"\b(ask|request)\b.*\b(clarification|rephrase)\b",
-            ),
-            (
-                ReActAction.GIVE_UP,
-                r"\b(give\s*up|cannot|can't|unable|insufficient)\b",
-            ),
-        ]
-        for action, pattern in natural_language_aliases:
-            if re.search(pattern, answer, flags=re.IGNORECASE | re.DOTALL):
-                action_text = action.value
-                break
-
-    if not action_text:
-        return ReActAction.GIVE_UP, "Could not parse action"
-
-    parsed_action = _resolve_action(action_text)
-    if parsed_action is None:
-        return ReActAction.GIVE_UP, "Could not parse action"
-
-    return parsed_action, action_input
-
-
-def choose_recovery_action_for_parse_failure(
-    answer: str,
-    state: dict[str, Any],
-) -> tuple[ReActAction, str] | None:
-    """
-    Pick a conservative next action when the planner response is malformed.
-
-    The ReAct loop should not terminate solely because the small planning model
-    ignored the requested output shape. Guardrails still validate generated SQL
-    before anything is returned or executed.
-    """
-    if answer.strip() and re.search(
-        r"\b(?:ACTION|NEXT\s+ACTION)\b\s*[:=\-]",
-        answer,
-        flags=re.IGNORECASE,
-    ):
-        return None
-
-    if state.get("current_sql"):
-        if state.get("last_validation_errors"):
-            return (
-                ReActAction.GENERATE_SQL,
-                "Planner output was unparseable; regenerate SQL to fix validation errors.",
-            )
-        return (
-            ReActAction.VALIDATE_AND_RETURN,
-            "Planner output was unparseable; validate the current SQL.",
-        )
-
-    if not state.get("tables_in_scope"):
-        return (
-            ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
-            "Planner output was unparseable; retrieve more schema context.",
-        )
-
-    return (
-        ReActAction.GENERATE_SQL,
-        "Planner output was unparseable; generate SQL from the retrieved context.",
-    )
-
-
-def build_react_prompt(
-    query: str,
-    context: str,
-    tables_in_scope: list[str],
-    allowed_columns: dict[str, list[str]],
-    history: list[ReActStep],
-    current_error: str,
-    dialect: str,
-    available_actions: list[ReActAction],
-    context_confidence_score: float,
-    context_confidence_details: dict[str, float],
-    learned_instructions: list[str],
-    settings: Settings | None = None,
-) -> str:
-    active_settings = settings or default_settings
-    column_lines = [
-        f"  {table}: {', '.join(columns)}"
-        for table, columns in allowed_columns.items()
-    ]
-    known_columns = "\n".join(column_lines) if column_lines else "(none)"
-    history_lines = [
-        (
-            f"Step {step.iteration}: Action={step.action.value}, "
-            f"Observation={step.observation}"
-        )
-        for step in history
-    ]
-    rendered_history = "\n".join(history_lines) if history_lines else "(empty)"
-    rendered_actions = "\n".join(
-        f"- {action.value}: {_action_description(action)}"
-        for action in available_actions
-    ) or "- REQUEST_CLARIFICATION: ask the user for clarification"
-    rendered_learned = "\n".join(f"- {item}" for item in learned_instructions[:6]) or "(none)"
-    governance = ""
-    if active_settings.governance_enabled and active_settings.governance_inject_react:
-        governance = build_governance_block(
-            get_config(active_settings),
-            context="react",
-        )
-
-    prompt = f"""
-You are a SQL planning agent for a {dialect} database.
-Your job is to analyse the situation and decide the
-next action to take.
-
-AVAILABLE ACTIONS:
-{rendered_actions}
-
-USER QUESTION: {query}
-
-RETRIEVED SCHEMA CONTEXT:
-{context}
-
-IMPORTANT: If USER-PROVIDED RULES are present above,
-follow them strictly. They override your defaults.
-Do not ignore table relationships, term mappings,
-or filter rules listed there.
-
-TABLES IN SCOPE: {', '.join(tables_in_scope)}
-
-KNOWN COLUMNS:
-{known_columns}
-
-HISTORY OF STEPS TAKEN:
-{rendered_history}
-(empty if first iteration)
-
-CURRENT ERROR (if any): {current_error}
-(empty string if no error yet)
-
-DIALECT: {dialect}
-
-CURRENT CONTEXT CONFIDENCE SCORE: {context_confidence_score:.2f}
-CONFIDENCE SIGNALS: {json.dumps(context_confidence_details, sort_keys=True)}
-
-LEARNED INSTRUCTIONS / CORRECTIONS:
-{rendered_learned}
-
-STRICT RULES:
-- Only SELECT or WITH...SELECT statements allowed
-- Only use tables listed in TABLES IN SCOPE
-- Only use columns listed in KNOWN COLUMNS
-- Do not invent column names
-- If context is insufficient, use the retrieval action that fills the missing gap
-- If context confidence already meets the threshold, prefer GENERATE_SQL
-- If SQL passed all checks, use VALIDATE_AND_RETURN
-- If retrieval cannot find relevant tables at all after trying, use REQUEST_CLARIFICATION
-- If error is unrecoverable, use GIVE_UP
-
-Think carefully about what went wrong and what to do.
-Then output EXACTLY:
-{{"action":"<one of the available actions above>","input":"<brief instruction for the action>"}}
-""".strip()
-    if governance:
-        return f"{governance}\n\n{prompt}"
-    return prompt
 
 
 async def execute_action(
@@ -1638,7 +1155,7 @@ async def run(
                 settings=settings,
             )
         )
-        available_actions = _build_available_actions(state, iteration, settings)
+        available_actions = react_planner._build_available_actions(state, iteration, settings)
 
         step_started = time.monotonic()
         await _emit_trace(
@@ -1669,7 +1186,7 @@ async def run(
             action = ReActAction.GENERATE_SQL
             action_input = "Context confidence threshold reached; generate SQL with available context."
         else:
-            prompt = build_react_prompt(
+            prompt = react_planner.build_react_prompt(
                 query=query,
                 context=state["context"],
                 tables_in_scope=state["tables_in_scope"],
@@ -1683,7 +1200,7 @@ async def run(
                 learned_instructions=list(state.get("learned_instructions") or []),
                 settings=settings,
             )
-            thought, answer, reason_warnings = await call_reasoning_model(
+            thought, answer, reason_warnings = await react_planner.call_reasoning_model(
                 prompt,
                 settings,
                 timeout_budget_seconds=_remaining_stage_budget_seconds(state),
@@ -1715,7 +1232,7 @@ async def run(
 
             action, action_input = parse_action(answer)
             if action == ReActAction.GIVE_UP and action_input == "Could not parse action":
-                recovery_action = choose_recovery_action_for_parse_failure(answer, state)
+                recovery_action = react_planner.choose_recovery_action_for_parse_failure(answer, state)
                 if recovery_action is not None:
                     action, action_input = recovery_action
             if action not in available_actions:
@@ -1870,7 +1387,7 @@ async def run(
             state["actions_taken"].append(
                 (
                     ReActAction.RETRIEVE_PAST_CORRECTIONS.value,
-                    _action_target(
+                    react_planner._action_target(
                         ReActAction.RETRIEVE_PAST_CORRECTIONS,
                         action_input,
                         state,
@@ -1880,7 +1397,7 @@ async def run(
             state["actions_taken"].append(
                 (
                     ReActAction.RETRIEVE_SCHEMA_FOR_TABLES.value,
-                    _action_target(
+                    react_planner._action_target(
                         ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
                         parallel_schema_input,
                         state,
@@ -1888,7 +1405,7 @@ async def run(
                 )
             )
         else:
-            state["actions_taken"].append((action.value, _action_target(action, action_input, state)))
+            state["actions_taken"].append((action.value, react_planner._action_target(action, action_input, state)))
 
         blocking_action_warnings = _blocking_warnings(action_warnings)
         if action == ReActAction.GENERATE_SQL and not blocking_action_warnings:

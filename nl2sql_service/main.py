@@ -18,34 +18,40 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from nl2sql_service import (
+from nl2sql_service.generation import (
     answer_generator,
-    cache,
-    chunker,
-    db,
-    embed,
-    help_docs,
-    ingest,
-    mysql_executor,
-    pattern_store,
-    provider_store,
     query_rewriter,
+)
+from nl2sql_service.core import cache
+from nl2sql_service.rag import (
+    chunker,
+    embed,
+    ingest,
     retrieve,
+)
+from nl2sql_service.db import (
+    db,
+    mysql_executor,
     schema_loader,
 )
-from nl2sql_service.cache import ask_cache
-from nl2sql_service.config import settings
-from nl2sql_service.key_vault import KeyVaultUnavailableError, decrypt_api_key, is_key_vault_configured
+from nl2sql_service import help_docs
+from nl2sql_service.storage import (
+    pattern_store,
+    provider_store,
+)
+from nl2sql_service.core.cache import ask_cache
+from nl2sql_service.core.config import settings
+from nl2sql_service.core.key_vault import KeyVaultUnavailableError, decrypt_api_key, is_key_vault_configured
 from nl2sql_service.llm.factory import LLMFactory
 from nl2sql_service.llm import metrics as llm_metrics
-from nl2sql_service.provider_health import list_provider_models, test_provider_connection
-from nl2sql_service.embed import (
+from nl2sql_service.core.provider_health import list_provider_models, test_provider_connection
+from nl2sql_service.rag.embed import (
     EmbeddingClientError,
     EmbeddingDimensionError,
     EmbeddingTimeoutError,
     EmbeddingUpstreamError,
 )
-from nl2sql_service.instruction_store import (
+from nl2sql_service.storage.instruction_store import (
     build_failure_teach_suggestion,
     process_confirmation,
     process_teach_request,
@@ -96,16 +102,16 @@ from nl2sql_service.models import (
     WarningCode,
     CreateProviderRequest,
 )
-from nl2sql_service.column_loader import load_columns_for_tables
-from nl2sql_service.roles import ALL_ROLES, GENERATION_ROLES, LLMRole
-from nl2sql_service.rulebook import RULES, get_active_rules, get_config
-from nl2sql_service.sql_generator import (
+from nl2sql_service.db.column_loader import load_columns_for_tables
+from nl2sql_service.core.roles import ALL_ROLES, GENERATION_ROLES, LLMRole
+from nl2sql_service.core.rulebook import RULES, get_active_rules, get_config
+from nl2sql_service.generation.sql_generator import (
     PgVectorStore,
     generate_sql,
     is_deterministic_generation_candidate,
     review_sql,
 )
-from nl2sql_service.log_config import configure_logging, set_request_id
+from nl2sql_service.core.log_config import configure_logging, set_request_id
 from nl2sql_service.observability.context import (
     bind_context,
     get_observability_context,
@@ -831,6 +837,10 @@ app = FastAPI(
 )
 setup_tracing(app, settings)
 install_request_middleware(app)
+
+from nl2sql_service.core.rate_limiter import RateLimitMiddleware
+app.add_middleware(RateLimitMiddleware, paths_to_limit=["/ask", "/generate-sql", "/ingest"])
+
 
 
 @app.get("/cache/stats", tags=["ops"])

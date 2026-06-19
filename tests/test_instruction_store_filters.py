@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nl2sql_service import instruction_store
+from nl2sql_service.storage import instruction_store
 
 
 def test_instruction_query_filter_rejects_unrelated_contact_correction() -> None:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from nl2sql_service.config import settings as default_settings
+from nl2sql_service.core.config import settings as default_settings
 from nl2sql_service.llm.interfaces import LLMResponse, ProviderConfig
 from nl2sql_service.llm.providers.base import BaseHTTPProvider, classify_http_error
 

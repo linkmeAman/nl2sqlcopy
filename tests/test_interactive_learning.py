@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import instruction_store, react_agent, retrieve
-from nl2sql_service.config import settings
+from nl2sql_service.storage import instruction_store
+from nl2sql_service.agent import react_agent, react_executor, react_planner
+from nl2sql_service.rag import retrieve
+from nl2sql_service.core.config import settings
 
 
 class _Acquire:
@@ -637,7 +639,7 @@ async def test_give_up_triggers_confidence_decay(
 ) -> None:
     del mock_instruction_store_with_rules, mock_build_clarification
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_groups",
         AsyncMock(
             return_value={
@@ -649,19 +651,19 @@ async def test_give_up_triggers_confidence_decay(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "load_columns_for_tables",
         AsyncMock(return_value={"employee": ["id", "contact_id"], "contact": ["id"]}),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_planner,
         "call_reasoning_model",
         AsyncMock(return_value=("Cannot continue", "ACTION: GIVE_UP\nINPUT: no match", [])),
     )
     outcome_mock = AsyncMock(return_value=None)
-    monkeypatch.setattr(react_agent, "record_instruction_outcome", outcome_mock)
+    monkeypatch.setattr(react_executor, "record_instruction_outcome", outcome_mock)
 
-    await react_agent.run(
+    await react_executor.run(
         query="fetch counselor",
         pool=_FakePool(_InstructionConn()),
         settings=settings,

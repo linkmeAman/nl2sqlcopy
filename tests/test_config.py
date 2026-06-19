@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 import pytest
 
-from nl2sql_service.config import Settings
+from nl2sql_service.core.config import Settings
 from nl2sql_service.models import ModelRoutingPatchRequest
 
 

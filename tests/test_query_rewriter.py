@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import query_rewriter, react_agent
-from nl2sql_service.config import settings
+from nl2sql_service.generation import query_rewriter
+from nl2sql_service.agent import react_agent, react_executor, react_planner
+from nl2sql_service.core.config import settings
 from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.models import GenerateSqlClarification
 
@@ -145,7 +146,8 @@ async def test_query_groups_endpoint_embeds_rewritten_search_text(
     mock_embed,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import instruction_store, main, pattern_store
+    from nl2sql_service.storage import instruction_store, pattern_store
+    from nl2sql_service import main
 
     app.state.pool = _FakePool(_GroupConn())
     monkeypatch.setattr(
@@ -266,20 +268,20 @@ async def test_react_agent_rewrites_once_and_reuses_expansion(
     monkeypatch.setattr(settings, "query_rewrite_enabled", True)
     monkeypatch.setattr(settings, "react_confidence_threshold", 2.0)
     print("REACT CONFIDENCE THRESHOLD IS:", settings.react_confidence_threshold)
-    monkeypatch.setattr(react_agent.query_rewriter, "rewrite_search_query", rewrite_mock)
-    monkeypatch.setattr(react_agent, "retrieve_groups", retrieve_mock)
-    monkeypatch.setattr(react_agent, "retrieve_past_corrections", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor.query_rewriter, "rewrite_search_query", rewrite_mock)
+    monkeypatch.setattr(react_executor, "retrieve_groups", retrieve_mock)
+    monkeypatch.setattr(react_executor, "retrieve_past_corrections", AsyncMock(return_value=[]))
     class MockColumnDoc:
         def __init__(self, table: str, col: str):
             self.metadata = {"table_name": table, "column_name": col}
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_column_catalog",
         AsyncMock(return_value=[MockColumnDoc("invoice", "id"), MockColumnDoc("employee", "id")]),
     )
-    monkeypatch.setattr(react_agent, "retrieve_join_paths", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "retrieve_join_paths", AsyncMock(return_value=[]))
     monkeypatch.setattr(
-        react_agent,
+        react_planner,
         "call_reasoning_model",
         AsyncMock(
             side_effect=[
@@ -297,7 +299,7 @@ async def test_react_agent_rewrites_once_and_reuses_expansion(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "build_clarification",
         AsyncMock(
             return_value=GenerateSqlClarification(
@@ -310,7 +312,7 @@ async def test_react_agent_rewrites_once_and_reuses_expansion(
         ),
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show unpaid invoices by counselor",
         pool=object(),
         settings=settings,

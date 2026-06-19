@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import cache, retrieve, sql_generator
+from nl2sql_service.core import cache
+from nl2sql_service.rag import retrieve
+from nl2sql_service.generation import sql_generator
 from nl2sql_service.models import CacheSource, GenerateSqlSuccess
 
 
@@ -99,10 +101,11 @@ async def test_retrieve_uses_embed_cache(monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.mark.asyncio
 async def test_generate_sql_returns_cache_hit_on_second_call(
+    mock_embed,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import react_agent
-    from nl2sql_service.config import settings
+    from nl2sql_service.agent import react_agent, react_executor, react_planner
+    from nl2sql_service.core.config import settings
 
     react_run = AsyncMock(
         return_value=GenerateSqlSuccess(
@@ -114,7 +117,8 @@ async def test_generate_sql_returns_cache_hit_on_second_call(
             react_trace=None,
         )
     )
-    monkeypatch.setattr(react_agent, "run", react_run)
+    monkeypatch.setattr("nl2sql_service.agent.react_agent.run", react_run)
+    monkeypatch.setattr("nl2sql_service.generation.sql_generator.db.get_query_cache_exact", __import__("unittest.mock").mock.AsyncMock(return_value=1))
 
     first = await sql_generator.generate_sql("show invoices", object(), settings, top_k=5)
     second = await sql_generator.generate_sql("show invoices", object(), settings, top_k=5)

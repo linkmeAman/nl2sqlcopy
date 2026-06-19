@@ -13,12 +13,13 @@ import sqlparse
 from sqlparse import tokens as T
 from sqlparse.sql import Comment, Identifier, IdentifierList, Parenthesis, Statement, Token, TokenList
 
-from nl2sql_service import query_rewriter, retrieve
-from nl2sql_service import db
-from nl2sql_service.cache import sql_cache
-from nl2sql_service.cache import semantic_sql_cache
-from nl2sql_service.column_loader import load_columns_for_tables
-from nl2sql_service.config import Settings, settings as default_settings
+from nl2sql_service.generation import query_rewriter
+from nl2sql_service.rag import retrieve
+from nl2sql_service.db import db
+from nl2sql_service.core.cache import sql_cache
+from nl2sql_service.core.cache import semantic_sql_cache
+from nl2sql_service.db.column_loader import load_columns_for_tables
+from nl2sql_service.core.config import Settings, settings as default_settings
 from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import (
     CacheSource,
@@ -33,8 +34,8 @@ from nl2sql_service.models import (
 )
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.sanitization import sanitize_sql, stable_hash, summarize_text
-from nl2sql_service.roles import LLMRole
-from nl2sql_service.rulebook import build_governance_block, get_config
+from nl2sql_service.core.roles import LLMRole
+from nl2sql_service.core.rulebook import build_governance_block, get_config
 
 logger = logging.getLogger(__name__)
 
@@ -725,7 +726,7 @@ def _with_cache_metadata(payload: dict[str, Any], source: CacheSource) -> dict[s
 async def _load_query_embedding(
     query: str,
 ) -> list[float] | None:
-    from nl2sql_service.cache import embed_cache
+    from nl2sql_service.core.cache import embed_cache
     from nl2sql_service import embed as embed_module
 
     q_vec = embed_cache.get(query)
@@ -1430,7 +1431,7 @@ async def generate_sql(
     top_k: int | None = None,
     trace_callback: TraceCallback | None = None,
 ) -> GenerateSqlResponse:
-    from nl2sql_service.react_agent import run as react_run
+    from nl2sql_service.agent.react_agent import run as react_run
 
     effective_top_k = top_k or settings.top_k
     cache_epoch: int | None = None

@@ -4,7 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import react_agent, sql_generator
+from nl2sql_service.agent import react_agent, react_executor, react_planner
+from nl2sql_service.generation import sql_generator
 from nl2sql_service.models import QueryResult, WarningCode
 
 
@@ -60,7 +61,7 @@ async def test_level1_queries_fail_fast_with_schema_in_scope(
     )
     monkeypatch.setattr(sql_generator, "run_explain", AsyncMock(return_value=[]))
     react_run = AsyncMock(side_effect=AssertionError("ReAct should not run for level-1 fast-path cases"))
-    monkeypatch.setattr(react_agent, "run", react_run)
+    monkeypatch.setattr(react_executor, "run", react_run)
 
     response = await client.post("/generate-sql", json={"query": query})
 
@@ -83,7 +84,7 @@ async def test_destructive_evaluation_case_rejects_before_react(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     react_run = AsyncMock(side_effect=AssertionError("ReAct should not run for destructive preflight rejections"))
-    monkeypatch.setattr(react_agent, "run", react_run)
+    monkeypatch.setattr(react_executor, "run", react_run)
 
     response = await client.post(
         "/generate-sql",
@@ -111,7 +112,7 @@ async def test_ambiguous_evaluation_case_clarifies_before_react(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     react_run = AsyncMock(side_effect=AssertionError("ReAct should not run for basic ambiguity preflight"))
-    monkeypatch.setattr(react_agent, "run", react_run)
+    monkeypatch.setattr(react_executor, "run", react_run)
 
     response = await client.post(
         "/generate-sql",
@@ -131,7 +132,7 @@ async def test_bootstrap_schema_focuses_payment_columns_for_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_groups",
         AsyncMock(
             return_value={
@@ -143,7 +144,7 @@ async def test_bootstrap_schema_focuses_payment_columns_for_generation(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_column_catalog",
         AsyncMock(
             return_value=[
@@ -162,12 +163,12 @@ async def test_bootstrap_schema_focuses_payment_columns_for_generation(
     )
 
     state: dict[str, object] = {"search_query": "show me the 5 most recent payments", "top_k": 5}
-    observation, warnings = await react_agent.execute_action(
+    observation, warnings = await react_executor.execute_action(
         action=react_agent.ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
         action_input="show me the 5 most recent payments",
         query="show me the 5 most recent payments",
         pool=object(),
-        settings=react_agent.default_settings,
+        settings=__import__("nl2sql_service.core.config", fromlist=["settings"]).settings,
         state=state,
     )
 

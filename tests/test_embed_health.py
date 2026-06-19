@@ -7,8 +7,8 @@ import pytest
 async def test_embedding_health_probe_reports_ok_for_configured_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import embed
-    from nl2sql_service.config import settings
+    from nl2sql_service.rag import embed
+    from nl2sql_service.core.config import settings
 
     class FakeEmbeddingProvider:
         async def embeddings(self, input_: list[str]) -> list[list[float]]:
@@ -33,8 +33,8 @@ async def test_embedding_health_probe_reports_ok_for_configured_provider(
 async def test_embedding_health_probe_returns_degraded_when_custom_provider_missing_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import embed
-    from nl2sql_service.config import settings
+    from nl2sql_service.rag import embed
+    from nl2sql_service.core.config import settings
 
     monkeypatch.setattr(settings, "embedding_provider", "custom")
     monkeypatch.setattr(settings, "embedding_api_url", None)

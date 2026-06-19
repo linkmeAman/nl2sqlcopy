@@ -4,7 +4,7 @@ import logging
 from collections import defaultdict
 from typing import Any
 
-from nl2sql_service.config import Settings
+from nl2sql_service.core.config import Settings
 
 log = logging.getLogger(__name__)
 

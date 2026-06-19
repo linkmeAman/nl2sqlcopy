@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from nl2sql_service.config import settings as default_settings
+from nl2sql_service.core.config import settings as default_settings
 from nl2sql_service.llm.adapters.openai import OpenAIAdapter
 from nl2sql_service.llm.interfaces import GenerateInput, LLMRequest, LLMResponse, ProviderConfig
 from nl2sql_service.llm.providers.base import BaseHTTPProvider

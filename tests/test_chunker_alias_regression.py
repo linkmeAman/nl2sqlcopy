@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import chunker
-from nl2sql_service.config import settings
+from nl2sql_service.rag import chunker
+from nl2sql_service.core.config import settings
 
 
 @pytest.mark.asyncio

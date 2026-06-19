@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import query_rewriter, react_agent, rulebook, schema_loader, sql_generator, synonym_map
+from nl2sql_service.generation import query_rewriter, sql_generator
+from nl2sql_service.agent import react_agent, react_executor, react_planner
+from nl2sql_service.core import rulebook
+from nl2sql_service.db import schema_loader
+from nl2sql_service.storage import synonym_map
 from nl2sql_service.models import GenerateSqlSuccess, QueryResult
 
 
@@ -102,7 +106,7 @@ def _assert_only_mock_columns(columns_by_table: dict[str, list[str]], origin: st
 
 
 def _temp_synonym_map(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     payload = json.loads(Path(settings.query_rewrite_synonym_map).read_text(encoding="utf-8"))
     payload.setdefault("query_terms", {})
@@ -120,7 +124,7 @@ def _temp_synonym_map(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 async def test_introspection_enrichment_produces_no_hardcoded_columns(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     mock_records = [
         {"table_name": table_name, "column_name": column_name, "data_type": "varchar", "ordinal_position": index}
@@ -158,7 +162,7 @@ async def test_synonym_expansion_works_for_new_domain_terms(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     _temp_synonym_map(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "query_rewrite_enabled", True)
@@ -194,7 +198,7 @@ async def test_synonym_expansion_works_for_new_domain_terms(
 async def test_retrieve_schema_for_tables_uses_retrieval_not_hardcoding(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     state = {
         "context": "",
@@ -208,7 +212,7 @@ async def test_retrieve_schema_for_tables_uses_retrieval_not_hardcoding(
     }
 
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_groups",
         AsyncMock(
             return_value={
@@ -220,7 +224,7 @@ async def test_retrieve_schema_for_tables_uses_retrieval_not_hardcoding(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_column_catalog",
         AsyncMock(
             return_value=[
@@ -238,7 +242,7 @@ async def test_retrieve_schema_for_tables_uses_retrieval_not_hardcoding(
         ),
     )
 
-    observation, warnings = await react_agent.execute_action(
+    observation, warnings = await react_executor.execute_action(
         action=react_agent.ReActAction.RETRIEVE_SCHEMA_FOR_TABLES,
         action_input="product",
         query="products with low stock",
@@ -250,11 +254,11 @@ async def test_retrieve_schema_for_tables_uses_retrieval_not_hardcoding(
     assert warnings == []
     assert "column-level retrieval" in observation
     assert state["allowed_columns"] == {"product": MOCK_SCHEMA_COLUMNS["product"]}
-    _assert_only_mock_columns(state["allowed_columns"], "react_agent.execute_action")
+    _assert_only_mock_columns(state["allowed_columns"], "react_executor.execute_action")
     _assert_no_forbidden_terms(
         json.dumps(state["allowed_columns"], sort_keys=True),
         PRODUCTION_SCHEMA_TERMS,
-        "react_agent.execute_action",
+        "react_executor.execute_action",
     )
 
 
@@ -262,11 +266,11 @@ async def test_retrieve_schema_for_tables_uses_retrieval_not_hardcoding(
 async def test_sql_generation_targets_mock_schema_tables(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
-    monkeypatch.setattr(react_agent, "retrieve_past_corrections", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "retrieve_past_corrections", AsyncMock(return_value=[]))
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_groups",
         AsyncMock(
             return_value={
@@ -278,7 +282,7 @@ async def test_sql_generation_targets_mock_schema_tables(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "retrieve_column_catalog",
         AsyncMock(
             return_value=[
@@ -296,7 +300,7 @@ async def test_sql_generation_targets_mock_schema_tables(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_planner,
         "call_reasoning_model",
         AsyncMock(
             side_effect=[
@@ -314,7 +318,7 @@ async def test_sql_generation_targets_mock_schema_tables(
         ),
     )
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "call_ollama",
         AsyncMock(
             return_value=(
@@ -323,9 +327,9 @@ async def test_sql_generation_targets_mock_schema_tables(
             )
         ),
     )
-    monkeypatch.setattr(react_agent, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "run_explain", AsyncMock(return_value=[]))
 
-    result = await react_agent.run(
+    result = await react_executor.run(
         query="show me all suppliers in the north region",
         pool=object(),
         settings=settings,
@@ -338,7 +342,7 @@ async def test_sql_generation_targets_mock_schema_tables(
     _assert_no_forbidden_terms(
         result.sql,
         PRODUCTION_TABLE_TERMS,
-        "react_agent.run",
+        "react_executor.run",
     )
 
 
@@ -347,7 +351,9 @@ async def test_full_ask_pipeline_on_mock_schema(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import answer_generator, main, mysql_executor
+    from nl2sql_service.generation import answer_generator
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     sql_result = GenerateSqlSuccess(
         sql=(
@@ -413,14 +419,14 @@ async def test_full_ask_pipeline_on_mock_schema(
 def test_governance_rules_are_schema_neutral(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     monkeypatch.setattr(settings, "governance_enabled", True)
     monkeypatch.setattr(settings, "governance_enabled_rules", "all")
     rulebook._config = None
     active_rules = rulebook.get_active_rules(rulebook.get_config(settings))
 
-    assert active_rules, "Expected active governance rules from nl2sql_service.rulebook."
+    assert active_rules, "Expected active governance rules from nl2sql_service.core.rulebook."
     for rule in active_rules:
         serialized = "\n".join(
             [

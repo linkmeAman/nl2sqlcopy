@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import answer_generator
-from nl2sql_service.config import settings
+from nl2sql_service.generation import answer_generator
+from nl2sql_service.core.config import settings
 from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.models import SqlWarning, WarningCode
 

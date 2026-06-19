@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from nl2sql_service import sql_generator
-from nl2sql_service.config import settings
+from nl2sql_service.generation import sql_generator
+from nl2sql_service.core.config import settings
 from nl2sql_service.llm.interfaces import LLMResponse
 from nl2sql_service.llm.providers.ollama import OllamaProvider
 from nl2sql_service.models import WarningCode

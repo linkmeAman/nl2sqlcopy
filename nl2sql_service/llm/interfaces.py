@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from nl2sql_service.config import settings as default_settings
+from nl2sql_service.core.config import settings as default_settings
 
 
 @dataclass(frozen=True)

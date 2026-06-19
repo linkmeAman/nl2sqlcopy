@@ -5,7 +5,7 @@ from uuid import UUID
 
 import asyncpg
 
-from nl2sql_service.key_vault import encrypt_api_key
+from nl2sql_service.core.key_vault import encrypt_api_key
 from nl2sql_service.models import (
     ApiKeyRecord,
     CreateProviderRequest,

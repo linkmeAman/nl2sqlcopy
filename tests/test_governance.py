@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service.config import settings
+from nl2sql_service.core.config import settings
 from nl2sql_service.models import WarningCode
-from nl2sql_service.rulebook import RulebookConfig, build_governance_block
+from nl2sql_service.core.rulebook import RulebookConfig, build_governance_block
 
 
 def test_build_governance_block_orders_rules_by_category() -> None:
@@ -47,7 +47,7 @@ async def test_governance_rules_endpoint_returns_active_rules(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import rulebook
+    from nl2sql_service.core import rulebook
 
     monkeypatch.setattr(settings, "governance_enabled", True)
     monkeypatch.setattr(rulebook, "_config", None)
@@ -67,7 +67,8 @@ async def test_governance_validate_endpoint_uses_review_gate(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import main, rulebook
+    from nl2sql_service import main
+    from nl2sql_service.core import rulebook
 
     monkeypatch.setattr(settings, "governance_enabled", True)
     monkeypatch.setattr(rulebook, "_config", None)
@@ -104,7 +105,8 @@ async def test_generate_sql_adds_review_failed_warning_when_gate_flags(
     mock_retrieve_groups,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from nl2sql_service import rulebook, sql_generator
+    from nl2sql_service.core import rulebook
+    from nl2sql_service.generation import sql_generator
 
     del mock_retrieve_groups
     monkeypatch.setattr(settings, "governance_enabled", True)

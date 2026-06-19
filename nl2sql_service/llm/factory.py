@@ -4,13 +4,13 @@ import os
 from collections.abc import Iterable
 from typing import Any
 
-from nl2sql_service.config import Settings
+from nl2sql_service.core.config import Settings
 from nl2sql_service.llm.interfaces import LLMProvider, LLMResponse, ProviderConfig
 from nl2sql_service.llm.metrics import record_llm_response
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.metrics import observe_provider
 from nl2sql_service.observability.sanitization import stable_hash
-from nl2sql_service.provider_registry import (
+from nl2sql_service.core.provider_registry import (
     normalize_provider_name,
     provider_compat,
     provider_requires_key,
@@ -235,8 +235,8 @@ class LLMFactory:
     ) -> LLMProvider | None:
         if pool is None:
             return None
-        from nl2sql_service import provider_store
-        from nl2sql_service.key_vault import decrypt_api_key
+        from nl2sql_service.storage import provider_store
+        from nl2sql_service.core.key_vault import decrypt_api_key
 
         model_config = await provider_store.get_default_model_config(pool, role)
         if not model_config:

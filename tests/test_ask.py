@@ -12,7 +12,7 @@ from nl2sql_service.models import (
     SqlWarning,
     WarningCode,
 )
-from nl2sql_service.mysql_executor import apply_row_cap
+from nl2sql_service.db.mysql_executor import apply_row_cap
 
 
 @pytest.mark.asyncio
@@ -64,7 +64,9 @@ async def test_ask_deterministic_inquiry_uses_fallback_answer(
     monkeypatch: pytest.MonkeyPatch,
     mock_embed,
 ):
-    from nl2sql_service import answer_generator, main, mysql_executor
+    from nl2sql_service.generation import answer_generator
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     mock_generate_sql = AsyncMock(
         return_value=GenerateSqlSuccess(
@@ -109,7 +111,9 @@ async def test_ask_rejected_sql_generation_skips_execution(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import answer_generator, main, mysql_executor
+    from nl2sql_service.generation import answer_generator
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     mock_generate_sql = AsyncMock(
         return_value=GenerateSqlRejected(
@@ -179,7 +183,8 @@ async def test_ask_mysql_execution_failure_returns_controlled_rejection(
     client,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from nl2sql_service import main, mysql_executor
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     mock_generate_sql = AsyncMock(
         return_value=GenerateSqlSuccess(
@@ -228,7 +233,8 @@ async def test_ask_answer_llm_timeout_returns_controlled_rejection(
     monkeypatch: pytest.MonkeyPatch,
     mock_ask_execute_sql,
 ):
-    from nl2sql_service import answer_generator, main
+    from nl2sql_service.generation import answer_generator
+    from nl2sql_service import main
 
     mock_generate_sql = AsyncMock(
         return_value=GenerateSqlSuccess(
@@ -390,7 +396,9 @@ async def test_ask_stream_deterministic_inquiry_uses_fallback_answer(
     monkeypatch: pytest.MonkeyPatch,
     mock_embed,
 ):
-    from nl2sql_service import answer_generator, main, mysql_executor
+    from nl2sql_service.generation import answer_generator
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     mock_generate_sql = AsyncMock(
         return_value=GenerateSqlSuccess(

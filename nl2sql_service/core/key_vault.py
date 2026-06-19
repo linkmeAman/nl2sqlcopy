@@ -6,7 +6,7 @@ import os
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from nl2sql_service.config import settings
+from nl2sql_service.core.config import settings
 
 
 class KeyVaultUnavailableError(RuntimeError):

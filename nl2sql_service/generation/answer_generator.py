@@ -3,13 +3,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from nl2sql_service.config import Settings, settings as default_settings
+from nl2sql_service.core.config import Settings, settings as default_settings
 from nl2sql_service.llm import get_model_client
 from nl2sql_service.models import SqlWarning, WarningCode
 from nl2sql_service.observability.context import emit_current_trace_event
 from nl2sql_service.observability.sanitization import stable_hash, summarize_text
-from nl2sql_service.roles import LLMRole
-from nl2sql_service.rulebook import build_governance_block, get_config
+from nl2sql_service.core.roles import LLMRole
+from nl2sql_service.core.rulebook import build_governance_block, get_config
 
 
 def _format_warning_lines(warnings: list[SqlWarning]) -> str:

@@ -15,7 +15,7 @@ async def test_auto_reconnect_recovers_without_restart(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from nl2sql_service import main
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     app.state.pool = None
     app.state.pool_last_reconnect_attempt = 0.0
@@ -61,7 +61,7 @@ async def test_auto_reconnect_failure_returns_503(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from nl2sql_service import main
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     app.state.pool = None
     app.state.pool_last_reconnect_attempt = 0.0
@@ -87,7 +87,7 @@ async def test_auto_reconnect_throttles_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from nl2sql_service import main
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     app.state.pool = None
     app.state.pool_last_reconnect_attempt = time.monotonic()
@@ -112,7 +112,7 @@ async def test_health_attempts_reconnect_when_pool_missing(
     monkeypatch: pytest.MonkeyPatch,
 ):
     from nl2sql_service import main
-    from nl2sql_service.config import settings
+    from nl2sql_service.core.config import settings
 
     app.state.pool = None
     app.state.pool_last_reconnect_attempt = 0.0

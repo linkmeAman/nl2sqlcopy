@@ -7,7 +7,7 @@ from typing import Any
 
 import httpx
 
-from nl2sql_service.config import settings as default_settings
+from nl2sql_service.core.config import settings as default_settings
 from nl2sql_service.llm.interfaces import GenerateInput, LLMResponse, ProviderConfig, extract_think_block
 from nl2sql_service.llm.providers.base import BaseHTTPProvider, classify_http_error
 

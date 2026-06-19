@@ -5,9 +5,9 @@ from typing import Any
 
 import httpx
 
-from nl2sql_service.config import settings
+from nl2sql_service.core.config import settings
 from nl2sql_service.models import ProviderTestResult
-from nl2sql_service.provider_registry import normalize_provider_name, provider_compat
+from nl2sql_service.core.provider_registry import normalize_provider_name, provider_compat
 
 
 async def _request(

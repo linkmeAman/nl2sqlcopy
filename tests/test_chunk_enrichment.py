@@ -4,8 +4,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import chunker, schema_loader
-from nl2sql_service.config import settings
+from nl2sql_service.rag import chunker
+from nl2sql_service.db import schema_loader
+from nl2sql_service.core.config import settings
 
 
 @pytest.mark.asyncio
@@ -203,7 +204,7 @@ async def test_ingest_groups_response_includes_enrichment_summary(
     monkeypatch: pytest.MonkeyPatch,
     mock_load_columns_for_ingest: AsyncMock,
 ):
-    from nl2sql_service import ingest
+    from nl2sql_service.rag import ingest
 
     del mock_load_columns_for_ingest
 

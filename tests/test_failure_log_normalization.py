@@ -1,4 +1,4 @@
-from nl2sql_service.db import _normalize_failure_log_row
+from nl2sql_service.db.db import _normalize_failure_log_row
 
 
 def test_normalize_failure_log_row_parses_legacy_stringified_json() -> None:

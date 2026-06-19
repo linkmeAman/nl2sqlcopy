@@ -6,8 +6,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from nl2sql_service import pattern_store, react_agent, retrieve
-from nl2sql_service.config import settings
+from nl2sql_service.storage import pattern_store
+from nl2sql_service.agent import react_agent, react_executor, react_planner
+from nl2sql_service.rag import retrieve
+from nl2sql_service.core.config import settings
 from nl2sql_service.models import (
     GenerateSqlSuccess,
     ReActAction,
@@ -121,7 +123,7 @@ class _PatternConn:
 def patch_react_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "react_max_iterations", 4)
     monkeypatch.setattr(
-        react_agent,
+        react_executor,
         "load_columns_for_tables",
         AsyncMock(
             return_value={
@@ -133,7 +135,7 @@ def patch_react_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
             }
         ),
     )
-    monkeypatch.setattr(react_agent, "run_explain", AsyncMock(return_value=[]))
+    monkeypatch.setattr(react_executor, "run_explain", AsyncMock(return_value=[]))
 
 
 def _pattern(pattern_id: int, use_count: int = 5, is_active: bool = True) -> dict:
@@ -239,7 +241,7 @@ async def test_give_up_returns_clarification_not_rejection(
         [],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="fetch aman",
         pool=object(),
         settings=settings,
@@ -268,7 +270,7 @@ async def test_max_retries_exceeded_returns_clarification(
     )
     mock_react_call_ollama.return_value = ("SELECT * FROM forbidden_table", [])
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show forbidden data",
         pool=object(),
         settings=settings,
@@ -295,7 +297,7 @@ async def test_ollama_timeout_returns_rejected_not_clarification(
         ],
     )
 
-    response = await react_agent.run(
+    response = await react_executor.run(
         query="show invoices",
         pool=object(),
         settings=settings,
@@ -365,7 +367,8 @@ async def test_save_pattern_called_when_row_count_positive(
     mock_ask_answer_generator,
     mock_save_pattern,
 ) -> None:
-    from nl2sql_service import main, mysql_executor
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     monkeypatch.setattr(
         main,
@@ -404,7 +407,8 @@ async def test_save_pattern_not_called_when_row_count_zero(
     mock_ask_answer_generator,
     mock_save_pattern,
 ) -> None:
-    from nl2sql_service import main, mysql_executor
+    from nl2sql_service import main
+    from nl2sql_service.db import mysql_executor
 
     monkeypatch.setattr(
         main,
